@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -16,25 +17,84 @@ use crate::backend::StorageBackend;
 use crate::path::CloudPath;
 use crate::types::{Etag, FileEntry, FileKind};
 
+static ROOT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<RwLock<()>>>>> = OnceLock::new();
+
+fn normalize_lock_key(root: &Path) -> String {
+    let abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(root))
+            .unwrap_or_else(|_| root.to_path_buf())
+    };
+
+    // Canonicalize the deepest existing ancestor so non-existent and newly created roots
+    // produce the exact same key.
+    let mut existing = abs.as_path();
+    let mut tail = Vec::new();
+    let canonical_base = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(_) => {
+                if let Some(name) = existing.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                match existing.parent() {
+                    Some(parent) if parent != existing => existing = parent,
+                    _ => break abs.clone(),
+                }
+            }
+        }
+    };
+
+    let mut full = canonical_base;
+    for part in tail.into_iter().rev() {
+        full.push(part);
+    }
+
+    let raw = full.to_string_lossy().replace('\\', "/");
+    let stripped = raw.strip_prefix("//?/").unwrap_or(&raw);
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        stripped.to_ascii_lowercase()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        stripped.to_owned()
+    }
+}
+
+fn lock_for_root(root: &Path) -> Arc<RwLock<()>> {
+    let key = normalize_lock_key(root);
+    let registry = ROOT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(RwLock::new(())))
+        .clone()
+}
+
 /// Local filesystem implementation of [`StorageBackend`], rooted in a sandbox directory.
 /// Used for fast deterministic unit/integration tests and offline development.
 ///
 /// Concurrency & sandbox invariants:
-/// - A backend-level `Arc<RwLock<()>>` is acquired as an owned guard and moved into blocking I/O
-///   tasks so concurrent directory mutations, case-insensitive filename aliases, and future
+/// - A per-root `Arc<RwLock<()>>` (shared across all instances targeting the same root) is
+///   acquired as an owned guard and moved into blocking I/O tasks so concurrent directory
+///   mutations, case-insensitive filename aliases, multiple backend instances, and future
 ///   cancellation cannot bypass containment or ETag checks.
 #[derive(Debug, Clone)]
 pub struct LocalFsBackend {
     root: PathBuf,
-    io_lock: Arc<RwLock<()>>,
 }
 
 impl LocalFsBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            io_lock: Arc::new(RwLock::new(())),
-        }
+        Self { root: root.into() }
+    }
+
+    fn root_lock(&self) -> Arc<RwLock<()>> {
+        lock_for_root(&self.root)
     }
 
     pub fn root(&self) -> &Path {
@@ -205,7 +265,7 @@ impl LocalFsBackend {
 #[async_trait]
 impl StorageBackend for LocalFsBackend {
     async fn list(&self, path: &CloudPath) -> Result<Vec<FileEntry>> {
-        let guard = self.io_lock.clone().read_owned().await;
+        let guard = self.root_lock().read_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -252,7 +312,7 @@ impl StorageBackend for LocalFsBackend {
     }
 
     async fn stat(&self, path: &CloudPath) -> Result<FileEntry> {
-        let guard = self.io_lock.clone().read_owned().await;
+        let guard = self.root_lock().read_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -266,7 +326,7 @@ impl StorageBackend for LocalFsBackend {
     }
 
     async fn read(&self, path: &CloudPath) -> Result<(Bytes, Etag)> {
-        let guard = self.io_lock.clone().read_owned().await;
+        let guard = self.root_lock().read_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -288,7 +348,7 @@ impl StorageBackend for LocalFsBackend {
     }
 
     async fn read_range(&self, path: &CloudPath, start: u64, end: Option<u64>) -> Result<Bytes> {
-        let guard = self.io_lock.clone().read_owned().await;
+        let guard = self.root_lock().read_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -336,7 +396,7 @@ impl StorageBackend for LocalFsBackend {
         // Hold an owned write guard for the entire blocking check + atomic persist so:
         // - Case-insensitive filename aliases serialize cleanly on Windows/macOS.
         // - Cancelling the future cannot release the lock mid-replacement.
-        let guard = self.io_lock.clone().write_owned().await;
+        let guard = self.root_lock().write_owned().await;
         let root = self.root.clone();
         let path = path.clone();
         let expected_etag = expected_etag.cloned();
@@ -381,7 +441,7 @@ impl StorageBackend for LocalFsBackend {
     }
 
     async fn mkdir(&self, path: &CloudPath) -> Result<()> {
-        let guard = self.io_lock.clone().write_owned().await;
+        let guard = self.root_lock().write_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -403,7 +463,7 @@ impl StorageBackend for LocalFsBackend {
             return Ok(());
         }
 
-        let guard = self.io_lock.clone().write_owned().await;
+        let guard = self.root_lock().write_owned().await;
         let root = self.root.clone();
         let from = from.clone();
         let to = to.clone();
@@ -433,7 +493,7 @@ impl StorageBackend for LocalFsBackend {
             return Err(FrError::InvalidPath("cannot delete root directory".into()));
         }
 
-        let guard = self.io_lock.clone().write_owned().await;
+        let guard = self.root_lock().write_owned().await;
         let root = self.root.clone();
         let path = path.clone();
 
@@ -575,6 +635,43 @@ mod tests {
         let e2 = initial_etag.clone();
         let t2 = tokio::spawn(async move {
             b2.write(&p2, Bytes::from_static(b"writer-B"), Some(&e2))
+                .await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let results = [r1.unwrap(), r2.unwrap()];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let conflict_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(FrError::Conflict { .. })))
+            .count();
+
+        assert_eq!(ok_count, 1);
+        assert_eq!(conflict_count, 1);
+    }
+
+    #[tokio::test]
+    async fn separate_backend_instances_for_same_root_coordinate_etag_writes() {
+        let dir = tempdir().expect("tempdir");
+        let b1 = LocalFsBackend::new(dir.path());
+        let b2 = LocalFsBackend::new(dir.path());
+        let path = CloudPath::parse("/shared-two.md").unwrap();
+        let initial_etag = b1
+            .write(&path, Bytes::from_static(b"v1"), None)
+            .await
+            .unwrap();
+
+        let p1 = path.clone();
+        let e1 = initial_etag.clone();
+        let t1 = tokio::spawn(async move {
+            b1.write(&p1, Bytes::from_static(b"inst-1"), Some(&e1))
+                .await
+        });
+
+        let p2 = path.clone();
+        let e2 = initial_etag.clone();
+        let t2 = tokio::spawn(async move {
+            b2.write(&p2, Bytes::from_static(b"inst-2"), Some(&e2))
                 .await
         });
 

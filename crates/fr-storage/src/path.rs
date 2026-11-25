@@ -34,14 +34,13 @@ impl CloudPath {
     /// Parses and normalizes an untrusted path string, rejecting path traversal (`..`),
     /// Windows drive/UNC prefixes, colons, and null bytes.
     pub fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        if trimmed.starts_with("\\\\") || trimmed.starts_with("//") {
+        let normalized = raw.trim().replace('\\', "/");
+        if normalized.starts_with("//") {
             return Err(FrError::InvalidPath(format!(
                 "UNC and double-slash network prefixes are not allowed: {raw}"
             )));
         }
 
-        let normalized = trimmed.replace('\\', "/");
         if normalized.is_empty() || normalized == "/" {
             return Ok(Self::root());
         }
@@ -165,6 +164,8 @@ mod tests {
         assert!(CloudPath::parse("file:stream").is_err());
         assert!(CloudPath::parse(r"\\server\share\file.txt").is_err());
         assert!(CloudPath::parse("//server/share/file.txt").is_err());
+        assert!(CloudPath::parse(r"\/server\share\file.txt").is_err());
+        assert!(CloudPath::parse(r"/\server/share/file.txt").is_err());
     }
 
     #[test]
