@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { Check, ShieldAlert, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  PendingWriteApproval,
   UpdateSettingsRequest,
   UserFacingError,
   WorkspaceOverview_Serialize,
@@ -7,6 +9,7 @@ import type {
 import { ErrorBanner } from "./components/ErrorBanner";
 import { Sidebar, type ActiveNavItem } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
+import { listPendingMcpApprovals, resolveMcpApproval } from "./lib/mcpClient";
 import {
   cancelNextcloudLogin,
   loadWorkspaceOverview,
@@ -19,6 +22,7 @@ import {
   toUserFacingError,
 } from "./lib/workspaceClient";
 import { FilesView } from "./views/FilesView";
+import { McpView } from "./views/McpView";
 import { ModuleComingSoonView } from "./views/ModuleComingSoonView";
 import { SettingsView } from "./views/SettingsView";
 
@@ -37,7 +41,26 @@ export function App() {
   const [error, setError] = useState<UserFacingError | null>(null);
   const [loginPendingUrl, setLoginPendingUrl] = useState<string | null>(null);
   const [loginStarting, setLoginStarting] = useState(false);
+  const [pendingMcpApprovals, setPendingMcpApprovals] = useState<
+    PendingWriteApproval[]
+  >([]);
   const pollInFlightRef = useRef(false);
+
+  const refreshPendingApprovals = useCallback(() => {
+    void listPendingMcpApprovals()
+      .then(setPendingMcpApprovals)
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!overview?.mcpServer.enabled) {
+      setPendingMcpApprovals([]);
+      return;
+    }
+    refreshPendingApprovals();
+    const timer = window.setInterval(refreshPendingApprovals, 1500);
+    return () => window.clearInterval(timer);
+  }, [overview?.mcpServer.enabled, refreshPendingApprovals]);
 
   useEffect(() => {
     let cancelled = false;
@@ -240,6 +263,7 @@ export function App() {
         modules={overview.modules}
         activeId={activeNav}
         mcpEnabled={overview.mcpServer.enabled}
+        pendingMcpApprovals={pendingMcpApprovals.length}
         onSelect={(id) => {
           setError(null);
           setActiveNav(id);
@@ -263,6 +287,51 @@ export function App() {
               <ErrorBanner error={overview.startupError} />
             </div>
           )}
+          {pendingMcpApprovals.length > 0 && activeModule?.id !== "mcp" && (
+            <div
+              role="alertdialog"
+              className="mx-auto mb-4 max-w-5xl rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 shadow-xs dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <ShieldAlert className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <span>
+                    <strong>AI write request:</strong>{" "}
+                    <code>{pendingMcpApprovals[0].toolName}</code> —{" "}
+                    {pendingMcpApprovals[0].summary}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void resolveMcpApproval(
+                        pendingMcpApprovals[0].id,
+                        true,
+                      ).then(refreshPendingApprovals)
+                    }
+                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2.5 py-1 font-semibold text-white hover:bg-emerald-700"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    Allow
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void resolveMcpApproval(
+                        pendingMcpApprovals[0].id,
+                        false,
+                      ).then(refreshPendingApprovals)
+                    }
+                    className="inline-flex items-center gap-1 rounded-lg border border-rose-300 bg-white px-2.5 py-1 font-semibold text-rose-700 hover:bg-rose-50 dark:border-rose-800 dark:bg-slate-900 dark:text-rose-300"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                    Deny
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
           {activeNav === "settings" ? (
             <SettingsView
               overview={overview}
@@ -284,6 +353,13 @@ export function App() {
               onStartLogin={handleStartLogin}
               onCancelLogin={handleCancelLogin}
               onOpenSettings={() => setActiveNav("settings")}
+              onOverviewUpdated={setOverview}
+            />
+          ) : activeModule?.id === "mcp" ? (
+            <McpView
+              isNextcloudConnected={overview.connectionStatus.state === "connected"}
+              pendingApprovals={pendingMcpApprovals}
+              onRefreshApprovals={refreshPendingApprovals}
               onOverviewUpdated={setOverview}
             />
           ) : activeModule ? (

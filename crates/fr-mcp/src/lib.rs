@@ -1,16 +1,40 @@
 //! Dual MCP (Model Context Protocol) subsystem:
-//! - Built-in local MCP Server (exposes FR modules to external AI clients).
-//! - Built-in MCP Client (lets automation workflows and modules call external MCP servers).
+//! - Built-in local MCP Server (Streamable HTTP JSON-RPC 2.0 on `127.0.0.1`, exposing FR modules
+//!   to external AI clients with Bearer auth, write-approval prompts, and audit logging).
+//! - Built-in MCP Client (`StreamableHttp` + `Stdio` transports, OS Keychain tokens, Nextcloud
+//!   team server sync, tool discovery, and execution for Automation Workflows & UI testing).
 //!
 //! Security defaults (per `AGENTS.md`):
 //! - MCP Server binds strictly to `127.0.0.1` (loopback only).
 //! - Disabled by default until explicitly enabled by the user.
+//! - Mutating tools require explicit UI confirmation by default (`require_write_approval = true`).
+
+pub mod client;
+pub mod governance;
+pub mod server;
+pub mod token;
+pub mod tools;
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use fr_core::{FrError, Result};
+use fr_core::{FrError, FrModule, ModuleCapability, ModuleDescriptor, ModuleStatus, Result};
 use serde::{Deserialize, Serialize};
 use specta::Type;
+
+pub use client::{
+    ExternalMcpServerView, ExternalMcpTool, McpClientManager, McpToolCallOutput,
+    TEAM_MCP_SERVERS_CLOUD_PATH, build_client_config_snippet,
+};
+pub use governance::{
+    ApprovalOutcome, McpAuditEntry, McpAuditLog, McpAuditStatus, PendingWriteApproval,
+    WriteApprovalGate,
+};
+pub use server::LocalMcpServer;
+pub use token::{
+    KeyringMcpTokenStore, LOCAL_SERVER_TOKEN_KEY, McpTokenStore, MemoryMcpTokenStore,
+    external_server_token_key, generate_bearer_token,
+};
+pub use tools::{McpToolHandler, McpToolInfo, McpToolRegistry, register_files_tools};
 
 pub const DEFAULT_MCP_BIND_HOST: &str = "127.0.0.1";
 pub const DEFAULT_MCP_PORT: u16 = 38420;
@@ -51,6 +75,17 @@ impl McpServerConfig {
     }
 }
 
+/// Live runtime status of the built-in local MCP Server returned to the desktop UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatus {
+    pub running: bool,
+    pub endpoint_url: Option<String>,
+    pub config: McpServerConfig,
+    pub exposed_tools: Vec<McpToolInfo>,
+    pub pending_approvals: u32,
+}
+
 /// Transport configuration for an external MCP server connected via the MCP Client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(
@@ -71,6 +106,29 @@ pub struct ExternalMcpServer {
     pub name: String,
     pub enabled: bool,
     pub transport: ExternalMcpTransport,
+}
+
+/// Pluggable MCP / AI module descriptor registered in the host [`fr_core::ModuleRegistry`].
+#[derive(Debug, Default)]
+pub struct McpModule;
+
+impl FrModule for McpModule {
+    fn descriptor(&self) -> ModuleDescriptor {
+        ModuleDescriptor {
+            id: "mcp".into(),
+            name: "MCP / AI".into(),
+            description:
+                "Connect local AI assistants to your workspace and manage external MCP tools."
+                    .into(),
+            icon: "cpu".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            status: ModuleStatus::Active,
+            capabilities: vec![
+                ModuleCapability::McpServerTools,
+                ModuleCapability::McpClient,
+            ],
+        }
+    }
 }
 
 #[cfg(test)]

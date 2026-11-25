@@ -19,6 +19,8 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     pinnedFolders: [] as string[],
     cacheLimitMb: 2048,
     mcpServerEnabled: false,
+    mcpServerPort: 38420,
+    mcpRequireWriteApproval: true,
     theme: "system",
   };
 
@@ -59,6 +61,16 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         version: "0.1.0",
         status: "active",
         capabilities: ["storage", "preview", "mcpServerTools"],
+      },
+      {
+        id: "mcp",
+        name: "MCP / AI",
+        description:
+          "Connect local AI assistants to your workspace and manage external MCP tools.",
+        icon: "cpu",
+        version: "0.1.0",
+        status: "active",
+        capabilities: ["mcpServerTools", "mcpClient"],
       },
       {
         id: "finance",

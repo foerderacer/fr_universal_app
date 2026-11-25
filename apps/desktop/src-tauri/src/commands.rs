@@ -8,7 +8,10 @@ use fr_core::{
     AppConfig, AppEvent, ConfigStore, FrError, ModuleDescriptor, UserFacingError,
     default_nextcloud_url,
 };
-use fr_mcp::McpServerConfig;
+use fr_mcp::{
+    ExternalMcpServer, ExternalMcpServerView, ExternalMcpTool, McpAuditEntry, McpServerConfig,
+    McpServerStatus, McpToolCallOutput, PendingWriteApproval, build_client_config_snippet,
+};
 use fr_mod_files::{FileItemView, FilePreviewPayload, FilesService, MarkdownDocument};
 use fr_nextcloud::{
     LoginPollResult, NextcloudConnectionStatus, UserAccountInfo, fetch_user_account_info,
@@ -115,7 +118,7 @@ pub fn get_workspace_overview(state: State<'_, AppState>) -> WorkspaceOverview {
 
 #[tauri::command]
 #[specta::specta]
-pub fn update_settings(
+pub async fn update_settings(
     state: State<'_, AppState>,
     input: UpdateSettingsRequest,
 ) -> Result<WorkspaceOverview, UserFacingError> {
@@ -173,6 +176,11 @@ pub fn update_settings(
     }
     if let Some(ref cache) = state.cache {
         let _ = cache.set_limit_mb(new_cache_limit);
+    }
+
+    if let Err(err) = state.sync_mcp_server_runtime(false).await {
+        tracing::warn!("MCP server sync error after settings save: {err}");
+        return Err(UserFacingError::from(err));
     }
 
     state.clear_startup_error();
@@ -1010,6 +1018,245 @@ pub async fn open_file_in_native_app(
         })?;
 
     Ok(path_str)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Dual MCP Server & External MCP Client commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigureMcpServerRequest {
+    pub enabled: bool,
+    pub port: u16,
+    pub require_write_approval: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigureMcpServerResponse {
+    pub status: McpServerStatus,
+    pub overview: WorkspaceOverview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct McpClientConfigSnippetResponse {
+    pub endpoint_url: String,
+    pub json_snippet: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mcp_server_status(
+    state: State<'_, AppState>,
+) -> Result<McpServerStatus, UserFacingError> {
+    Ok(state.mcp_server_status().await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn configure_mcp_server(
+    state: State<'_, AppState>,
+    input: ConfigureMcpServerRequest,
+) -> Result<ConfigureMcpServerResponse, UserFacingError> {
+    if input.port < 1024 {
+        return Err(UserFacingError::from(FrError::InvalidConfig(
+            "Choose a local port between 1024 and 65535".into(),
+        )));
+    }
+
+    let previous = state.current_config();
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while saving MCP server settings"))?;
+        let mut candidate = guard.clone();
+        candidate.mcp_server_enabled = input.enabled;
+        candidate.mcp_server_port = input.port;
+        candidate.mcp_require_write_approval = input.require_write_approval;
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+        *guard = candidate;
+    }
+
+    let status = match state.sync_mcp_server_runtime(false).await {
+        Ok(s) => s,
+        Err(err) => {
+            // Roll back config if starting the server on the requested port failed (e.g. port in use).
+            if let Ok(mut guard) = state.config.lock() {
+                let _ = state.config_store.save(&previous);
+                *guard = previous;
+            }
+            return Err(UserFacingError::from(err));
+        }
+    };
+
+    state.events.publish(AppEvent::ConfigUpdated {
+        timestamp: Utc::now(),
+    });
+
+    Ok(ConfigureMcpServerResponse {
+        status,
+        overview: build_overview(&state),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mcp_client_config_snippet(
+    state: State<'_, AppState>,
+) -> Result<McpClientConfigSnippetResponse, UserFacingError> {
+    let status = state.mcp_server_status().await;
+    let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
+        format!(
+            "http://{}:{}/mcp",
+            status.config.bind_host, status.config.port
+        )
+    });
+    let token = state
+        .mcp_token_store
+        .get_or_create_server_token()
+        .map_err(UserFacingError::from)?;
+    let json_snippet = build_client_config_snippet(&endpoint_url, &token);
+    Ok(McpClientConfigSnippetResponse {
+        endpoint_url,
+        json_snippet,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn rotate_mcp_server_token(
+    state: State<'_, AppState>,
+) -> Result<McpClientConfigSnippetResponse, UserFacingError> {
+    let token = state
+        .mcp_token_store
+        .rotate_server_token()
+        .map_err(UserFacingError::from)?;
+    let status = state
+        .sync_mcp_server_runtime(true)
+        .await
+        .map_err(UserFacingError::from)?;
+    let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
+        format!(
+            "http://{}:{}/mcp",
+            status.config.bind_host, status.config.port
+        )
+    });
+    let json_snippet = build_client_config_snippet(&endpoint_url, &token);
+    Ok(McpClientConfigSnippetResponse {
+        endpoint_url,
+        json_snippet,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_mcp_audit_log(state: State<'_, AppState>) -> Vec<McpAuditEntry> {
+    state.mcp_audit.list()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn clear_mcp_audit_log(state: State<'_, AppState>) {
+    state.mcp_audit.clear();
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_pending_mcp_approvals(state: State<'_, AppState>) -> Vec<PendingWriteApproval> {
+    state.mcp_approvals.list_pending()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn resolve_mcp_approval(state: State<'_, AppState>, approval_id: String, allow: bool) -> bool {
+    state.mcp_approvals.resolve(&approval_id, allow)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_external_mcp_servers(state: State<'_, AppState>) -> Vec<ExternalMcpServerView> {
+    state.mcp_client.list_servers()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn upsert_external_mcp_server(
+    state: State<'_, AppState>,
+    server: ExternalMcpServer,
+    bearer_token: Option<String>,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    state
+        .mcp_client
+        .upsert_server(server, bearer_token)
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn delete_external_mcp_server(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    state
+        .mcp_client
+        .delete_server(&server_id)
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_team_mcp_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    let service = require_files_service(&state)?;
+    state
+        .mcp_client
+        .sync_from_nextcloud(service.storage().as_ref())
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn discover_external_mcp_tools(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<ExternalMcpTool>, UserFacingError> {
+    state
+        .mcp_client
+        .discover_tools(&server_id)
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn test_external_mcp_tool(
+    state: State<'_, AppState>,
+    server_id: String,
+    tool_name: String,
+    arguments_json: String,
+) -> Result<McpToolCallOutput, UserFacingError> {
+    let args: serde_json::Value = if arguments_json.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&arguments_json).map_err(|err| {
+            UserFacingError::from(FrError::InvalidConfig(format!(
+                "Arguments must be valid JSON: {err}"
+            )))
+        })?
+    };
+    state
+        .mcp_client
+        .call_tool(&server_id, &tool_name, args)
+        .await
+        .map_err(UserFacingError::from)
 }
 
 #[cfg(test)]

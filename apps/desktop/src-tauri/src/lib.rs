@@ -38,6 +38,20 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::get_file_thumbnail,
         commands::get_media_proxy_url,
         commands::open_file_in_native_app,
+        commands::get_mcp_server_status,
+        commands::configure_mcp_server,
+        commands::get_mcp_client_config_snippet,
+        commands::rotate_mcp_server_token,
+        commands::list_mcp_audit_log,
+        commands::clear_mcp_audit_log,
+        commands::list_pending_mcp_approvals,
+        commands::resolve_mcp_approval,
+        commands::list_external_mcp_servers,
+        commands::upsert_external_mcp_server,
+        commands::delete_external_mcp_server,
+        commands::sync_team_mcp_servers,
+        commands::discover_external_mcp_tools,
+        commands::test_external_mcp_tool,
     ])
 }
 
@@ -95,6 +109,18 @@ pub fn run() {
                     }
                     Err(err) => {
                         tracing::error!("Failed to start local media proxy: {err}");
+                    }
+                }
+                if state.current_config().mcp_server_enabled {
+                    match state.sync_mcp_server_runtime(false).await {
+                        Ok(status) => {
+                            if let Some(ep) = status.endpoint_url {
+                                tracing::info!("Built-in local MCP Server listening on {ep}");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!("Failed to start local MCP Server: {err}");
+                        }
                     }
                 }
             });
