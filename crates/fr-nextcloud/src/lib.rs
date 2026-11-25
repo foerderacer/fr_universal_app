@@ -1,12 +1,25 @@
-//! Nextcloud integration layer (Login Flow v2, WebDAV, OCS API).
-//!
-//! Phase 0 establishes URL normalization, authentication session models, and endpoint helpers.
-//! Phase 1 implements live Login Flow v2, OS keychain persistence, and `NextcloudBackend`.
+//! Nextcloud integration layer:
+//! - Server URL validation & normalization
+//! - Zero-setup Login Flow v2 + OS Keychain credential persistence (`keyring`)
+//! - OCS User & Quota API
+//! - Full WebDAV `NextcloudBackend` implementing `StorageBackend` (with ETag `If-Match` 412 conflict detection,
+//!   byte-range streaming, Chunked Upload v2, and server-generated thumbnails)
+
+pub mod auth;
+pub mod ocs;
+pub mod webdav;
 
 use fr_core::{FrError, Result};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use url::Url;
+
+pub use auth::{
+    CredentialStore, InMemoryCredentialStore, KeyringCredentialStore, LoginFlowSession,
+    LoginPollResult, NextcloudCredentials, initiate_login_flow, poll_login_flow,
+};
+pub use ocs::{UserAccountInfo, fetch_user_account_info};
+pub use webdav::{DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_THRESHOLD, NextcloudBackend};
 
 /// Connection state displayed in the desktop shell status bar and Settings view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -87,6 +100,52 @@ pub fn login_flow_v2_endpoint(server_url: &str) -> Result<String> {
         ));
     }
     Ok(format!("{base}/index.php/login/v2"))
+}
+
+/// Validates that `candidate_url` uses `http`/`https`, has no embedded credentials,
+/// and matches the exact origin (`scheme`, `host`, effective `port`) of `expected_base`.
+pub(crate) fn ensure_same_origin(expected_base: &Url, candidate_url: &str) -> Result<Url> {
+    let parsed = Url::parse(candidate_url).map_err(|err| {
+        FrError::Network(format!(
+            "Nextcloud returned invalid URL '{candidate_url}': {err}"
+        ))
+    })?;
+
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return Err(FrError::Network(format!(
+            "Nextcloud returned unsupported URL scheme '{}'",
+            parsed.scheme()
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FrError::Network(
+            "Nextcloud returned URL with embedded credentials".into(),
+        ));
+    }
+
+    let same_scheme = parsed.scheme() == expected_base.scheme();
+    let same_host = parsed.host_str() == expected_base.host_str();
+    let same_port = parsed.port_or_known_default() == expected_base.port_or_known_default();
+    if !(same_scheme && same_host && same_port) {
+        return Err(FrError::Network(format!(
+            "Nextcloud returned cross-origin URL '{}', expected origin '{}'",
+            parsed.origin().ascii_serialization(),
+            expected_base.origin().ascii_serialization()
+        )));
+    }
+
+    Ok(parsed)
+}
+
+/// Builds a hardened HTTP client for Nextcloud communication (no automatic redirects so
+/// Basic auth headers and poll tokens can never leak cross-origin).
+pub fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("FR Universal App/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|err| FrError::Network(format!("failed to initialize HTTP client: {err}")))
 }
 
 #[cfg(test)]

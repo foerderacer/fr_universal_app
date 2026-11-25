@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   UpdateSettingsRequest,
   UserFacingError,
@@ -8,9 +8,14 @@ import { ErrorBanner } from "./components/ErrorBanner";
 import { Sidebar, type ActiveNavItem } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import {
+  cancelNextcloudLogin,
   loadWorkspaceOverview,
+  pollNextcloudLogin,
+  refreshAccountInfo,
   resetWorkspaceNextcloudUrl,
   saveWorkspaceSettings,
+  signOutNextcloud,
+  startNextcloudLogin,
   toUserFacingError,
 } from "./lib/workspaceClient";
 import { FilesView } from "./views/FilesView";
@@ -30,14 +35,34 @@ export function App() {
   );
   const [activeNav, setActiveNav] = useState<ActiveNavItem>("files");
   const [error, setError] = useState<UserFacingError | null>(null);
+  const [loginPendingUrl, setLoginPendingUrl] = useState<string | null>(null);
+  const [loginStarting, setLoginStarting] = useState(false);
+  const pollInFlightRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     loadWorkspaceOverview()
       .then((data) => {
-        if (!cancelled) {
-          setOverview(data);
-          applyThemePreference(data.config.theme);
+        if (cancelled) return;
+        setOverview(data);
+        applyThemePreference(data.config.theme);
+
+        // Silently populate account display name & quota when a keychain session was restored.
+        if (
+          data.connectionStatus.state === "connected" &&
+          data.accountInfo === null
+        ) {
+          void refreshAccountInfo()
+            .then((info) => {
+              if (!cancelled && info) {
+                setOverview((prev) =>
+                  prev ? { ...prev, accountInfo: info } : prev,
+                );
+              }
+            })
+            .catch(() => {
+              // Non-fatal: user may be offline.
+            });
         }
       })
       .catch((err) => {
@@ -62,11 +87,48 @@ export function App() {
     return () => media.removeEventListener("change", listener);
   }, [overview]);
 
+  // Poll Nextcloud Login Flow v2 every 2 seconds while waiting for browser approval.
+  useEffect(() => {
+    if (!loginPendingUrl) return;
+    let cancelled = false;
+
+    const timer = window.setInterval(() => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
+      void pollNextcloudLogin()
+        .then((res) => {
+          if (cancelled) return;
+          if (res.completed && res.overview) {
+            setLoginPendingUrl(null);
+            setOverview(res.overview);
+            setError(null);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setLoginPendingUrl(null);
+            setError(toUserFacingError(err));
+          }
+        })
+        .finally(() => {
+          pollInFlightRef.current = false;
+        });
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [loginPendingUrl]);
+
   async function handleSaveSettings(input: UpdateSettingsRequest) {
     setError(null);
     try {
       const updated = await saveWorkspaceSettings(input);
       setOverview(updated);
+      if (updated.connectionStatus.state !== "connected") {
+        setLoginPendingUrl(null);
+      }
     } catch (err) {
       setError(toUserFacingError(err));
       throw err;
@@ -78,7 +140,46 @@ export function App() {
     try {
       const updated = await resetWorkspaceNextcloudUrl();
       setOverview(updated);
+      if (updated.connectionStatus.state !== "connected") {
+        setLoginPendingUrl(null);
+      }
       return updated.config.nextcloudUrl;
+    } catch (err) {
+      setError(toUserFacingError(err));
+      throw err;
+    }
+  }
+
+  async function handleStartLogin() {
+    setError(null);
+    setLoginStarting(true);
+    try {
+      const res = await startNextcloudLogin();
+      setLoginPendingUrl(res.loginUrl);
+    } catch (err) {
+      setError(toUserFacingError(err));
+    } finally {
+      setLoginStarting(false);
+    }
+  }
+
+  async function handleCancelLogin() {
+    setError(null);
+    setLoginPendingUrl(null);
+    try {
+      const updated = await cancelNextcloudLogin();
+      setOverview(updated);
+    } catch (err) {
+      setError(toUserFacingError(err));
+    }
+  }
+
+  async function handleSignOut() {
+    setError(null);
+    setLoginPendingUrl(null);
+    try {
+      const updated = await signOutNextcloud();
+      setOverview(updated);
     } catch (err) {
       setError(toUserFacingError(err));
       throw err;
@@ -104,14 +205,15 @@ export function App() {
   const activeModule =
     activeNav === "settings"
       ? null
-      : overview.modules.find((m) => m.id === activeNav) ?? overview.modules[0];
+      : (overview.modules.find((m) => m.id === activeNav) ??
+        overview.modules[0]);
 
   const headerTitle =
-    activeNav === "settings" ? "Settings" : activeModule?.name ?? "Workspace";
+    activeNav === "settings" ? "Settings" : (activeModule?.name ?? "Workspace");
   const headerSubtitle =
     activeNav === "settings"
       ? "Configure your Nextcloud connection, local cache, and integrations."
-      : activeModule?.description ?? "";
+      : (activeModule?.description ?? "");
 
   return (
     <div className="flex h-full overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -132,6 +234,7 @@ export function App() {
           appVersion={overview.appVersion}
           platform={overview.platform}
           connectionStatus={overview.connectionStatus}
+          accountInfo={overview.accountInfo}
           onOpenSettings={() => setActiveNav("settings")}
         />
 
@@ -146,12 +249,20 @@ export function App() {
               overview={overview}
               onSave={handleSaveSettings}
               onResetUrl={handleResetUrl}
+              onSignOut={handleSignOut}
               error={error}
               onClearError={() => setError(null)}
             />
           ) : activeModule?.id === "files" ? (
             <FilesView
               connectionStatus={overview.connectionStatus}
+              accountInfo={overview.accountInfo}
+              loginPendingUrl={loginPendingUrl}
+              loginStarting={loginStarting}
+              error={error}
+              onClearError={() => setError(null)}
+              onStartLogin={handleStartLogin}
+              onCancelLogin={handleCancelLogin}
               onOpenSettings={() => setActiveNav("settings")}
             />
           ) : activeModule ? (

@@ -21,8 +21,15 @@ async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
+hex = "0.4"
+keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
+percent-encoding = "2.3"
+quick-xml = "0.42"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json", "http2", "charset", "system-proxy"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 specta = { version = "=2.0.0-rc.28", features = ["derive", "chrono"] }
 specta-typescript = "=0.0.15"
 tauri = { version = "2", default-features = false, features = ["wry", "compression", "dynamic-acl", "x11", "dbus"] }
@@ -31,10 +38,12 @@ tauri-plugin-opener = "2"
 tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+wiremock = "0.6"
 
 # Internal workspace crates
 fr-core = { path = "crates/fr-core" }

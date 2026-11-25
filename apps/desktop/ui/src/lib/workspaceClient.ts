@@ -1,7 +1,11 @@
 import { isTauri } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   commands,
+  type LoginPollStatusResponse_Serialize,
+  type LoginStartResponse,
   type UpdateSettingsRequest,
+  type UserAccountInfo_Serialize,
   type UserFacingError,
   type WorkspaceOverview_Serialize,
 } from "../bindings/tauri";
@@ -11,7 +15,8 @@ const BROWSER_STORAGE_KEY = "fr_universal_app_preview_config";
 function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
   const fallbackConfig = {
     nextcloudUrl: "",
-    pinnedFolders: [],
+    nextcloudLoginName: null as string | null,
+    pinnedFolders: [] as string[],
     cacheLimitMb: 2048,
     mcpServerEnabled: false,
     theme: "system",
@@ -35,6 +40,8 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     connectionStatus: config.nextcloudUrl
       ? { state: "signedOut", serverUrl: config.nextcloudUrl }
       : { state: "notConfigured" },
+    accountInfo: null,
+    loginPending: false,
     mcpServer: {
       enabled: config.mcpServerEnabled,
       bindHost: "127.0.0.1",
@@ -113,6 +120,7 @@ export async function saveWorkspaceSettings(
       trimmed && !trimmed.includes("://") ? `https://${trimmed}` : trimmed;
     const nextConfig = {
       nextcloudUrl: normalized,
+      nextcloudLoginName: null,
       pinnedFolders: [],
       cacheLimitMb: Math.max(128, Math.min(32768, input.cacheLimitMb)),
       mcpServerEnabled: input.mcpServerEnabled,
@@ -130,4 +138,67 @@ export async function resetWorkspaceNextcloudUrl(): Promise<WorkspaceOverview_Se
     return createBrowserPreviewOverview();
   }
   return commands.resetNextcloudUrl();
+}
+
+export async function startNextcloudLogin(): Promise<LoginStartResponse> {
+  if (!isTauri()) {
+    throw {
+      code: "browser_preview",
+      title: "Desktop app required",
+      message: "Sign in with Nextcloud works inside the desktop application.",
+      recoveryHint: "Launch FR Universal App via Tauri to sign in.",
+      technicalDetails: null,
+    } satisfies UserFacingError;
+  }
+  return commands.startNextcloudLogin();
+}
+
+export async function pollNextcloudLogin(): Promise<LoginPollStatusResponse_Serialize> {
+  if (!isTauri()) {
+    return { completed: false, overview: null };
+  }
+  return commands.pollNextcloudLogin();
+}
+
+export async function cancelNextcloudLogin(): Promise<WorkspaceOverview_Serialize> {
+  if (!isTauri()) {
+    return createBrowserPreviewOverview();
+  }
+  return commands.cancelNextcloudLogin();
+}
+
+export async function signOutNextcloud(): Promise<WorkspaceOverview_Serialize> {
+  if (!isTauri()) {
+    return createBrowserPreviewOverview();
+  }
+  return commands.signOutNextcloud();
+}
+
+export async function refreshAccountInfo(): Promise<UserAccountInfo_Serialize | null> {
+  if (!isTauri()) {
+    return null;
+  }
+  return commands.refreshAccountInfo();
+}
+
+export async function openExternalUrl(url: string): Promise<void> {
+  if (isTauri()) {
+    await openUrl(url);
+  } else {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || Number.isNaN(bytes) || bytes < 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
 }

@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fr_core::{
     AppConfig, ConfigStore, EventBus, FrModule, ModuleCapability, ModuleDescriptor, ModuleRegistry,
@@ -6,7 +6,11 @@ use fr_core::{
 };
 use fr_mcp::McpServerConfig;
 use fr_mod_files::FilesModule;
-use fr_nextcloud::NextcloudConnectionStatus;
+use fr_nextcloud::{
+    CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
+    NextcloudConnectionStatus, NextcloudCredentials, UserAccountInfo, build_http_client,
+};
+use fr_storage::{CacheStore, CachedStorage, StorageBackend};
 
 /// Placeholder descriptors for upcoming modules shown transparently in the Workspace Shell.
 struct FinancePlaceholderModule;
@@ -49,6 +53,13 @@ pub struct AppState {
     pub config_store: ConfigStore,
     pub config: Mutex<AppConfig>,
     pub startup_error: Mutex<Option<UserFacingError>>,
+    pub credential_store: Arc<dyn CredentialStore>,
+    pub http_client: reqwest::Client,
+    pub cache: Option<CacheStore>,
+    pub active_credentials: Mutex<Option<NextcloudCredentials>>,
+    pub storage: Mutex<Option<Arc<dyn StorageBackend>>>,
+    pub active_login: Mutex<Option<LoginFlowSession>>,
+    pub account_info: Mutex<Option<UserAccountInfo>>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
@@ -88,17 +99,77 @@ impl AppState {
             }
         };
 
+        let cache = ConfigStore::default_cache_dir()
+            .and_then(|dir| CacheStore::open(dir, config.cache_limit_mb))
+            .ok();
+
+        let http_client = build_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let credential_store: Arc<dyn CredentialStore> = Arc::new(KeyringCredentialStore::new());
+
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
         modules.register(FinancePlaceholderModule);
         modules.register(AutomationPlaceholderModule);
 
-        Self {
+        let state = Self {
             config_store,
-            config: Mutex::new(config),
+            config: Mutex::new(config.clone()),
             startup_error: Mutex::new(startup_error),
+            credential_store,
+            http_client,
+            cache,
+            active_credentials: Mutex::new(None),
+            storage: Mutex::new(None),
+            active_login: Mutex::new(None),
+            account_info: Mutex::new(None),
             modules,
             events: EventBus::default(),
+        };
+
+        // Silently restore previous Nextcloud session from OS Keychain if present.
+        if !config.nextcloud_url.trim().is_empty()
+            && let Some(ref login_name) = config.nextcloud_login_name
+            && let Ok(Some(creds)) = state
+                .credential_store
+                .load(&config.nextcloud_url, login_name)
+        {
+            let _ = state.activate_session(creds);
+        }
+
+        state
+    }
+
+    pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
+        let nc = NextcloudBackend::with_client(self.http_client.clone(), creds.clone())?;
+        let backend: Arc<dyn StorageBackend> = match &self.cache {
+            Some(cache) => Arc::new(CachedStorage::new(Arc::new(nc), cache.clone())),
+            None => Arc::new(nc),
+        };
+
+        if let Ok(mut guard) = self.storage.lock() {
+            *guard = Some(backend);
+        }
+        if let Ok(mut guard) = self.active_credentials.lock() {
+            *guard = Some(creds);
+        }
+        Ok(())
+    }
+
+    pub fn clear_active_session(&self, wipe_cache: bool) {
+        if let Ok(mut guard) = self.storage.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.active_credentials.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.active_login.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.account_info.lock() {
+            *guard = None;
+        }
+        if wipe_cache && let Some(ref cache) = self.cache {
+            let _ = cache.clear_all();
         }
     }
 
@@ -122,7 +193,30 @@ impl AppState {
         }
     }
 
+    pub fn current_account_info(&self) -> Option<UserAccountInfo> {
+        self.account_info
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn is_login_pending(&self) -> bool {
+        self.active_login
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn connection_status(&self) -> NextcloudConnectionStatus {
+        if let Ok(guard) = self.active_credentials.lock()
+            && let Some(ref creds) = *guard
+        {
+            return NextcloudConnectionStatus::Connected {
+                server_url: creds.server_url.clone(),
+                login_name: creds.login_name.clone(),
+            };
+        }
+
         let cfg = self.current_config();
         if cfg.nextcloud_url.trim().is_empty() {
             NextcloudConnectionStatus::NotConfigured
