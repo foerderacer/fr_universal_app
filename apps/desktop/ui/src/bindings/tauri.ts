@@ -15,6 +15,22 @@ export const commands = {
 	cancelNextcloudLogin: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("cancel_nextcloud_login", undefined, options),
 	signOutNextcloud: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("sign_out_nextcloud", undefined, options),
 	refreshAccountInfo: (options?: InvokeOptions) => __TAURI_INVOKE<UserAccountInfo_Serialize | null>("refresh_account_info", undefined, options),
+	listFiles: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<FileItemView_Serialize[]>("list_files", { path }, options),
+	searchFiles: (path: string, query: string, options?: InvokeOptions) => __TAURI_INVOKE<FileItemView_Serialize[]>("search_files", { path, query }, options),
+	createFolder: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("create_folder", { path }, options),
+	renameFile: (from: string, to: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("rename_file", { from, to }, options),
+	deleteFile: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("delete_file", { path }, options),
+	uploadFileBase64: (path: string, dataBase64: string, options?: InvokeOptions) => __TAURI_INVOKE<Etag>("upload_file_base64", { path, dataBase64 }, options),
+	togglePinFolder: (folderPath: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("toggle_pin_folder", { folderPath }, options),
+	readMarkdownFile: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<MarkdownDocument_Serialize>("read_markdown_file", { path }, options),
+	saveMarkdownFile: (path: string, content: string, expectedEtag: Etag | null, forceOverwrite: boolean, options?: InvokeOptions) => __TAURI_INVOKE<SaveMarkdownResponse>("save_markdown_file", { path, content, expectedEtag, forceOverwrite }, options),
+	saveMarkdownCopy: (originalPath: string, content: string, options?: InvokeOptions) => __TAURI_INVOKE<SaveMarkdownResponse>("save_markdown_copy", { originalPath, content }, options),
+	saveMarkdownDraft: (path: string, content: string, baseEtag: Etag | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_markdown_draft", { path, content, baseEtag }, options),
+	discardMarkdownDraft: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("discard_markdown_draft", { path }, options),
+	getFilePreview: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<FilePreviewPayload_Serialize>("get_file_preview", { path }, options),
+	getFileThumbnail: (fileId: string, width: number, height: number, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_file_thumbnail", { fileId, width, height }, options),
+	getMediaProxyUrl: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_media_proxy_url", { path }, options),
+	openFileInNativeApp: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("open_file_in_native_app", { path }, options),
 };
 
 /* Types */
@@ -53,6 +69,98 @@ export type AppConfig_Serialize = {
 	theme: string,
 };
 
+/**
+ *  Normalized, POSIX-style virtual cloud path always starting with `/`.
+ * 
+ *  Examples:
+ *  - Root: `/`
+ *  - Folder: `/Projects/Design`
+ *  - File: `/Projects/Design/spec.md`
+ */
+export type CloudPath = string;
+
+/**  Opaque entity tag used for optimistic concurrency (`If-Match` / HTTP 412 conflict detection). */
+export type Etag = string;
+
+/**  Normalized metadata for a file or folder returned by any [`crate::StorageBackend`]. */
+export type FileEntry = FileEntry_Serialize | FileEntry_Deserialize;
+
+/**  Normalized metadata for a file or folder returned by any [`crate::StorageBackend`]. */
+export type FileEntry_Deserialize = {
+	id: string,
+	name: string,
+	path: CloudPath,
+	kind: FileKind,
+	size: number | null,
+	mimeType?: string | null,
+	etag?: Etag | null,
+	modifiedAt?: string | null,
+};
+
+/**  Normalized metadata for a file or folder returned by any [`crate::StorageBackend`]. */
+export type FileEntry_Serialize = {
+	id: string,
+	name: string,
+	path: CloudPath,
+	kind: FileKind,
+	size: number | null,
+	mimeType: string | null,
+	etag: Etag | null,
+	modifiedAt: string | null,
+};
+
+/**  Enriched file/folder item returned by the Files module for UI and MCP consumers. */
+export type FileItemView = FileItemView_Serialize | FileItemView_Deserialize;
+
+/**  Enriched file/folder item returned by the Files module for UI and MCP consumers. */
+export type FileItemView_Deserialize = {
+	entry: FileEntry_Deserialize,
+	previewKind?: PreviewKind | null,
+	editable: boolean,
+};
+
+/**  Enriched file/folder item returned by the Files module for UI and MCP consumers. */
+export type FileItemView_Serialize = {
+	entry: FileEntry_Serialize,
+	previewKind: PreviewKind | null,
+	editable: boolean,
+};
+
+/**  Distinguishes directories from regular files. */
+export type FileKind = "directory" | "file";
+
+/**  Unified preview payload dispatched by [`FilesService::build_preview`]. */
+export type FilePreviewPayload = FilePreviewPayload_Serialize | FilePreviewPayload_Deserialize;
+
+/**  Unified preview payload dispatched by [`FilesService::build_preview`]. */
+export type FilePreviewPayload_Deserialize = {
+	entry: FileEntry_Deserialize,
+	previewKind: PreviewKind,
+	mediaUrl?: string | null,
+	textContent?: string | null,
+	imageDimensions?: ImageDimensions | null,
+	solidworks?: SolidWorksPreview_Deserialize | null,
+	thumbnailDataUrl?: string | null,
+	note?: string | null,
+};
+
+/**  Unified preview payload dispatched by [`FilesService::build_preview`]. */
+export type FilePreviewPayload_Serialize = {
+	entry: FileEntry_Serialize,
+	previewKind: PreviewKind,
+	mediaUrl: string | null,
+	textContent: string | null,
+	imageDimensions: ImageDimensions | null,
+	solidworks: SolidWorksPreview_Serialize | null,
+	thumbnailDataUrl: string | null,
+	note: string | null,
+};
+
+export type ImageDimensions = {
+	width: number,
+	height: number,
+};
+
 /**  Returned on each Login Flow v2 poll tick. */
 export type LoginPollStatusResponse = LoginPollStatusResponse_Serialize | LoginPollStatusResponse_Deserialize;
 
@@ -73,6 +181,46 @@ export type LoginStartResponse = {
 	serverUrl: string,
 	loginUrl: string,
 	browserOpened: boolean,
+};
+
+/**  Markdown document opened for WYSIWYG / raw editing, including any unsaved local draft. */
+export type MarkdownDocument = MarkdownDocument_Serialize | MarkdownDocument_Deserialize;
+
+/**  Markdown document opened for WYSIWYG / raw editing, including any unsaved local draft. */
+export type MarkdownDocument_Deserialize = {
+	path: CloudPath,
+	name: string,
+	content: string,
+	etag: Etag,
+	draft?: MarkdownDraft_Deserialize | null,
+};
+
+/**  Markdown document opened for WYSIWYG / raw editing, including any unsaved local draft. */
+export type MarkdownDocument_Serialize = {
+	path: CloudPath,
+	name: string,
+	content: string,
+	etag: Etag,
+	draft: MarkdownDraft_Serialize | null,
+};
+
+/**  Local unsaved Markdown draft stored in SQLite so edits survive crashes or offline periods. */
+export type MarkdownDraft = MarkdownDraft_Serialize | MarkdownDraft_Deserialize;
+
+/**  Local unsaved Markdown draft stored in SQLite so edits survive crashes or offline periods. */
+export type MarkdownDraft_Deserialize = {
+	path: CloudPath,
+	content: string,
+	baseEtag?: Etag | null,
+	updatedAtMs: number | null,
+};
+
+/**  Local unsaved Markdown draft stored in SQLite so edits survive crashes or offline periods. */
+export type MarkdownDraft_Serialize = {
+	path: CloudPath,
+	content: string,
+	baseEtag: Etag | null,
+	updatedAtMs: number | null,
 };
 
 /**  Configuration for the built-in local MCP Server. */
@@ -102,6 +250,63 @@ export type ModuleStatus = "active" | "preview" | "planned";
 
 /**  Connection state displayed in the desktop shell status bar and Settings view. */
 export type NextcloudConnectionStatus = { state: "notConfigured" } | { state: "signedOut"; serverUrl: string } | { state: "connected"; serverUrl: string; loginName: string };
+
+/**  Rendering/preview strategy selected for a file in the Files workspace. */
+export type PreviewKind = "markdown" | "image" | "video" | "pdf" | "vectorSvg" | "vectorAi" | "vectorDxf" | "vectorEps" | "solidWorks" | "cad3d" | "plainText" | "unsupported";
+
+/**  Result of saving a Markdown document to Nextcloud. */
+export type SaveMarkdownResponse = {
+	path: CloudPath,
+	etag: Etag,
+};
+
+/**  Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams. */
+export type SolidWorksMetadata = SolidWorksMetadata_Serialize | SolidWorksMetadata_Deserialize;
+
+/**  Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams. */
+export type SolidWorksMetadata_Deserialize = {
+	title?: string | null,
+	subject?: string | null,
+	author?: string | null,
+	keywords?: string | null,
+	comments?: string | null,
+	lastSavedBy?: string | null,
+	applicationName?: string | null,
+	createdAt?: string | null,
+	lastSavedAt?: string | null,
+};
+
+/**  Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams. */
+export type SolidWorksMetadata_Serialize = {
+	title: string | null,
+	subject: string | null,
+	author: string | null,
+	keywords: string | null,
+	comments: string | null,
+	lastSavedBy: string | null,
+	applicationName: string | null,
+	createdAt: string | null,
+	lastSavedAt: string | null,
+};
+
+/**  Pure-Rust preview payload extracted from a SolidWorks `.sldprt` / `.sldasm` / `.slddrw` file. */
+export type SolidWorksPreview = SolidWorksPreview_Serialize | SolidWorksPreview_Deserialize;
+
+/**  Pure-Rust preview payload extracted from a SolidWorks `.sldprt` / `.sldasm` / `.slddrw` file. */
+export type SolidWorksPreview_Deserialize = {
+	/**  Data URL (`data:image/png;base64,...`) of the embedded thumbnail, if present. */
+	thumbnailDataUrl?: string | null,
+	metadata: SolidWorksMetadata_Deserialize,
+	streamCount: number,
+};
+
+/**  Pure-Rust preview payload extracted from a SolidWorks `.sldprt` / `.sldasm` / `.slddrw` file. */
+export type SolidWorksPreview_Serialize = {
+	/**  Data URL (`data:image/png;base64,...`) of the embedded thumbnail, if present. */
+	thumbnailDataUrl: string | null,
+	metadata: SolidWorksMetadata_Serialize,
+	streamCount: number,
+};
 
 /**  Partial update payload submitted from the Settings screen. */
 export type UpdateSettingsRequest = {

@@ -1,12 +1,18 @@
-//! Client-side preview classification and extractors.
-//!
-//! Phase 0 provides deterministic preview classification for all Phase 1 target formats.
-//! Phase 1 adds SolidWorks OLE2/CFBF preview extraction, SVG sanitization, and media streaming helpers.
+//! Client-side preview classification, SolidWorks OLE2/CFBF extractor, image transcoding,
+//! and ephemeral loopback Range-request media streaming proxy.
+
+pub mod image_helper;
+pub mod media_proxy;
+pub mod solidworks;
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+
+pub use image_helper::{ImageDimensions, inspect_image_dimensions, transcode_to_png};
+pub use media_proxy::MediaProxyServer;
+pub use solidworks::{SolidWorksMetadata, SolidWorksPreview, extract_solidworks_preview};
 
 /// Rendering/preview strategy selected for a file in the Files workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -35,7 +41,7 @@ pub fn classify_preview(file_name: &str) -> PreviewKind {
 
     match ext.as_deref() {
         Some("md" | "markdown") => PreviewKind::Markdown,
-        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff") => {
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "avif") => {
             PreviewKind::Image
         }
         Some("mp4" | "webm" | "mov" | "mkv" | "m4v") => PreviewKind::Video,
@@ -45,8 +51,10 @@ pub fn classify_preview(file_name: &str) -> PreviewKind {
         Some("dxf") => PreviewKind::VectorDxf,
         Some("eps") => PreviewKind::VectorEps,
         Some("sldprt" | "sldasm" | "slddrw") => PreviewKind::SolidWorks,
-        Some("step" | "stp" | "stl" | "glb" | "gltf") => PreviewKind::Cad3d,
-        Some("txt" | "json" | "yaml" | "yml" | "csv" | "log") => PreviewKind::PlainText,
+        Some("step" | "stp" | "stl" | "glb" | "gltf" | "obj") => PreviewKind::Cad3d,
+        Some("txt" | "json" | "yaml" | "yml" | "csv" | "log" | "xml" | "toml") => {
+            PreviewKind::PlainText
+        }
         _ => PreviewKind::Unsupported,
     }
 }
@@ -54,6 +62,19 @@ pub fn classify_preview(file_name: &str) -> PreviewKind {
 /// Returns whether the file supports in-app editing in Phase 1.
 pub fn is_editable_in_app(kind: PreviewKind) -> bool {
     matches!(kind, PreviewKind::Markdown)
+}
+
+/// Returns whether an image extension should be transcoded to PNG by the Rust proxy for
+/// consistent WebView2/WKWebView rendering.
+pub fn needs_png_transcode(file_name: &str) -> bool {
+    matches!(
+        Path::new(file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("tif" | "tiff" | "bmp")
+    )
 }
 
 #[cfg(test)]
@@ -73,5 +94,7 @@ mod tests {
         assert_eq!(classify_preview("spec.pdf"), PreviewKind::Pdf);
         assert!(is_editable_in_app(PreviewKind::Markdown));
         assert!(!is_editable_in_app(PreviewKind::SolidWorks));
+        assert!(needs_png_transcode("scan.tiff"));
+        assert!(!needs_png_transcode("photo.png"));
     }
 }

@@ -126,7 +126,7 @@ pub async fn initiate_login_flow(
 
 /// Polls Nextcloud once to see if the user has granted access in the browser.
 ///
-/// - HTTP `404` → [`LoginPollResult::Pending`]
+/// - HTTP `404`, `429`, `5xx`, or transient transport errors → [`LoginPollResult::Pending`]
 /// - HTTP `200` → [`LoginPollResult::Completed`] (after validating returned server origin)
 pub async fn poll_login_flow(
     client: &reqwest::Client,
@@ -137,19 +137,15 @@ pub async fn poll_login_flow(
 
     let resp = match client
         .post(&session.poll_endpoint)
+        .timeout(std::time::Duration::from_secs(20))
         .form(&[("token", session.poll_token.as_str())])
         .send()
         .await
     {
         Ok(r) => r,
-        Err(err) if err.is_timeout() || err.is_connect() => {
-            // Treat brief connectivity blips as pending so an approved browser login isn't aborted.
+        Err(_) => {
+            // Poll is idempotent and bounded by the UI timeout; treat transient network errors as pending.
             return Ok(LoginPollResult::Pending);
-        }
-        Err(err) => {
-            return Err(FrError::Network(format!(
-                "Nextcloud login poll failed: {err}"
-            )));
         }
     };
 

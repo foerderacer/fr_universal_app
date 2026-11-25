@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
 fr-core.workspace = true
 fr-preview.workspace = true
 fr-storage.workspace = true
@@ -12,7 +15,6 @@ serde.workspace = true
 specta.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

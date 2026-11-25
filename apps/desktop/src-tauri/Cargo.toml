@@ -12,11 +12,14 @@ name = "fr_desktop_lib"
 tauri-build.workspace = true
 
 [dependencies]
+base64.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 fr-core.workspace = true
 fr-mcp.workspace = true
 fr-mod-files.workspace = true
 fr-nextcloud.workspace = true
+fr-preview.workspace = true
 fr-storage.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -26,6 +29,7 @@ specta-typescript.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-specta.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

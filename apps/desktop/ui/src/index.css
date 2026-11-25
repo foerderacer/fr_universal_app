@@ -19,3 +19,106 @@ body,
   height: 100%;
   margin: 0;
 }
+
+.fr-checkerboard {
+  background-color: #f1f5f9;
+  background-image:
+    linear-gradient(45deg, #cbd5e1 25%, transparent 25%),
+    linear-gradient(-45deg, #cbd5e1 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #cbd5e1 75%),
+    linear-gradient(-45deg, transparent 75%, #cbd5e1 75%);
+  background-size: 20px 20px;
+  background-position:
+    0 0,
+    0 10px,
+    10px -10px,
+    -10px 0;
+}
+
+.dark .fr-checkerboard {
+  background-color: #0f172a;
+  background-image:
+    linear-gradient(45deg, #1e293b 25%, transparent 25%),
+    linear-gradient(-45deg, #1e293b 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #1e293b 75%),
+    linear-gradient(-45deg, transparent 75%, #1e293b 75%);
+}
+
+.fr-prose .ProseMirror {
+  outline: none;
+  min-height: 360px;
+  font-size: 0.9375rem;
+  line-height: 1.7;
+}
+
+.fr-prose .ProseMirror h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 1rem 0 0.5rem;
+}
+
+.fr-prose .ProseMirror h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 0.9rem 0 0.4rem;
+}
+
+.fr-prose .ProseMirror p {
+  margin: 0.5rem 0;
+}
+
+.fr-prose .ProseMirror ul {
+  list-style: disc;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.fr-prose .ProseMirror ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.fr-prose .ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+}
+
+.fr-prose .ProseMirror ul[data-type="taskList"] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.fr-prose .ProseMirror blockquote {
+  border-left: 3px solid #3b82f6;
+  padding-left: 0.875rem;
+  color: #64748b;
+  margin: 0.75rem 0;
+}
+
+.fr-prose .ProseMirror pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-size: 0.8125rem;
+}
+
+.fr-prose .ProseMirror table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.75rem 0;
+}
+
+.fr-prose .ProseMirror th,
+.fr-prose .ProseMirror td {
+  border: 1px solid #cbd5e1;
+  padding: 0.4rem 0.6rem;
+}
+
+.dark .fr-prose .ProseMirror th,
+.dark .fr-prose .ProseMirror td {
+  border-color: #334155;
+}

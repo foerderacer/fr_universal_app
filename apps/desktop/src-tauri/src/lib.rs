@@ -1,7 +1,11 @@
 pub mod commands;
 pub mod state;
 
+use std::sync::Arc;
+
+use fr_preview::MediaProxyServer;
 use specta_typescript::Typescript;
+use tauri::Manager;
 use tauri_specta::{Builder, collect_commands};
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +21,22 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::cancel_nextcloud_login,
         commands::sign_out_nextcloud,
         commands::refresh_account_info,
+        commands::list_files,
+        commands::search_files,
+        commands::create_folder,
+        commands::rename_file,
+        commands::delete_file,
+        commands::upload_file_base64,
+        commands::toggle_pin_folder,
+        commands::read_markdown_file,
+        commands::save_markdown_file,
+        commands::save_markdown_copy,
+        commands::save_markdown_draft,
+        commands::discard_markdown_draft,
+        commands::get_file_preview,
+        commands::get_file_thumbnail,
+        commands::get_media_proxy_url,
+        commands::open_file_in_native_app,
     ])
 }
 
@@ -35,16 +55,6 @@ pub fn run() {
         .try_init();
 
     let builder = specta_builder();
-
-    #[cfg(debug_assertions)]
-    {
-        let bindings_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/bindings/tauri.ts");
-        if let Err(err) = builder.export(typescript_exporter(), &bindings_path) {
-            tracing::warn!("Failed to export TypeScript IPC bindings: {err}");
-        }
-    }
-
     let app_state = AppState::initialize();
 
     tauri::Builder::default()
@@ -53,6 +63,22 @@ pub fn run() {
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                match MediaProxyServer::start(state.storage.clone()).await {
+                    Ok(proxy) => {
+                        tracing::info!(
+                            "Local Range-streaming media proxy listening on {}",
+                            proxy.addr()
+                        );
+                        state.set_media_proxy(Arc::new(proxy));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to start local media proxy: {err}");
+                    }
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
