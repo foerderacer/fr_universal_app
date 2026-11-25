@@ -49,7 +49,18 @@ fn normalize_lock_key(root: &Path) -> String {
 
     let mut full = canonical_base;
     for part in tail.into_iter().rev() {
-        full.push(part);
+        #[cfg(windows)]
+        {
+            let text = part.to_string_lossy();
+            let trimmed = text.trim_end_matches(['.', ' ']);
+            if !trimmed.is_empty() {
+                full.push(trimmed);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            full.push(part);
+        }
     }
 
     let raw = full.to_string_lossy().replace('\\', "/");
@@ -685,6 +696,30 @@ mod tests {
 
         assert_eq!(ok_count, 1);
         assert_eq!(conflict_count, 1);
+    }
+
+    #[tokio::test]
+    async fn lock_key_matches_before_and_after_root_creation() {
+        let parent = tempdir().expect("tempdir");
+        #[cfg(windows)]
+        let dotted = parent.path().join("dotted.");
+        #[cfg(not(windows))]
+        let dotted = parent.path().join("fresh");
+
+        let lock_before = lock_for_root(&dotted);
+        let backend = LocalFsBackend::new(&dotted);
+        backend
+            .mkdir(&CloudPath::parse("/sub").unwrap())
+            .await
+            .unwrap();
+        let lock_after = lock_for_root(&dotted);
+        assert!(Arc::ptr_eq(&lock_before, &lock_after));
+
+        #[cfg(windows)]
+        {
+            let lock_plain = lock_for_root(&parent.path().join("dotted"));
+            assert!(Arc::ptr_eq(&lock_before, &lock_plain));
+        }
     }
 
     #[cfg(unix)]
