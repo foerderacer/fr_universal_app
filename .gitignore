@@ -1,6 +1,11 @@
 # Local planning docs (never committed)
 .plan/
 
+# Local environment overrides (never commit secrets or private URLs)
+.env
+.env.*
+!.env.example
+
 # Rust / Cargo
 /target/
 **/*.rs.bk
