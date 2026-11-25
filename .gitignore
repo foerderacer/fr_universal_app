@@ -1,0 +1,16 @@
+# Local planning docs (never committed)
+.plan/
+
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
