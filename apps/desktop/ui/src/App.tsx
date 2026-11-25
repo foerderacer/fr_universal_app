@@ -45,6 +45,7 @@ export function App() {
       .then((data) => {
         if (cancelled) return;
         setOverview(data);
+        setLoginPendingUrl(data.loginPendingUrl);
         applyThemePreference(data.config.theme);
 
         // Silently populate account display name & quota when a keychain session was restored.
@@ -87,12 +88,28 @@ export function App() {
     return () => media.removeEventListener("change", listener);
   }, [overview]);
 
-  // Poll Nextcloud Login Flow v2 every 2 seconds while waiting for browser approval.
+  // Poll Nextcloud Login Flow v2 every 2 seconds while waiting for browser approval,
+  // with a 10-minute expiration timeout so abandoned flows clean up gracefully.
   useEffect(() => {
     if (!loginPendingUrl) return;
     let cancelled = false;
+    const startedAt = Date.now();
+    const MAX_LOGIN_WAIT_MS = 10 * 60 * 1000;
 
     const timer = window.setInterval(() => {
+      if (Date.now() - startedAt > MAX_LOGIN_WAIT_MS) {
+        setLoginPendingUrl(null);
+        void cancelNextcloudLogin().catch(() => {});
+        setError({
+          code: "login_expired",
+          title: "Sign-in session timed out",
+          message: "The browser sign-in link expired before approval completed.",
+          recoveryHint: "Click Sign in with Nextcloud to open a fresh sign-in link.",
+          technicalDetails: null,
+        });
+        return;
+      }
+
       if (pollInFlightRef.current) return;
       pollInFlightRef.current = true;
       void pollNextcloudLogin()
@@ -107,6 +124,7 @@ export function App() {
         .catch((err) => {
           if (!cancelled) {
             setLoginPendingUrl(null);
+            void cancelNextcloudLogin().catch(() => {});
             setError(toUserFacingError(err));
           }
         })

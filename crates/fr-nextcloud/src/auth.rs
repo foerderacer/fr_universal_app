@@ -135,14 +135,28 @@ pub async fn poll_login_flow(
     let expected_base = Url::parse(&session.server_url)
         .map_err(|err| FrError::InvalidConfig(format!("invalid server URL: {err}")))?;
 
-    let resp = client
+    let resp = match client
         .post(&session.poll_endpoint)
         .form(&[("token", session.poll_token.as_str())])
         .send()
         .await
-        .map_err(|err| FrError::Network(format!("Nextcloud login poll failed: {err}")))?;
+    {
+        Ok(r) => r,
+        Err(err) if err.is_timeout() || err.is_connect() => {
+            // Treat brief connectivity blips as pending so an approved browser login isn't aborted.
+            return Ok(LoginPollResult::Pending);
+        }
+        Err(err) => {
+            return Err(FrError::Network(format!(
+                "Nextcloud login poll failed: {err}"
+            )));
+        }
+    };
 
-    if resp.status() == StatusCode::NOT_FOUND {
+    if resp.status() == StatusCode::NOT_FOUND
+        || resp.status() == StatusCode::TOO_MANY_REQUESTS
+        || resp.status().is_server_error()
+    {
         return Ok(LoginPollResult::Pending);
     }
 

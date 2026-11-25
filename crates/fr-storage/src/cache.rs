@@ -90,12 +90,42 @@ impl CacheStore {
         .map_err(sqlite_err)?;
 
         let max_bytes = u64::from(max_limit_mb.max(16)) * 1024 * 1024;
-        Ok(Self {
+        let store = Self {
             root,
             blobs_dir,
             conn: Arc::new(Mutex::new(conn)),
             max_bytes: Arc::new(Mutex::new(max_bytes)),
-        })
+        };
+        let _ = store.sweep_orphaned_blobs();
+        Ok(store)
+    }
+
+    fn sweep_orphaned_blobs(&self) -> Result<()> {
+        let referenced: std::collections::HashSet<String> = {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut stmt = conn
+                .prepare("SELECT file_name FROM cached_blobs")
+                .map_err(sqlite_err)?;
+            let rows = stmt.query_map([], |row| row.get(0)).map_err(sqlite_err)?;
+            let mut set = std::collections::HashSet::new();
+            for row in rows {
+                set.insert(row.map_err(sqlite_err)?);
+            }
+            set
+        };
+
+        if let Ok(entries) = std::fs::read_dir(&self.blobs_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !referenced.contains(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -380,30 +410,48 @@ impl CacheStore {
     }
 
     /// Clears all cached directory listings, blobs, thumbnails, and drafts (e.g. on sign-out).
-    pub fn clear_all(&self) -> Result<()> {
-        let files: Vec<String> = {
+    fn wipe_blobs_dir(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.blobs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    /// Clears cached directory listings, blobs, and thumbnails (including any orphaned files
+    /// in `blobs_dir`) while preserving unsaved local `markdown_drafts` so user edits are never
+    /// silently lost on sign-out or server change.
+    pub fn clear_cached_data(&self) -> Result<()> {
+        {
             let conn = self
                 .conn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut stmt = conn
-                .prepare("SELECT file_name FROM cached_blobs")
+            conn.execute_batch("DELETE FROM cached_dirs; DELETE FROM cached_blobs; VACUUM;")
                 .map_err(sqlite_err)?;
-            let rows = stmt.query_map([], |row| row.get(0)).map_err(sqlite_err)?;
-            let mut list = Vec::new();
-            for row in rows {
-                list.push(row.map_err(sqlite_err)?);
-            }
+        }
+        self.wipe_blobs_dir();
+        Ok(())
+    }
+
+    /// Clears all cached directory listings, blobs, thumbnails, and drafts.
+    pub fn clear_all(&self) -> Result<()> {
+        {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             conn.execute_batch(
-                "DELETE FROM cached_dirs; DELETE FROM cached_blobs; DELETE FROM markdown_drafts;",
+                "DELETE FROM cached_dirs; DELETE FROM cached_blobs; DELETE FROM markdown_drafts; VACUUM;",
             )
             .map_err(sqlite_err)?;
-            list
-        };
-
-        for file_name in files {
-            let _ = std::fs::remove_file(self.blobs_dir.join(file_name));
         }
+        self.wipe_blobs_dir();
         Ok(())
     }
 
@@ -693,6 +741,31 @@ mod tests {
 
         cache.delete_markdown_draft(&path).unwrap();
         assert!(cache.get_markdown_draft(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_cached_data_sweeps_orphans_and_preserves_drafts() {
+        let dir = tempdir().expect("tempdir");
+        let cache = CacheStore::open(dir.path(), 64).unwrap();
+        let path = CloudPath::parse("/Docs/notes.md").unwrap();
+
+        cache
+            .save_markdown_draft(&path, "# Unsaved edits", None)
+            .unwrap();
+        cache.put_blob(&path, &Etag::new("e1"), b"cached").unwrap();
+
+        let orphan = dir.path().join("blobs").join("orphan.blob");
+        std::fs::write(&orphan, b"stale secret").unwrap();
+
+        cache.clear_cached_data().unwrap();
+
+        assert!(!orphan.exists());
+        assert!(cache.get_blob(&path, &Etag::new("e1")).unwrap().is_none());
+        let draft = cache
+            .get_markdown_draft(&path)
+            .unwrap()
+            .expect("draft must survive cache clear");
+        assert_eq!(draft.content, "# Unsaved edits");
     }
 
     #[tokio::test]

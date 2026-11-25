@@ -41,7 +41,7 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
       ? { state: "signedOut", serverUrl: config.nextcloudUrl }
       : { state: "notConfigured" },
     accountInfo: null,
-    loginPending: false,
+    loginPendingUrl: null,
     mcpServer: {
       enabled: config.mcpServerEnabled,
       bindHost: "127.0.0.1",

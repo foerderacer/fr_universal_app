@@ -59,7 +59,7 @@ pub fn normalize_server_url(raw: &str) -> Result<String> {
     };
 
     let parsed = Url::parse(&candidate)
-        .map_err(|err| FrError::InvalidConfig(format!("invalid Nextcloud URL '{raw}': {err}")))?;
+        .map_err(|err| FrError::InvalidConfig(format!("invalid Nextcloud URL: {err}")))?;
 
     match parsed.scheme() {
         "https" | "http" => {}
@@ -138,12 +138,13 @@ pub(crate) fn ensure_same_origin(expected_base: &Url, candidate_url: &str) -> Re
 }
 
 /// Builds a hardened HTTP client for Nextcloud communication (no automatic redirects so
-/// Basic auth headers and poll tokens can never leak cross-origin).
+/// Basic auth headers and poll tokens can never leak cross-origin; connect timeout without
+/// cutting off large streaming uploads/downloads).
 pub fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("FR Universal App/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|err| FrError::Network(format!("failed to initialize HTTP client: {err}")))
 }

@@ -180,6 +180,12 @@ export function SettingsView({
               </button>
             )}
           </div>
+          {nextcloudUrl.trim().toLowerCase().startsWith("http://") && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Heads up: this address uses unencrypted <code>http://</code>. Use{" "}
+              <code>https://</code> for production Nextcloud servers.
+            </p>
+          )}
         </div>
       </section>
 

@@ -139,12 +139,13 @@ impl NextcloudBackend {
             StatusCode::METHOD_NOT_ALLOWED | StatusCode::CONFLICT => {
                 FrError::AlreadyExists(path.to_string())
             }
-            StatusCode::PRECONDITION_FAILED => FrError::Conflict {
-                path: path.to_string(),
-                expected: expected_etag
-                    .map(|e| e.as_str().to_owned())
-                    .unwrap_or_default(),
-                actual: "modified-on-server".into(),
+            StatusCode::PRECONDITION_FAILED => match expected_etag {
+                Some(etag) => FrError::Conflict {
+                    path: path.to_string(),
+                    expected: etag.as_str().to_owned(),
+                    actual: "modified-on-server".into(),
+                },
+                None => FrError::AlreadyExists(path.to_string()),
             },
             other => FrError::Network(format!(
                 "Nextcloud WebDAV request for '{path}' failed with HTTP {}",
@@ -187,15 +188,34 @@ impl NextcloudBackend {
         data: Bytes,
         expected_etag: Option<&Etag>,
     ) -> Result<Etag> {
+        // SabreDAV evaluates `If-Match` on `MOVE` against the temporary `.file` source node,
+        // not the destination file. Perform a pre-flight ETag check against the destination
+        // before starting the chunked upload (note: a narrow TOCTOU window remains during upload).
+        if let Some(expected) = expected_etag {
+            let remote = self.stat(path).await?;
+            let actual = remote.etag.as_ref().map(Etag::as_str).unwrap_or_default();
+            if actual != expected.as_str() {
+                return Err(FrError::Conflict {
+                    path: path.to_string(),
+                    expected: expected.as_str().to_owned(),
+                    actual: actual.to_owned(),
+                });
+            }
+        }
+
         let upload_id = format!("fr-{}", Uuid::new_v4());
         let upload_dir_url = self.uploads_base_url(&upload_id);
+        let dest_url = self.dav_url(path);
         let mkcol = Method::from_bytes(b"MKCOL")
             .map_err(|err| FrError::Other(format!("invalid MKCOL method: {err}")))?;
 
+        // Nextcloud Chunked Upload v2 requires the `Destination` header on MKCOL, chunk PUTs,
+        // and the final assemble MOVE.
         let mkcol_resp = self
             .client
             .request(mkcol, &upload_dir_url)
             .basic_auth(&self.creds.login_name, Some(&self.creds.app_password))
+            .header("Destination", &dest_url)
             .send()
             .await
             .map_err(|err| FrError::Network(format!("chunked upload MKCOL failed: {err}")))?;
@@ -220,6 +240,7 @@ impl NextcloudBackend {
                 .client
                 .put(&part_url)
                 .basic_auth(&self.creds.login_name, Some(&self.creds.app_password))
+                .header("Destination", &dest_url)
                 .header("OC-Total-Length", total_len.to_string())
                 .body(chunk)
                 .send()
@@ -244,22 +265,18 @@ impl NextcloudBackend {
         let move_method = Method::from_bytes(b"MOVE")
             .map_err(|err| FrError::Other(format!("invalid MOVE method: {err}")))?;
         let assemble_url = format!("{upload_dir_url}/.file");
-        let dest_url = self.dav_url(path);
 
-        let mut req = self
+        let move_resp = self
             .client
             .request(move_method, &assemble_url)
             .basic_auth(&self.creds.login_name, Some(&self.creds.app_password))
-            .header("Destination", dest_url)
-            .header("OC-Total-Length", total_len.to_string());
-
-        if let Some(etag) = expected_etag {
-            req = req.header("If-Match", Self::format_if_match(etag));
-        }
-
-        let move_resp = req.send().await.map_err(|err| {
-            FrError::Network(format!("chunked upload assemble MOVE failed: {err}"))
-        })?;
+            .header("Destination", &dest_url)
+            .header("OC-Total-Length", total_len.to_string())
+            .send()
+            .await
+            .map_err(|err| {
+                FrError::Network(format!("chunked upload assemble MOVE failed: {err}"))
+            })?;
 
         if !move_resp.status().is_success() {
             let status = move_resp.status();
@@ -478,6 +495,9 @@ impl StorageBackend for NextcloudBackend {
             .map_err(|err| FrError::Network(format!("WebDAV MOVE failed: {err}")))?;
 
         if !resp.status().is_success() {
+            if resp.status() == StatusCode::PRECONDITION_FAILED {
+                return Err(FrError::AlreadyExists(to.to_string()));
+            }
             return Err(Self::map_status_error(resp.status(), from, None));
         }
         Ok(())
@@ -722,8 +742,11 @@ fn parse_multistatus_xml(
     }
 
     let mut entries = Vec::new();
+    let mut unmatched_count = 0usize;
+    let total_responses = responses.len();
     for resp in responses {
         let Some(cloud_path) = href_to_cloud_path(&resp.href, dav_base_path) else {
+            unmatched_count += 1;
             continue;
         };
         if skip_self && cloud_path == *requested_path {
@@ -774,6 +797,12 @@ fn parse_multistatus_xml(
             etag,
             modified_at,
         });
+    }
+
+    if total_responses > 0 && unmatched_count == total_responses {
+        return Err(FrError::Network(format!(
+            "Nextcloud WebDAV response paths did not match expected prefix '{dav_base_path}'"
+        )));
     }
 
     Ok(entries)
@@ -908,14 +937,17 @@ mod tests {
     #[tokio::test]
     async fn webdav_chunked_upload_v2_splits_and_assembles() {
         let server = MockServer::start().await;
+        let expected_dest = format!("{}/remote.php/dav/files/alice/big.bin", server.uri());
 
         Mock::given(method("MKCOL"))
+            .and(header("Destination", expected_dest.as_str()))
             .respond_with(ResponseTemplate::new(201))
             .expect(1)
             .mount(&server)
             .await;
 
         Mock::given(method("PUT"))
+            .and(header("Destination", expected_dest.as_str()))
             .and(header("OC-Total-Length", "10"))
             .respond_with(ResponseTemplate::new(201))
             .expect(3)
@@ -923,6 +955,7 @@ mod tests {
             .await;
 
         Mock::given(method("MOVE"))
+            .and(header("Destination", expected_dest.as_str()))
             .and(header("OC-Total-Length", "10"))
             .respond_with(ResponseTemplate::new(201).insert_header("ETag", "\"chunked-etag\""))
             .expect(1)
@@ -939,5 +972,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(etag, Etag::new("chunked-etag"));
+    }
+
+    #[tokio::test]
+    async fn webdav_rename_412_maps_to_already_exists() {
+        let server = MockServer::start().await;
+        Mock::given(method("MOVE"))
+            .and(header("Overwrite", "F"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+
+        let backend = test_backend(server.uri());
+        let err = backend
+            .rename(
+                &CloudPath::parse("/a.md").unwrap(),
+                &CloudPath::parse("/b.md").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FrError::AlreadyExists(_)));
+    }
+
+    #[tokio::test]
+    async fn webdav_propfind_errors_when_all_hrefs_unmatched() {
+        let server = MockServer::start().await;
+        let xml = r#"<?xml version="1.0"?>
+        <d:multistatus xmlns:d="DAV:">
+          <d:response>
+            <d:href>/wrong-prefix/dav/files/alice/file.txt</d:href>
+            <d:propstat>
+              <d:prop><d:resourcetype/></d:prop>
+              <d:status>HTTP/1.1 200 OK</d:status>
+            </d:propstat>
+          </d:response>
+        </d:multistatus>"#;
+
+        Mock::given(method("PROPFIND"))
+            .respond_with(ResponseTemplate::new(207).set_body_string(xml))
+            .mount(&server)
+            .await;
+
+        let backend = test_backend(server.uri());
+        let err = backend.list(&CloudPath::root()).await.unwrap_err();
+        assert!(matches!(err, FrError::Network(_)));
     }
 }

@@ -103,7 +103,8 @@ impl AppState {
             .and_then(|dir| CacheStore::open(dir, config.cache_limit_mb))
             .ok();
 
-        let http_client = build_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let http_client =
+            build_http_client().expect("failed to build hardened Nextcloud HTTP client");
         let credential_store: Arc<dyn CredentialStore> = Arc::new(KeyringCredentialStore::new());
 
         let mut modules = ModuleRegistry::new();
@@ -169,7 +170,7 @@ impl AppState {
             *guard = None;
         }
         if wipe_cache && let Some(ref cache) = self.cache {
-            let _ = cache.clear_all();
+            let _ = cache.clear_cached_data();
         }
     }
 
@@ -200,11 +201,11 @@ impl AppState {
             .and_then(|guard| guard.clone())
     }
 
-    pub fn is_login_pending(&self) -> bool {
+    pub fn login_pending_url(&self) -> Option<String> {
         self.active_login
             .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|s| s.login_url.clone()))
     }
 
     pub fn connection_status(&self) -> NextcloudConnectionStatus {

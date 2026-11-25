@@ -22,7 +22,7 @@ pub struct WorkspaceOverview {
     pub default_nextcloud_url: String,
     pub connection_status: NextcloudConnectionStatus,
     pub account_info: Option<UserAccountInfo>,
-    pub login_pending: bool,
+    pub login_pending_url: Option<String>,
     pub mcp_server: McpServerConfig,
     pub modules: Vec<ModuleDescriptor>,
     pub startup_error: Option<UserFacingError>,
@@ -73,7 +73,7 @@ fn build_overview(state: &AppState) -> WorkspaceOverview {
         default_nextcloud_url: default_nextcloud_url(),
         connection_status: state.connection_status(),
         account_info: state.current_account_info(),
-        login_pending: state.is_login_pending(),
+        login_pending_url: state.login_pending_url(),
         mcp_server: state.mcp_server_config(),
         modules: state.modules.descriptors(),
         startup_error: state.current_startup_error(),
@@ -100,13 +100,21 @@ pub fn update_settings(
         _ => "system".to_owned(),
     };
 
-    let (server_changed, new_cache_limit) = {
+    let (server_changed, prev_server_and_user, new_cache_limit) = {
         let mut guard = state
             .config
             .lock()
             .map_err(|_| lock_error("Mutex poisoned while updating AppConfig"))?;
 
         let server_changed = guard.nextcloud_url != normalized_url;
+        let prev_server_and_user = if server_changed {
+            guard
+                .nextcloud_login_name
+                .clone()
+                .map(|user| (guard.nextcloud_url.clone(), user))
+        } else {
+            None
+        };
         let mut candidate = guard.clone();
         candidate.nextcloud_url = normalized_url;
         if server_changed {
@@ -124,10 +132,15 @@ pub fn update_settings(
 
         let limit = candidate.cache_limit_mb;
         *guard = candidate;
-        (server_changed, limit)
+        (server_changed, prev_server_and_user, limit)
     };
 
     if server_changed {
+        if let Some((prev_url, prev_user)) = prev_server_and_user
+            && !prev_url.trim().is_empty()
+        {
+            let _ = state.credential_store.delete(&prev_url, &prev_user);
+        }
         state.clear_active_session(true);
     }
     if let Some(ref cache) = state.cache {
@@ -150,13 +163,21 @@ pub fn reset_nextcloud_url(
     let default_url =
         normalize_server_url(&default_nextcloud_url()).map_err(UserFacingError::from)?;
 
-    let server_changed = {
+    let (server_changed, prev_server_and_user) = {
         let mut guard = state
             .config
             .lock()
             .map_err(|_| lock_error("Mutex poisoned while resetting Nextcloud URL"))?;
 
         let server_changed = guard.nextcloud_url != default_url;
+        let prev_server_and_user = if server_changed {
+            guard
+                .nextcloud_login_name
+                .clone()
+                .map(|user| (guard.nextcloud_url.clone(), user))
+        } else {
+            None
+        };
         let mut candidate = guard.clone();
         candidate.nextcloud_url = default_url;
         if server_changed {
@@ -169,10 +190,15 @@ pub fn reset_nextcloud_url(
             .map_err(UserFacingError::from)?;
 
         *guard = candidate;
-        server_changed
+        (server_changed, prev_server_and_user)
     };
 
     if server_changed {
+        if let Some((prev_url, prev_user)) = prev_server_and_user
+            && !prev_url.trim().is_empty()
+        {
+            let _ = state.credential_store.delete(&prev_url, &prev_user);
+        }
         state.clear_active_session(true);
     }
 
