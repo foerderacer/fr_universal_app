@@ -18,10 +18,14 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
 bytes = "1"
+cfb = "0.14"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
 percent-encoding = "2.3"
 quick-xml = "0.42"
@@ -32,13 +36,15 @@ serde_json = "1"
 sha2 = "0.10"
 specta = { version = "=2.0.0-rc.28", features = ["derive", "chrono"] }
 specta-typescript = "=0.0.15"
+subtle = "2.6"
 tauri = { version = "2", default-features = false, features = ["wry", "compression", "dynamic-acl", "x11", "dbus"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util", "time", "net"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }

@@ -35,6 +35,7 @@ pub struct FileEntry {
     pub name: String,
     pub path: CloudPath,
     pub kind: FileKind,
+    #[specta(type = f64)]
     pub size: u64,
     pub mime_type: Option<String>,
     pub etag: Option<Etag>,

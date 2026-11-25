@@ -1,7 +1,11 @@
 pub mod commands;
 pub mod state;
 
+use std::sync::Arc;
+
+use fr_preview::MediaProxyServer;
 use specta_typescript::Typescript;
+use tauri::Manager;
 use tauri_specta::{Builder, collect_commands};
 use tracing_subscriber::EnvFilter;
 
@@ -17,7 +21,37 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::cancel_nextcloud_login,
         commands::sign_out_nextcloud,
         commands::refresh_account_info,
+        commands::list_files,
+        commands::search_files,
+        commands::create_folder,
+        commands::rename_file,
+        commands::delete_file,
+        commands::upload_file_base64,
+        commands::toggle_pin_folder,
+        commands::create_markdown_file,
+        commands::read_markdown_file,
+        commands::save_markdown_file,
+        commands::save_markdown_copy,
+        commands::save_markdown_draft,
+        commands::discard_markdown_draft,
+        commands::get_file_preview,
+        commands::get_file_thumbnail,
+        commands::get_media_proxy_url,
+        commands::open_file_in_native_app,
     ])
+}
+
+fn is_allowed_app_navigation(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "about" => true,
+        "http" | "https" => matches!(
+            (url.host_str(), url.port()),
+            (Some("tauri.localhost"), None)
+                | (Some("localhost"), Some(1420))
+                | (Some("127.0.0.1"), Some(1420))
+        ),
+        _ => false,
+    }
 }
 
 pub fn typescript_exporter() -> Typescript {
@@ -35,24 +69,35 @@ pub fn run() {
         .try_init();
 
     let builder = specta_builder();
-
-    #[cfg(debug_assertions)]
-    {
-        let bindings_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/bindings/tauri.ts");
-        if let Err(err) = builder.export(typescript_exporter(), &bindings_path) {
-            tracing::warn!("Failed to export TypeScript IPC bindings: {err}");
-        }
-    }
-
     let app_state = AppState::initialize();
 
+    let nav_guard = tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
+        .on_navigation(|_webview, url| is_allowed_app_navigation(url))
+        .build();
+
     tauri::Builder::default()
+        .plugin(nav_guard)
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                match MediaProxyServer::start(state.storage.clone()).await {
+                    Ok(proxy) => {
+                        tracing::info!(
+                            "Local Range-streaming media proxy listening on {}",
+                            proxy.addr()
+                        );
+                        state.set_media_proxy(Arc::new(proxy));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to start local media proxy: {err}");
+                    }
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -70,5 +115,24 @@ mod tests {
         specta_builder()
             .export(typescript_exporter(), &bindings_path)
             .expect("Failed to export TypeScript bindings");
+    }
+
+    #[test]
+    fn nav_guard_blocks_external_and_loopback_proxy_navigations() {
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("tauri://localhost/index.html").unwrap()
+        ));
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("https://tauri.localhost/").unwrap()
+        ));
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("http://localhost:1420/").unwrap()
+        ));
+        assert!(!is_allowed_app_navigation(
+            &tauri::Url::parse("https://evil.example/phish").unwrap()
+        ));
+        assert!(!is_allowed_app_navigation(
+            &tauri::Url::parse("http://127.0.0.1:54321/media/token?path=/x").unwrap()
+        ));
     }
 }

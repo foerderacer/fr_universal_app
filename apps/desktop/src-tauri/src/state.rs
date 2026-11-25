@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use fr_core::{
     AppConfig, ConfigStore, EventBus, FrModule, ModuleCapability, ModuleDescriptor, ModuleRegistry,
@@ -10,6 +10,7 @@ use fr_nextcloud::{
     CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
     NextcloudConnectionStatus, NextcloudCredentials, UserAccountInfo, build_http_client,
 };
+use fr_preview::MediaProxyServer;
 use fr_storage::{CacheStore, CachedStorage, StorageBackend};
 
 /// Placeholder descriptors for upcoming modules shown transparently in the Workspace Shell.
@@ -57,7 +58,9 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub cache: Option<CacheStore>,
     pub active_credentials: Mutex<Option<NextcloudCredentials>>,
-    pub storage: Mutex<Option<Arc<dyn StorageBackend>>>,
+    /// Shared storage backend slot read by both IPC commands and the local `MediaProxyServer`.
+    pub storage: Arc<RwLock<Option<Arc<dyn StorageBackend>>>>,
+    pub media_proxy: Mutex<Option<Arc<MediaProxyServer>>>,
     pub active_login: Mutex<Option<LoginFlowSession>>,
     pub account_info: Mutex<Option<UserAccountInfo>>,
     pub modules: ModuleRegistry,
@@ -120,7 +123,8 @@ impl AppState {
             http_client,
             cache,
             active_credentials: Mutex::new(None),
-            storage: Mutex::new(None),
+            storage: Arc::new(RwLock::new(None)),
+            media_proxy: Mutex::new(None),
             active_login: Mutex::new(None),
             account_info: Mutex::new(None),
             modules,
@@ -140,14 +144,56 @@ impl AppState {
         state
     }
 
+    pub fn set_media_proxy(&self, proxy: Arc<MediaProxyServer>) {
+        if let Ok(mut guard) = self.media_proxy.lock() {
+            *guard = Some(proxy);
+        }
+    }
+
+    pub fn current_media_proxy(&self) -> Option<Arc<MediaProxyServer>> {
+        self.media_proxy.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn current_storage(&self) -> Option<Arc<dyn StorageBackend>> {
+        self.storage.read().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn active_account_scope(&self) -> String {
+        if let Ok(guard) = self.active_credentials.lock()
+            && let Some(ref creds) = *guard
+        {
+            return format!("{}|{}", creds.server_url, creds.login_name);
+        }
+        let cfg = self.current_config();
+        format!(
+            "{}|{}",
+            cfg.nextcloud_url,
+            cfg.nextcloud_login_name.unwrap_or_default()
+        )
+    }
+
     pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
+        let switched_account = self
+            .active_credentials
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|prev| {
+                    prev.server_url != creds.server_url || prev.login_name != creds.login_name
+                })
+            })
+            .unwrap_or(false);
+        if switched_account && let Some(ref cache) = self.cache {
+            let _ = cache.clear_cached_data();
+        }
+
         let nc = NextcloudBackend::with_client(self.http_client.clone(), creds.clone())?;
         let backend: Arc<dyn StorageBackend> = match &self.cache {
             Some(cache) => Arc::new(CachedStorage::new(Arc::new(nc), cache.clone())),
             None => Arc::new(nc),
         };
 
-        if let Ok(mut guard) = self.storage.lock() {
+        if let Ok(mut guard) = self.storage.write() {
             *guard = Some(backend);
         }
         if let Ok(mut guard) = self.active_credentials.lock() {
@@ -157,7 +203,7 @@ impl AppState {
     }
 
     pub fn clear_active_session(&self, wipe_cache: bool) {
-        if let Ok(mut guard) = self.storage.lock() {
+        if let Ok(mut guard) = self.storage.write() {
             *guard = None;
         }
         if let Ok(mut guard) = self.active_credentials.lock() {

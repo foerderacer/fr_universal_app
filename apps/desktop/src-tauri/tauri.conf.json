@@ -14,15 +14,15 @@
       {
         "label": "main",
         "title": "FR Universal App",
-        "width": 1240,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 620,
+        "width": 1340,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640,
         "resizable": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; img-src 'self' http://127.0.0.1:* asset: https://asset.localhost data: blob:; media-src 'self' http://127.0.0.1:* blob:; connect-src 'self' http://127.0.0.1:*; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {

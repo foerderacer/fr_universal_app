@@ -126,7 +126,7 @@ pub async fn initiate_login_flow(
 
 /// Polls Nextcloud once to see if the user has granted access in the browser.
 ///
-/// - HTTP `404` → [`LoginPollResult::Pending`]
+/// - HTTP `404`, `429`, `5xx`, or transient transport errors → [`LoginPollResult::Pending`]
 /// - HTTP `200` → [`LoginPollResult::Completed`] (after validating returned server origin)
 pub async fn poll_login_flow(
     client: &reqwest::Client,
@@ -137,18 +137,24 @@ pub async fn poll_login_flow(
 
     let resp = match client
         .post(&session.poll_endpoint)
+        .timeout(std::time::Duration::from_secs(20))
         .form(&[("token", session.poll_token.as_str())])
         .send()
         .await
     {
         Ok(r) => r,
-        Err(err) if err.is_timeout() || err.is_connect() => {
-            // Treat brief connectivity blips as pending so an approved browser login isn't aborted.
-            return Ok(LoginPollResult::Pending);
-        }
         Err(err) => {
+            let msg_lower = err.to_string().to_ascii_lowercase();
+            let is_fatal_tls_or_dns = msg_lower.contains("certificate")
+                || msg_lower.contains("tls")
+                || msg_lower.contains("ssl")
+                || msg_lower.contains("dns error")
+                || msg_lower.contains("failed to lookup address");
+            if !is_fatal_tls_or_dns && (err.is_timeout() || err.is_connect()) {
+                return Ok(LoginPollResult::Pending);
+            }
             return Err(FrError::Network(format!(
-                "Nextcloud login poll failed: {err}"
+                "failed to poll Nextcloud login status: {err}"
             )));
         }
     };

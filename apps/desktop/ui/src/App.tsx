@@ -135,6 +135,7 @@ export function App() {
 
     return () => {
       cancelled = true;
+      pollInFlightRef.current = false;
       window.clearInterval(timer);
     };
   }, [loginPendingUrl]);
@@ -275,6 +276,7 @@ export function App() {
             <FilesView
               connectionStatus={overview.connectionStatus}
               accountInfo={overview.accountInfo}
+              pinnedFolders={overview.config.pinnedFolders}
               loginPendingUrl={loginPendingUrl}
               loginStarting={loginStarting}
               error={error}
@@ -282,6 +284,7 @@ export function App() {
               onStartLogin={handleStartLogin}
               onCancelLogin={handleCancelLogin}
               onOpenSettings={() => setActiveNav("settings")}
+              onOverviewUpdated={setOverview}
             />
           ) : activeModule ? (
             <ModuleComingSoonView module={activeModule} />

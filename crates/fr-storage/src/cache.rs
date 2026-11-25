@@ -80,7 +80,9 @@ impl CacheStore {
                 last_accessed_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS markdown_drafts (
-                cloud_path TEXT PRIMARY KEY,
+                draft_key TEXT PRIMARY KEY,
+                server_scope TEXT NOT NULL,
+                cloud_path TEXT NOT NULL,
                 content TEXT NOT NULL,
                 base_etag TEXT,
                 updated_at_ms INTEGER NOT NULL
@@ -88,6 +90,71 @@ impl CacheStore {
             ",
         )
         .map_err(sqlite_err)?;
+
+        // Migrate legacy markdown_drafts tables that lacked `draft_key` while preserving existing drafts.
+        let has_draft_key: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(markdown_drafts)")
+                .map_err(sqlite_err)?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(sqlite_err)?;
+            let mut found = false;
+            for col in cols {
+                if col.map_err(sqlite_err)? == "draft_key" {
+                    found = true;
+                }
+            }
+            found
+        };
+        if !has_draft_key {
+            let legacy_rows: Vec<(String, String, Option<String>, i64)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT cloud_path, content, base_etag, updated_at_ms FROM markdown_drafts",
+                    )
+                    .map_err(sqlite_err)?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .map_err(sqlite_err)?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.map_err(sqlite_err)?);
+                }
+                collected
+            };
+            conn.execute_batch(
+                "ALTER TABLE markdown_drafts RENAME TO markdown_drafts_legacy;
+                 CREATE TABLE markdown_drafts (
+                     draft_key TEXT PRIMARY KEY,
+                     server_scope TEXT NOT NULL,
+                     cloud_path TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     base_etag TEXT,
+                     updated_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .map_err(sqlite_err)?;
+            for (cloud_path, content, base_etag, updated_at_ms) in legacy_rows {
+                let draft_key = hash_key(&format!("draft:legacy:{cloud_path}"));
+                conn.execute(
+                    "INSERT OR REPLACE INTO markdown_drafts
+                     (draft_key, server_scope, cloud_path, content, base_etag, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        draft_key,
+                        "legacy",
+                        cloud_path,
+                        content,
+                        base_etag,
+                        updated_at_ms
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            }
+            conn.execute_batch("DROP TABLE markdown_drafts_legacy;")
+                .map_err(sqlite_err)?;
+        }
 
         let max_bytes = u64::from(max_limit_mb.max(16)) * 1024 * 1024;
         let store = Self {
@@ -350,37 +417,51 @@ impl CacheStore {
 
     pub fn save_markdown_draft(
         &self,
+        server_scope: &str,
         path: &CloudPath,
         content: &str,
         base_etag: Option<&Etag>,
     ) -> Result<()> {
+        let draft_key = hash_key(&format!("draft:{server_scope}:{}", path.as_str()));
         let now = Utc::now().timestamp_millis();
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
-            "INSERT INTO markdown_drafts (cloud_path, content, base_etag, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(cloud_path) DO UPDATE SET
+            "INSERT INTO markdown_drafts (draft_key, server_scope, cloud_path, content, base_etag, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(draft_key) DO UPDATE SET
                content = excluded.content,
                base_etag = excluded.base_etag,
                updated_at_ms = excluded.updated_at_ms",
-            params![path.as_str(), content, base_etag.map(Etag::as_str), now],
+            params![
+                draft_key,
+                server_scope,
+                path.as_str(),
+                content,
+                base_etag.map(Etag::as_str),
+                now
+            ],
         )
         .map_err(sqlite_err)?;
         Ok(())
     }
 
-    pub fn get_markdown_draft(&self, path: &CloudPath) -> Result<Option<MarkdownDraft>> {
+    pub fn get_markdown_draft(
+        &self,
+        server_scope: &str,
+        path: &CloudPath,
+    ) -> Result<Option<MarkdownDraft>> {
+        let draft_key = hash_key(&format!("draft:{server_scope}:{}", path.as_str()));
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let row: Option<(String, Option<String>, i64)> = conn
             .query_row(
-                "SELECT content, base_etag, updated_at_ms FROM markdown_drafts WHERE cloud_path = ?1",
-                params![path.as_str()],
+                "SELECT content, base_etag, updated_at_ms FROM markdown_drafts WHERE draft_key = ?1",
+                params![draft_key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -396,20 +477,20 @@ impl CacheStore {
         )
     }
 
-    pub fn delete_markdown_draft(&self, path: &CloudPath) -> Result<()> {
+    pub fn delete_markdown_draft(&self, server_scope: &str, path: &CloudPath) -> Result<()> {
+        let draft_key = hash_key(&format!("draft:{server_scope}:{}", path.as_str()));
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
-            "DELETE FROM markdown_drafts WHERE cloud_path = ?1",
-            params![path.as_str()],
+            "DELETE FROM markdown_drafts WHERE draft_key = ?1",
+            params![draft_key],
         )
         .map_err(sqlite_err)?;
         Ok(())
     }
 
-    /// Clears all cached directory listings, blobs, thumbnails, and drafts (e.g. on sign-out).
     fn wipe_blobs_dir(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.blobs_dir) {
             for entry in entries.flatten() {
@@ -424,18 +505,24 @@ impl CacheStore {
     }
 
     /// Clears cached directory listings, blobs, and thumbnails (including any orphaned files
-    /// in `blobs_dir`) while preserving unsaved local `markdown_drafts` so user edits are never
-    /// silently lost on sign-out or server change.
+    /// in `blobs_dir`) while preserving server-scoped unsaved local `markdown_drafts`.
     pub fn clear_cached_data(&self) -> Result<()> {
         {
             let conn = self
                 .conn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            conn.execute_batch("DELETE FROM cached_dirs; DELETE FROM cached_blobs; VACUUM;")
+            conn.execute_batch("DELETE FROM cached_dirs; DELETE FROM cached_blobs;")
                 .map_err(sqlite_err)?;
         }
         self.wipe_blobs_dir();
+        {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = conn.execute_batch("VACUUM;");
+        }
         Ok(())
     }
 
@@ -447,11 +534,18 @@ impl CacheStore {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             conn.execute_batch(
-                "DELETE FROM cached_dirs; DELETE FROM cached_blobs; DELETE FROM markdown_drafts; VACUUM;",
+                "DELETE FROM cached_dirs; DELETE FROM cached_blobs; DELETE FROM markdown_drafts;",
             )
             .map_err(sqlite_err)?;
         }
         self.wipe_blobs_dir();
+        {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = conn.execute_batch("VACUUM;");
+        }
         Ok(())
     }
 
@@ -733,14 +827,70 @@ mod tests {
         let etag = Etag::new("v1");
 
         cache
-            .save_markdown_draft(&path, "# Draft", Some(&etag))
+            .save_markdown_draft("https://cloud-a.example", &path, "# Draft", Some(&etag))
             .unwrap();
-        let draft = cache.get_markdown_draft(&path).unwrap().expect("draft");
+        let draft = cache
+            .get_markdown_draft("https://cloud-a.example", &path)
+            .unwrap()
+            .expect("draft");
         assert_eq!(draft.content, "# Draft");
         assert_eq!(draft.base_etag, Some(etag));
 
-        cache.delete_markdown_draft(&path).unwrap();
-        assert!(cache.get_markdown_draft(&path).unwrap().is_none());
+        // Server & account scoping prevents cross-server AND cross-user leakage on shared machines.
+        assert!(
+            cache
+                .get_markdown_draft("https://cloud-b.example", &path)
+                .unwrap()
+                .is_none()
+        );
+        cache
+            .save_markdown_draft("https://cloud-a.example|alice", &path, "# Alice", None)
+            .unwrap();
+        assert!(
+            cache
+                .get_markdown_draft("https://cloud-a.example|bob", &path)
+                .unwrap()
+                .is_none()
+        );
+
+        cache
+            .delete_markdown_draft("https://cloud-a.example", &path)
+            .unwrap();
+        assert!(
+            cache
+                .get_markdown_draft("https://cloud-a.example", &path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_markdown_drafts_migration_preserves_existing_rows() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("blobs")).unwrap();
+        let db_path = dir.path().join("cache.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE markdown_drafts (
+                    cloud_path TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    base_etag TEXT,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO markdown_drafts (cloud_path, content, base_etag, updated_at_ms)
+                VALUES ('/Docs/legacy.md', '# Preserved', 'e1', 12345);",
+            )
+            .unwrap();
+        }
+
+        let cache = CacheStore::open(dir.path(), 64).unwrap();
+        let migrated = cache
+            .get_markdown_draft("legacy", &CloudPath::parse("/Docs/legacy.md").unwrap())
+            .unwrap()
+            .expect("legacy draft must be preserved");
+        assert_eq!(migrated.content, "# Preserved");
+        assert_eq!(migrated.base_etag, Some(Etag::new("e1")));
     }
 
     #[test]
@@ -750,7 +900,7 @@ mod tests {
         let path = CloudPath::parse("/Docs/notes.md").unwrap();
 
         cache
-            .save_markdown_draft(&path, "# Unsaved edits", None)
+            .save_markdown_draft("https://cloud.example", &path, "# Unsaved edits", None)
             .unwrap();
         cache.put_blob(&path, &Etag::new("e1"), b"cached").unwrap();
 
@@ -762,7 +912,7 @@ mod tests {
         assert!(!orphan.exists());
         assert!(cache.get_blob(&path, &Etag::new("e1")).unwrap().is_none());
         let draft = cache
-            .get_markdown_draft(&path)
+            .get_markdown_draft("https://cloud.example", &path)
             .unwrap()
             .expect("draft must survive cache clear");
         assert_eq!(draft.content, "# Unsaved edits");
