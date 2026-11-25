@@ -47,14 +47,24 @@ fn normalize_lock_key(root: &Path) -> String {
         }
     };
 
+    #[cfg(windows)]
+    let is_verbatim = matches!(
+        abs.components().next(),
+        Some(std::path::Component::Prefix(p)) if p.kind().is_verbatim()
+    );
+
     let mut full = canonical_base;
     for part in tail.into_iter().rev() {
         #[cfg(windows)]
         {
-            let text = part.to_string_lossy();
-            let trimmed = text.trim_end_matches(['.', ' ']);
-            if !trimmed.is_empty() {
-                full.push(trimmed);
+            if is_verbatim {
+                full.push(part);
+            } else {
+                let text = part.to_string_lossy();
+                let trimmed = text.trim_end_matches(['.', ' ']);
+                if !trimmed.is_empty() {
+                    full.push(trimmed);
+                }
             }
         }
         #[cfg(not(windows))]
@@ -719,6 +729,18 @@ mod tests {
         {
             let lock_plain = lock_for_root(&parent.path().join("dotted"));
             assert!(Arc::ptr_eq(&lock_before, &lock_plain));
+
+            // Verbatim paths (`\\?\...`) preserve trailing dots on Windows.
+            let canon_parent = std::fs::canonicalize(parent.path()).unwrap();
+            let verbatim_dotted = canon_parent.join("verbatim_dotted.");
+            let verbatim_before = lock_for_root(&verbatim_dotted);
+            let verbatim_backend = LocalFsBackend::new(&verbatim_dotted);
+            verbatim_backend
+                .mkdir(&CloudPath::parse("/sub").unwrap())
+                .await
+                .unwrap();
+            let verbatim_after = lock_for_root(&verbatim_dotted);
+            assert!(Arc::ptr_eq(&verbatim_before, &verbatim_after));
         }
     }
 
