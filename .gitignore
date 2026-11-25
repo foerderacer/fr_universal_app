@@ -11,6 +11,15 @@
 **/*.rs.bk
 *.pdb
 
+# Node / Frontend
+node_modules/
+apps/desktop/ui/dist/
+apps/desktop/ui/.vite/
+*.tsbuildinfo
+
+# Tauri generated artifacts
+apps/desktop/src-tauri/gen/
+
 # OS / Editor
 .DS_Store
 Thumbs.db
