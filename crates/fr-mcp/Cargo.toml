@@ -1,0 +1,13 @@
+[package]
+name = "fr-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fr-core.workspace = true
+serde.workspace = true
+specta.workspace = true
+
+[lints]
+workspace = true

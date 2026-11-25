@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/fr-core",
+  "crates/fr-storage",
+  "crates/fr-nextcloud",
+  "crates/fr-preview",
+  "crates/fr-mcp",
+  "crates/fr-workflows",
+  "crates/modules/fr-mod-files",
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+specta = { version = "=2.0.0-rc.28", features = ["derive", "chrono"] }
+specta-typescript = "=0.0.15"
+tauri = { version = "2", default-features = false, features = ["wry", "compression", "dynamic-acl", "x11", "dbus"] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+
+# Internal workspace crates
+fr-core = { path = "crates/fr-core" }
+fr-storage = { path = "crates/fr-storage" }
+fr-nextcloud = { path = "crates/fr-nextcloud" }
+fr-preview = { path = "crates/fr-preview" }
+fr-mcp = { path = "crates/fr-mcp" }
+fr-mod-files = { path = "crates/modules/fr-mod-files" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

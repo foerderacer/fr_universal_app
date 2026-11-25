@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-quality:
+    name: Rust Check & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+
+      - name: Install frontend dependencies & build dist (needed for Tauri context)
+        working-directory: apps/desktop/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust unit tests
+        run: cargo test --workspace
+
+      - name: Verify TypeScript IPC bindings are up to date
+        run: git diff --exit-code -- apps/desktop/ui/src/bindings/tauri.ts
+
+  frontend-quality:
+    name: Frontend Typecheck, Lint & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop/ui
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: apps/desktop/ui
+        run: npm run typecheck
+
+      - name: Lint
+        working-directory: apps/desktop/ui
+        run: npm run lint
+
+      - name: Build
+        working-directory: apps/desktop/ui
+        run: npm run build
+
+  tauri-build-check:
+    name: Tauri Desktop Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [rust-quality, frontend-quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop/ui
+        run: npm ci
+
+      - name: Build Tauri application (no bundle)
+        working-directory: apps/desktop/ui
+        env:
+          FR_DEFAULT_NEXTCLOUD_URL: ${{ vars.FR_DEFAULT_NEXTCLOUD_URL }}
+        run: npm run tauri -- build --no-bundle
