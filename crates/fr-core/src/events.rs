@@ -27,6 +27,11 @@ pub enum AppEvent {
         path: String,
         timestamp: DateTime<Utc>,
     },
+    FileRenamed {
+        from: String,
+        to: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Lightweight in-process broadcast bus for decoupled module communication.

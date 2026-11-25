@@ -28,6 +28,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::delete_file,
         commands::upload_file_base64,
         commands::toggle_pin_folder,
+        commands::create_markdown_file,
         commands::read_markdown_file,
         commands::save_markdown_file,
         commands::save_markdown_copy,
@@ -38,6 +39,19 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::get_media_proxy_url,
         commands::open_file_in_native_app,
     ])
+}
+
+fn is_allowed_app_navigation(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" | "about" => true,
+        "http" | "https" => matches!(
+            (url.host_str(), url.port()),
+            (Some("tauri.localhost"), None)
+                | (Some("localhost"), Some(1420))
+                | (Some("127.0.0.1"), Some(1420))
+        ),
+        _ => false,
+    }
 }
 
 pub fn typescript_exporter() -> Typescript {
@@ -57,7 +71,12 @@ pub fn run() {
     let builder = specta_builder();
     let app_state = AppState::initialize();
 
+    let nav_guard = tauri::plugin::Builder::<tauri::Wry>::new("nav-guard")
+        .on_navigation(|_webview, url| is_allowed_app_navigation(url))
+        .build();
+
     tauri::Builder::default()
+        .plugin(nav_guard)
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(builder.invoke_handler())
@@ -96,5 +115,24 @@ mod tests {
         specta_builder()
             .export(typescript_exporter(), &bindings_path)
             .expect("Failed to export TypeScript bindings");
+    }
+
+    #[test]
+    fn nav_guard_blocks_external_and_loopback_proxy_navigations() {
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("tauri://localhost/index.html").unwrap()
+        ));
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("https://tauri.localhost/").unwrap()
+        ));
+        assert!(is_allowed_app_navigation(
+            &tauri::Url::parse("http://localhost:1420/").unwrap()
+        ));
+        assert!(!is_allowed_app_navigation(
+            &tauri::Url::parse("https://evil.example/phish").unwrap()
+        ));
+        assert!(!is_allowed_app_navigation(
+            &tauri::Url::parse("http://127.0.0.1:54321/media/token?path=/x").unwrap()
+        ));
     }
 }

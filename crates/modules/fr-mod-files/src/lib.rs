@@ -112,9 +112,15 @@ impl FilesService {
 
         let mut matches = Vec::new();
         let mut queue = std::collections::VecDeque::new();
+        let mut visited_dirs = 0usize;
+        const MAX_SEARCH_DIRS: usize = 60;
         queue.push_back((root, 0usize));
 
         while let Some((dir, depth)) = queue.pop_front() {
+            if visited_dirs >= MAX_SEARCH_DIRS {
+                break;
+            }
+            visited_dirs += 1;
             let Ok(entries) = self.storage.list(&dir).await else {
                 continue;
             };
@@ -124,7 +130,11 @@ impl FilesService {
                 if entry.name.to_ascii_lowercase().contains(&needle) {
                     matches.push(Self::enrich(entry));
                 }
-                if is_dir && depth < max_depth && matches.len() < 200 {
+                if is_dir
+                    && depth < max_depth
+                    && matches.len() < 200
+                    && visited_dirs + queue.len() < MAX_SEARCH_DIRS
+                {
                     queue.push_back((entry_path, depth + 1));
                 }
             }
@@ -152,9 +162,23 @@ impl FilesService {
         self.storage.delete(&path).await
     }
 
-    pub async fn upload_bytes(&self, raw_path: &str, data: Bytes) -> Result<Etag> {
+    pub async fn upload_bytes(&self, raw_path: &str, data: Bytes, overwrite: bool) -> Result<Etag> {
         let path = CloudPath::parse(raw_path)?;
+        if !overwrite && self.storage.stat(&path).await.is_ok() {
+            return Err(FrError::AlreadyExists(path.as_str().to_owned()));
+        }
         self.storage.write(&path, data, None).await
+    }
+
+    /// Creates a brand-new Markdown note, refusing to overwrite an existing file.
+    pub async fn create_markdown(&self, raw_path: &str, content: &str) -> Result<Etag> {
+        let path = CloudPath::parse(raw_path)?;
+        if self.storage.stat(&path).await.is_ok() {
+            return Err(FrError::AlreadyExists(path.as_str().to_owned()));
+        }
+        self.storage
+            .write(&path, Bytes::from(content.as_bytes().to_vec()), None)
+            .await
     }
 
     pub async fn read_markdown(&self, raw_path: &str) -> Result<(CloudPath, String, Etag)> {
@@ -297,17 +321,21 @@ impl FilesService {
             PreviewKind::SolidWorks => {
                 if entry.size as usize > MAX_SOLIDWORKS_BYTES {
                     payload.note = Some(
-                        "SolidWorks file exceeds 128 MB preview cap — open in SolidWorks / eDrawings."
+                        "This SolidWorks file is larger than 128 MB. Click \"Open in SolidWorks\" to inspect the 3D model."
                             .into(),
                     );
                 } else {
                     let (bytes, _) = self.storage.read(&path).await?;
-                    match extract_solidworks_preview(&bytes) {
-                        Ok(sw) => payload.solidworks = Some(sw),
-                        Err(err) => {
-                            payload.note = Some(format!(
-                                "Couldn't extract embedded SolidWorks preview ({err}). Open in SolidWorks / eDrawings instead."
-                            ));
+                    let extracted =
+                        tokio::task::spawn_blocking(move || extract_solidworks_preview(&bytes))
+                            .await;
+                    match extracted {
+                        Ok(Ok(sw)) => payload.solidworks = Some(sw),
+                        _ => {
+                            payload.note = Some(
+                                "This SolidWorks file doesn't include a readable embedded preview. Click \"Open in SolidWorks\" to inspect the 3D model."
+                                    .into(),
+                            );
                         }
                     }
                 }
@@ -421,5 +449,23 @@ mod tests {
         // Search finds both guide files.
         let found = service.search_folder("/", "guide", 2).await.unwrap();
         assert_eq!(found.len(), 2);
+
+        // Creating a note or uploading without overwrite refuses to clobber existing files.
+        assert!(matches!(
+            service.create_markdown("/Docs/guide.md", "# Clobber").await,
+            Err(FrError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            service
+                .upload_bytes("/Docs/guide.md", Bytes::from_static(b"x"), false)
+                .await,
+            Err(FrError::AlreadyExists(_))
+        ));
+        assert!(
+            service
+                .upload_bytes("/Docs/guide.md", Bytes::from_static(b"# Replaced"), true)
+                .await
+                .is_ok()
+        );
     }
 }

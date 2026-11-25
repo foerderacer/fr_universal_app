@@ -91,7 +91,7 @@ impl CacheStore {
         )
         .map_err(sqlite_err)?;
 
-        // Migrate legacy markdown_drafts tables that lacked `draft_key`.
+        // Migrate legacy markdown_drafts tables that lacked `draft_key` while preserving existing drafts.
         let has_draft_key: bool = {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(markdown_drafts)")
@@ -108,8 +108,23 @@ impl CacheStore {
             found
         };
         if !has_draft_key {
+            let legacy_rows: Vec<(String, String, Option<String>, i64)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT cloud_path, content, base_etag, updated_at_ms FROM markdown_drafts",
+                    )
+                    .map_err(sqlite_err)?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .map_err(sqlite_err)?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row.map_err(sqlite_err)?);
+                }
+                collected
+            };
             conn.execute_batch(
-                "DROP TABLE markdown_drafts;
+                "ALTER TABLE markdown_drafts RENAME TO markdown_drafts_legacy;
                  CREATE TABLE markdown_drafts (
                      draft_key TEXT PRIMARY KEY,
                      server_scope TEXT NOT NULL,
@@ -120,6 +135,25 @@ impl CacheStore {
                  );",
             )
             .map_err(sqlite_err)?;
+            for (cloud_path, content, base_etag, updated_at_ms) in legacy_rows {
+                let draft_key = hash_key(&format!("draft:legacy:{cloud_path}"));
+                conn.execute(
+                    "INSERT OR REPLACE INTO markdown_drafts
+                     (draft_key, server_scope, cloud_path, content, base_etag, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        draft_key,
+                        "legacy",
+                        cloud_path,
+                        content,
+                        base_etag,
+                        updated_at_ms
+                    ],
+                )
+                .map_err(sqlite_err)?;
+            }
+            conn.execute_batch("DROP TABLE markdown_drafts_legacy;")
+                .map_err(sqlite_err)?;
         }
 
         let max_bytes = u64::from(max_limit_mb.max(16)) * 1024 * 1024;
@@ -802,10 +836,19 @@ mod tests {
         assert_eq!(draft.content, "# Draft");
         assert_eq!(draft.base_etag, Some(etag));
 
-        // Server scoping prevents server A's drafts from leaking into server B.
+        // Server & account scoping prevents cross-server AND cross-user leakage on shared machines.
         assert!(
             cache
                 .get_markdown_draft("https://cloud-b.example", &path)
+                .unwrap()
+                .is_none()
+        );
+        cache
+            .save_markdown_draft("https://cloud-a.example|alice", &path, "# Alice", None)
+            .unwrap();
+        assert!(
+            cache
+                .get_markdown_draft("https://cloud-a.example|bob", &path)
                 .unwrap()
                 .is_none()
         );
@@ -819,6 +862,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_markdown_drafts_migration_preserves_existing_rows() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("blobs")).unwrap();
+        let db_path = dir.path().join("cache.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE markdown_drafts (
+                    cloud_path TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    base_etag TEXT,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO markdown_drafts (cloud_path, content, base_etag, updated_at_ms)
+                VALUES ('/Docs/legacy.md', '# Preserved', 'e1', 12345);",
+            )
+            .unwrap();
+        }
+
+        let cache = CacheStore::open(dir.path(), 64).unwrap();
+        let migrated = cache
+            .get_markdown_draft("legacy", &CloudPath::parse("/Docs/legacy.md").unwrap())
+            .unwrap()
+            .expect("legacy draft must be preserved");
+        assert_eq!(migrated.content, "# Preserved");
+        assert_eq!(migrated.base_etag, Some(Etag::new("e1")));
     }
 
     #[test]

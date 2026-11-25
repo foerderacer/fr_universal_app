@@ -143,9 +143,19 @@ pub async fn poll_login_flow(
         .await
     {
         Ok(r) => r,
-        Err(_) => {
-            // Poll is idempotent and bounded by the UI timeout; treat transient network errors as pending.
-            return Ok(LoginPollResult::Pending);
+        Err(err) => {
+            let msg_lower = err.to_string().to_ascii_lowercase();
+            let is_fatal_tls_or_dns = msg_lower.contains("certificate")
+                || msg_lower.contains("tls")
+                || msg_lower.contains("ssl")
+                || msg_lower.contains("dns error")
+                || msg_lower.contains("failed to lookup address");
+            if !is_fatal_tls_or_dns && (err.is_timeout() || err.is_connect()) {
+                return Ok(LoginPollResult::Pending);
+            }
+            return Err(FrError::Network(format!(
+                "failed to poll Nextcloud login status: {err}"
+            )));
         }
     };
 

@@ -158,7 +158,35 @@ impl AppState {
         self.storage.read().ok().and_then(|guard| guard.clone())
     }
 
+    pub fn active_account_scope(&self) -> String {
+        if let Ok(guard) = self.active_credentials.lock()
+            && let Some(ref creds) = *guard
+        {
+            return format!("{}|{}", creds.server_url, creds.login_name);
+        }
+        let cfg = self.current_config();
+        format!(
+            "{}|{}",
+            cfg.nextcloud_url,
+            cfg.nextcloud_login_name.unwrap_or_default()
+        )
+    }
+
     pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
+        let switched_account = self
+            .active_credentials
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|prev| {
+                    prev.server_url != creds.server_url || prev.login_name != creds.login_name
+                })
+            })
+            .unwrap_or(false);
+        if switched_account && let Some(ref cache) = self.cache {
+            let _ = cache.clear_cached_data();
+        }
+
         let nc = NextcloudBackend::with_client(self.http_client.clone(), creds.clone())?;
         let backend: Arc<dyn StorageBackend> = match &self.cache {
             Some(cache) => Arc::new(CachedStorage::new(Arc::new(nc), cache.clone())),

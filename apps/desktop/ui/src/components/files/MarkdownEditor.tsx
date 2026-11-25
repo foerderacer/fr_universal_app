@@ -9,6 +9,7 @@ import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import DOMPurify from "dompurify";
 import {
   AlertTriangle,
   Bold,
@@ -51,6 +52,56 @@ import { ErrorBanner } from "../ErrorBanner";
 interface MarkdownEditorProps {
   path: string;
   onSaved?: (newPath: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+function resolveRelativeCloudPath(docParentDir: string, rawSrc: string): string | null {
+  const trimmed = rawSrc.trim();
+  if (!trimmed || /^(https?:|data:|blob:|mailto:|#)/i.test(trimmed)) {
+    return null;
+  }
+  const baseParts = docParentDir === "/" ? [] : docParentDir.split("/").filter(Boolean);
+  const relParts = trimmed.startsWith("/") ? [] : [...baseParts];
+  for (const seg of trimmed.split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (relParts.length === 0) return null;
+      relParts.pop();
+    } else {
+      relParts.push(seg);
+    }
+  }
+  return `/${relParts.join("/")}`;
+}
+
+async function renderSanitizedHtmlWithProxyImages(
+  mdText: string,
+  docParentDir: string,
+): Promise<string> {
+  const rawHtml = marked.parse(mdText, { async: false }) as string;
+  const cleanHtml = DOMPurify.sanitize(rawHtml, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form"],
+  });
+
+  const parser = new DOMParser();
+  const parsedDoc = parser.parseFromString(cleanHtml, "text/html");
+  const imgs = Array.from(parsedDoc.querySelectorAll("img"));
+
+  await Promise.all(
+    imgs.map(async (img) => {
+      const src = img.getAttribute("src");
+      if (!src) return;
+      const cloudPath = resolveRelativeCloudPath(docParentDir, src);
+      if (!cloudPath) return;
+      const proxyUrl = await getMediaProxyUrl(cloudPath).catch(() => null);
+      if (proxyUrl) {
+        img.setAttribute("src", proxyUrl);
+      }
+    }),
+  );
+
+  return parsedDoc.body.innerHTML;
 }
 
 function createTurndown(docParentDir: string): TurndownService {
@@ -95,7 +146,11 @@ function createTurndown(docParentDir: string): TurndownService {
   return td;
 }
 
-export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
+export function MarkdownEditor({
+  path,
+  onSaved,
+  onDirtyChange,
+}: MarkdownEditorProps) {
   const [doc, setDoc] = useState<MarkdownDocument_Serialize | null>(null);
   const [markdown, setMarkdown] = useState("");
   const [etag, setEtag] = useState<Etag | null>(null);
@@ -115,6 +170,34 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
   const turndown = useMemo(() => createTurndown(docParentDir), [docParentDir]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const syncingFromExternal = useRef(false);
+  const renderSeqRef = useRef(0);
+  const latestDraftRef = useRef<{
+    dirty: boolean;
+    hasDoc: boolean;
+    path: string;
+    markdown: string;
+    etag: Etag | null;
+  }>({
+    dirty: false,
+    hasDoc: false,
+    path,
+    markdown: "",
+    etag: null,
+  });
+
+  useEffect(() => {
+    latestDraftRef.current = {
+      dirty,
+      hasDoc: Boolean(doc),
+      path,
+      markdown,
+      etag,
+    };
+  }, [dirty, doc, path, markdown, etag]);
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   const editor = useEditor({
     extensions: [
@@ -139,17 +222,22 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
   });
 
   const applyMarkdownToEditor = useCallback(
-    (mdText: string) => {
+    async (mdText: string) => {
       if (!editor) return;
+      const seq = ++renderSeqRef.current;
+      const safeHtml = await renderSanitizedHtmlWithProxyImages(
+        mdText,
+        docParentDir,
+      );
+      if (seq !== renderSeqRef.current || editor.isDestroyed) return;
       syncingFromExternal.current = true;
       try {
-        const html = marked.parse(mdText, { async: false }) as string;
-        editor.commands.setContent(html, { emitUpdate: false });
+        editor.commands.setContent(safeHtml, { emitUpdate: false });
       } finally {
         syncingFromExternal.current = false;
       }
     },
-    [editor],
+    [editor, docParentDir],
   );
 
   const loadDocument = useCallback(async () => {
@@ -162,7 +250,7 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
       setMarkdown(loaded.content);
       setEtag(loaded.etag);
       setDirty(false);
-      applyMarkdownToEditor(loaded.content);
+      await applyMarkdownToEditor(loaded.content);
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -184,6 +272,21 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
     }, 800);
     return () => window.clearTimeout(handle);
   }, [dirty, doc, path, markdown, etag]);
+
+  // Immediately flush any pending draft on unmount, path switch, or window close so edits are never lost.
+  useEffect(() => {
+    const flushNow = () => {
+      const cur = latestDraftRef.current;
+      if (cur.dirty && cur.hasDoc) {
+        void saveMarkdownDraft(cur.path, cur.markdown, cur.etag).catch(() => {});
+      }
+    };
+    window.addEventListener("beforeunload", flushNow);
+    return () => {
+      window.removeEventListener("beforeunload", flushNow);
+      flushNow();
+    };
+  }, [path]);
 
   const handleSave = useCallback(
     async (forceOverwrite = false) => {
@@ -247,7 +350,7 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
   async function handleRestoreDraft() {
     if (!doc?.draft) return;
     setMarkdown(doc.draft.content);
-    applyMarkdownToEditor(doc.draft.content);
+    await applyMarkdownToEditor(doc.draft.content);
     setDirty(true);
     setDoc({ ...doc, draft: null });
   }
@@ -271,7 +374,7 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
         `${Date.now()}-${safeName}`,
       );
       const buf = new Uint8Array(await file.arrayBuffer());
-      await uploadFileBytes(assetPath, buf);
+      await uploadFileBytes(assetPath, buf, false);
       const proxyUrl = await getMediaProxyUrl(assetPath);
       const relLink = `./assets/${assetPath.split("/").pop()}`;
       if (mode === "rich" && editor) {
@@ -292,7 +395,7 @@ export function MarkdownEditor({ path, onSaved }: MarkdownEditorProps) {
   function handleModeSwitch(nextMode: "rich" | "raw") {
     if (nextMode === mode) return;
     if (nextMode === "rich") {
-      applyMarkdownToEditor(markdown);
+      void applyMarkdownToEditor(markdown);
     }
     setMode(nextMode);
   }

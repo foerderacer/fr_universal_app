@@ -20,8 +20,9 @@ export const commands = {
 	createFolder: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("create_folder", { path }, options),
 	renameFile: (from: string, to: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("rename_file", { from, to }, options),
 	deleteFile: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("delete_file", { path }, options),
-	uploadFileBase64: (path: string, dataBase64: string, options?: InvokeOptions) => __TAURI_INVOKE<Etag>("upload_file_base64", { path, dataBase64 }, options),
+	uploadFileBase64: (path: string, dataBase64: string, overwrite: boolean, options?: InvokeOptions) => __TAURI_INVOKE<Etag>("upload_file_base64", { path, dataBase64, overwrite }, options),
 	togglePinFolder: (folderPath: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("toggle_pin_folder", { folderPath }, options),
+	createMarkdownFile: (path: string, content: string, options?: InvokeOptions) => __TAURI_INVOKE<SaveMarkdownResponse>("create_markdown_file", { path, content }, options),
 	readMarkdownFile: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<MarkdownDocument_Serialize>("read_markdown_file", { path }, options),
 	saveMarkdownFile: (path: string, content: string, expectedEtag: Etag | null, forceOverwrite: boolean, options?: InvokeOptions) => __TAURI_INVOKE<SaveMarkdownResponse>("save_markdown_file", { path, content, expectedEtag, forceOverwrite }, options),
 	saveMarkdownCopy: (originalPath: string, content: string, options?: InvokeOptions) => __TAURI_INVOKE<SaveMarkdownResponse>("save_markdown_copy", { originalPath, content }, options),
@@ -30,7 +31,7 @@ export const commands = {
 	getFilePreview: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<FilePreviewPayload_Serialize>("get_file_preview", { path }, options),
 	getFileThumbnail: (fileId: string, width: number, height: number, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_file_thumbnail", { fileId, width, height }, options),
 	getMediaProxyUrl: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_media_proxy_url", { path }, options),
-	openFileInNativeApp: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("open_file_in_native_app", { path }, options),
+	openFileInNativeApp: (path: string, allowExecutable: boolean, options?: InvokeOptions) => __TAURI_INVOKE<string>("open_file_in_native_app", { path, allowExecutable }, options),
 };
 
 /* Types */

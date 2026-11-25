@@ -50,10 +50,11 @@ export async function deleteFile(path: string): Promise<void> {
 export async function uploadFileBytes(
   path: string,
   bytes: Uint8Array,
+  overwrite = false,
 ): Promise<Etag> {
   if (!isTauri()) requireDesktop("Uploading files");
   const base64 = uint8ToBase64(bytes);
-  return commands.uploadFileBase64(path, base64);
+  return commands.uploadFileBase64(path, base64, overwrite);
 }
 
 export async function togglePinFolder(
@@ -61,6 +62,14 @@ export async function togglePinFolder(
 ): Promise<WorkspaceOverview_Serialize> {
   if (!isTauri()) requireDesktop("Pinning folders");
   return commands.togglePinFolder(folderPath);
+}
+
+export async function createMarkdownFile(
+  path: string,
+  content: string,
+): Promise<SaveMarkdownResponse> {
+  if (!isTauri()) requireDesktop("Creating Markdown notes");
+  return commands.createMarkdownFile(path, content);
 }
 
 export async function readMarkdownFile(
@@ -123,9 +132,12 @@ export async function getMediaProxyUrl(path: string): Promise<string | null> {
   return commands.getMediaProxyUrl(path);
 }
 
-export async function openFileInNativeApp(path: string): Promise<string> {
+export async function openFileInNativeApp(
+  path: string,
+  allowExecutable = false,
+): Promise<string> {
   if (!isTauri()) requireDesktop("Opening in native app");
-  return commands.openFileInNativeApp(path);
+  return commands.openFileInNativeApp(path, allowExecutable);
 }
 
 export function uint8ToBase64(bytes: Uint8Array): string {

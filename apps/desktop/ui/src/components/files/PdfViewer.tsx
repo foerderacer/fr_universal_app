@@ -19,18 +19,24 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
   const [scale, setScale] = useState(1.2);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<{
+    message: string;
+    details: string | null;
+  } | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [matchPages, setMatchPages] = useState<number[]>([]);
   const [searching, setSearching] = useState(false);
+  const searchRunRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
+    searchRunRef.current += 1;
     setLoadError(null);
     setPdfDoc(null);
     setPageNum(1);
     setNumPages(0);
     setMatchPages([]);
+    setSearching(false);
 
     const task = pdfjsLib.getDocument({ url });
     task.promise
@@ -43,15 +49,18 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
       })
       .catch((err) => {
         if (!cancelled) {
-          setLoadError(
-            onFallbackNote ??
-              `Unable to render ${fileName} as PDF (${err instanceof Error ? err.message : String(err)}).`,
-          );
+          setLoadError({
+            message:
+              onFallbackNote ??
+              `We couldn't display "${fileName}" right now. Click "Open in Native App" to open it in your PDF reader.`,
+            details: err instanceof Error ? err.message : String(err),
+          });
         }
       });
 
     return () => {
       cancelled = true;
+      searchRunRef.current += 1;
       void task.destroy();
     };
   }, [url, fileName, onFallbackNote]);
@@ -90,6 +99,7 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
   async function handleSearch(e: React.FormEvent) {
     e.preventDefault();
     if (!pdfDoc) return;
+    const runId = ++searchRunRef.current;
     const needle = searchQuery.trim().toLowerCase();
     if (!needle) {
       setMatchPages([]);
@@ -99,6 +109,7 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
     try {
       const hits: number[] = [];
       for (let p = 1; p <= pdfDoc.numPages; p += 1) {
+        if (searchRunRef.current !== runId) return;
         const page = await pdfDoc.getPage(p);
         const content = await page.getTextContent();
         const text = content.items
@@ -109,19 +120,28 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
           hits.push(p);
         }
       }
+      if (searchRunRef.current !== runId) return;
       setMatchPages(hits);
       if (hits.length > 0) {
         setPageNum(hits[0]);
       }
     } finally {
-      setSearching(false);
+      if (searchRunRef.current === runId) {
+        setSearching(false);
+      }
     }
   }
 
   if (loadError) {
     return (
       <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-        {loadError}
+        <p>{loadError.message}</p>
+        {loadError.details && (
+          <details className="mt-2 text-xs opacity-80">
+            <summary className="cursor-pointer font-medium">Technical details</summary>
+            <p className="mt-1 font-mono break-all">{loadError.details}</p>
+          </details>
+        )}
       </div>
     );
   }

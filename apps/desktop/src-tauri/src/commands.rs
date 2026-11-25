@@ -146,11 +146,13 @@ pub fn update_settings(
         candidate.nextcloud_url = normalized_url;
         if server_changed {
             candidate.nextcloud_login_name = None;
+            candidate.pinned_folders.clear();
         }
         candidate.cache_limit_mb = input.cache_limit_mb.clamp(128, 32_768);
         candidate.mcp_server_enabled = input.mcp_server_enabled;
         candidate.theme = theme;
 
+        // Persist atomically before updating in-memory state so disk and RAM never diverge on error.
         state
             .config_store
             .save(&candidate)
@@ -208,6 +210,7 @@ pub fn reset_nextcloud_url(
         candidate.nextcloud_url = default_url;
         if server_changed {
             candidate.nextcloud_login_name = None;
+            candidate.pinned_folders.clear();
         }
 
         state
@@ -313,11 +316,13 @@ pub async fn poll_nextcloud_login(
                 });
             }
 
+            // 1. Persist secret in OS Keychain first (never plaintext).
             state
                 .credential_store
                 .save(&creds)
                 .map_err(UserFacingError::from)?;
 
+            // 2. Persist non-secret account pointer in config.json.
             {
                 let mut guard = state
                     .config
@@ -333,6 +338,7 @@ pub async fn poll_nextcloud_login(
                 *guard = candidate;
             }
 
+            // 3. Activate live WebDAV + SQLite cached storage session.
             state
                 .activate_session(creds.clone())
                 .map_err(UserFacingError::from)?;
@@ -497,8 +503,9 @@ pub async fn rename_file(
         .rename_item(&from, &to)
         .await
         .map_err(UserFacingError::from)?;
-    state.events.publish(AppEvent::FileCreated {
-        path: to,
+    state.events.publish(AppEvent::FileRenamed {
+        from,
+        to,
         timestamp: Utc::now(),
     });
     Ok(())
@@ -525,13 +532,14 @@ pub async fn upload_file_base64(
     state: State<'_, AppState>,
     path: String,
     data_base64: String,
+    overwrite: bool,
 ) -> Result<Etag, UserFacingError> {
     let service = require_files_service(&state)?;
     let raw = BASE64.decode(data_base64.as_bytes()).map_err(|err| {
         UserFacingError::from(FrError::Other(format!("invalid upload payload: {err}")))
     })?;
     let etag = service
-        .upload_bytes(&path, Bytes::from(raw))
+        .upload_bytes(&path, Bytes::from(raw), overwrite)
         .await
         .map_err(UserFacingError::from)?;
     state.events.publish(AppEvent::FileCreated {
@@ -577,6 +585,29 @@ pub fn toggle_pin_folder(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn create_markdown_file(
+    state: State<'_, AppState>,
+    path: String,
+    content: String,
+) -> Result<SaveMarkdownResponse, UserFacingError> {
+    let service = require_files_service(&state)?;
+    let cloud_path = CloudPath::parse(&path).map_err(UserFacingError::from)?;
+    let etag = service
+        .create_markdown(cloud_path.as_str(), &content)
+        .await
+        .map_err(UserFacingError::from)?;
+    state.events.publish(AppEvent::FileCreated {
+        path: cloud_path.as_str().to_owned(),
+        timestamp: Utc::now(),
+    });
+    Ok(SaveMarkdownResponse {
+        path: cloud_path,
+        etag,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn read_markdown_file(
     state: State<'_, AppState>,
     path: String,
@@ -587,11 +618,11 @@ pub async fn read_markdown_file(
         .await
         .map_err(UserFacingError::from)?;
 
-    let server_scope = state.current_config().nextcloud_url;
+    let account_scope = state.active_account_scope();
     let draft = if let Some(ref cache) = state.cache {
         let cache = cache.clone();
         let p = cloud_path.clone();
-        tokio::task::spawn_blocking(move || cache.get_markdown_draft(&server_scope, &p))
+        tokio::task::spawn_blocking(move || cache.get_markdown_draft(&account_scope, &p))
             .await
             .ok()
             .and_then(|res| res.ok())
@@ -634,10 +665,11 @@ pub async fn save_markdown_file(
 
     if let Some(ref cache) = state.cache {
         let cache = cache.clone();
-        let server_scope = state.current_config().nextcloud_url;
+        let account_scope = state.active_account_scope();
         let p = cloud_path.clone();
-        let _ = tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&server_scope, &p))
-            .await;
+        let _ =
+            tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&account_scope, &p))
+                .await;
     }
 
     state.events.publish(AppEvent::FileUpdated {
@@ -669,9 +701,9 @@ pub async fn save_markdown_copy(
         && let Ok(orig) = CloudPath::parse(&original_path)
     {
         let cache = cache.clone();
-        let server_scope = state.current_config().nextcloud_url;
+        let account_scope = state.active_account_scope();
         let _ =
-            tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&server_scope, &orig))
+            tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&account_scope, &orig))
                 .await;
     }
 
@@ -699,9 +731,9 @@ pub async fn save_markdown_draft(
         return Ok(());
     };
     let cache = cache.clone();
-    let server_scope = state.current_config().nextcloud_url;
+    let account_scope = state.active_account_scope();
     tokio::task::spawn_blocking(move || {
-        cache.save_markdown_draft(&server_scope, &cloud_path, &content, base_etag.as_ref())
+        cache.save_markdown_draft(&account_scope, &cloud_path, &content, base_etag.as_ref())
     })
     .await
     .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
@@ -719,8 +751,8 @@ pub async fn discard_markdown_draft(
         return Ok(());
     };
     let cache = cache.clone();
-    let server_scope = state.current_config().nextcloud_url;
-    tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&server_scope, &cloud_path))
+    let account_scope = state.active_account_scope();
+    tokio::task::spawn_blocking(move || cache.delete_markdown_draft(&account_scope, &cloud_path))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
         .map_err(UserFacingError::from)
@@ -772,12 +804,126 @@ pub fn get_media_proxy_url(
         .map(|proxy| proxy.media_url(&cloud_path, transcode)))
 }
 
+const MAX_NATIVE_OPEN_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_OPENED_FILE_DIRS: usize = 20;
+
+fn is_dangerous_executable_name(file_name: &str) -> bool {
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    matches!(
+        ext.as_deref(),
+        Some(
+            "exe"
+                | "bat"
+                | "cmd"
+                | "com"
+                | "msi"
+                | "msp"
+                | "ps1"
+                | "psm1"
+                | "vbs"
+                | "vbe"
+                | "js"
+                | "jse"
+                | "wsf"
+                | "wsh"
+                | "scr"
+                | "pif"
+                | "hta"
+                | "jar"
+                | "app"
+                | "command"
+                | "sh"
+                | "dmg"
+                | "pkg"
+                | "lnk"
+                | "reg"
+        )
+    )
+}
+
+fn sanitize_native_open_filename(raw: &str) -> fr_core::Result<String> {
+    let replaced: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            _ => c,
+        })
+        .collect();
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err(FrError::InvalidPath(
+            "invalid file name for native open".into(),
+        ));
+    }
+
+    let stem_upper = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let is_windows_reserved = matches!(
+        stem_upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if is_windows_reserved {
+        Ok(format!("_{trimmed}"))
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+fn prune_old_opened_dirs(parent: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_dir() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, e.path()))
+        })
+        .collect();
+    if dirs.len() <= MAX_OPENED_FILE_DIRS {
+        return;
+    }
+    dirs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, stale) in dirs.into_iter().skip(MAX_OPENED_FILE_DIRS) {
+        let _ = std::fs::remove_dir_all(stale);
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn open_file_in_native_app(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
+    allow_executable: bool,
 ) -> Result<String, UserFacingError> {
     let service = require_files_service(&state)?;
     let cloud_path = CloudPath::parse(&path).map_err(UserFacingError::from)?;
@@ -788,24 +934,44 @@ pub async fn open_file_in_native_app(
         })?
         .to_owned();
 
+    if !allow_executable && is_dangerous_executable_name(&file_name) {
+        return Err(UserFacingError {
+            code: "executable_blocked".into(),
+            title: "Executable or script file".into(),
+            message: format!(
+                "\"{file_name}\" is a program or script from Nextcloud. Opening it could run code on your computer."
+            ),
+            recovery_hint: Some(
+                "Only proceed if you trust the teammate who uploaded this file.".into(),
+            ),
+            technical_details: None,
+        });
+    }
+
+    let safe_file_name =
+        sanitize_native_open_filename(&file_name).map_err(UserFacingError::from)?;
+
+    let meta = service
+        .storage()
+        .stat(&cloud_path)
+        .await
+        .map_err(UserFacingError::from)?;
+    if meta.size > MAX_NATIVE_OPEN_BYTES {
+        return Err(UserFacingError {
+            code: "file_too_large".into(),
+            title: "File is too large for quick open".into(),
+            message: "This file is larger than 256 MB. Download it directly from Nextcloud in your browser to open it.".into(),
+            recovery_hint: None,
+            technical_details: Some(format!("size={} bytes", meta.size)),
+        });
+    }
+
     let (bytes, etag) = service
         .storage()
         .read(&cloud_path)
         .await
         .map_err(UserFacingError::from)?;
 
-    let safe_file_name: String = file_name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect();
-    if safe_file_name.is_empty() || safe_file_name == "." || safe_file_name == ".." {
-        return Err(UserFacingError::from(FrError::InvalidPath(
-            "invalid file name for native open".into(),
-        )));
-    }
     let safe_etag: String = etag
         .as_str()
         .chars()
@@ -813,20 +979,21 @@ pub async fn open_file_in_native_app(
         .take(24)
         .collect();
 
-    let base_dir: PathBuf = ConfigStore::default_cache_dir()
+    let opened_root: PathBuf = ConfigStore::default_cache_dir()
         .unwrap_or_else(|_| std::env::temp_dir())
-        .join("opened-files")
-        .join(if safe_etag.is_empty() {
-            "latest"
-        } else {
-            safe_etag.as_str()
-        });
+        .join("opened-files");
+    let base_dir = opened_root.join(if safe_etag.is_empty() {
+        "latest"
+    } else {
+        safe_etag.as_str()
+    });
 
     let target_path = base_dir.join(&safe_file_name);
     let target_clone = target_path.clone();
     tokio::task::spawn_blocking(move || -> fr_core::Result<()> {
         std::fs::create_dir_all(&base_dir)?;
         std::fs::write(&target_clone, &bytes)?;
+        prune_old_opened_dirs(&opened_root);
         Ok(())
     })
     .await
@@ -843,4 +1010,37 @@ pub async fn open_file_in_native_app(
         })?;
 
     Ok(path_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_windows_reserved_and_trailing_dot_names() {
+        assert_eq!(
+            sanitize_native_open_filename("CON.txt").unwrap(),
+            "_CON.txt"
+        );
+        assert_eq!(sanitize_native_open_filename("nul").unwrap(), "_nul");
+        assert_eq!(
+            sanitize_native_open_filename("report.pdf. ").unwrap(),
+            "report.pdf"
+        );
+        assert_eq!(
+            sanitize_native_open_filename("a:b*c?.png").unwrap(),
+            "a_b_c_.png"
+        );
+        assert!(sanitize_native_open_filename("...").is_err());
+        assert!(sanitize_native_open_filename("   ").is_err());
+    }
+
+    #[test]
+    fn detects_executable_and_script_extensions() {
+        assert!(is_dangerous_executable_name("installer.exe"));
+        assert!(is_dangerous_executable_name("script.PS1"));
+        assert!(is_dangerous_executable_name("run.command"));
+        assert!(!is_dangerous_executable_name("bracket.sldprt"));
+        assert!(!is_dangerous_executable_name("drawing.pdf"));
+    }
 }

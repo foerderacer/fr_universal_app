@@ -40,11 +40,11 @@ import { ErrorBanner } from "../components/ErrorBanner";
 import { FilePreviewPane } from "../components/files/FilePreviewPane";
 import {
   createFolder,
+  createMarkdownFile,
   deleteFile,
   joinCloudPath,
   listFiles,
   renameFile,
-  saveMarkdownFile,
   searchFiles,
   togglePinFolder,
   uploadFileBytes,
@@ -168,9 +168,54 @@ export function FilesView({
   const [renamingItem, setRenamingItem] =
     useState<FileItemView_Serialize | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [pendingDelete, setPendingDelete] =
+    useState<FileItemView_Serialize | null>(null);
+  const [pendingUploadOverwrite, setPendingUploadOverwrite] = useState<{
+    dest: string;
+    name: string;
+    bytes: Uint8Array;
+  } | null>(null);
+  const [editorDirty, setEditorDirty] = useState(false);
+  const [pendingNavAction, setPendingNavAction] = useState<(() => void) | null>(
+    null,
+  );
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const isConnected = connectionStatus.state === "connected";
+
+  const guardUnsavedEditor = useCallback(
+    (action: () => void) => {
+      if (editorDirty && selectedFile?.previewKind === "markdown") {
+        setPendingNavAction(() => action);
+        return;
+      }
+      action();
+    },
+    [editorDirty, selectedFile],
+  );
+
+  const navigateToFolder = useCallback(
+    (targetPath: string) => {
+      guardUnsavedEditor(() => {
+        setSelectedFile(null);
+        setPreviewExpanded(false);
+        setEditorDirty(false);
+        setCurrentPath(targetPath);
+      });
+    },
+    [guardUnsavedEditor],
+  );
+
+  const selectFileSafely = useCallback(
+    (item: FileItemView_Serialize) => {
+      if (selectedFile?.entry.path === item.entry.path) return;
+      guardUnsavedEditor(() => {
+        setEditorDirty(false);
+        setSelectedFile(item);
+      });
+    },
+    [guardUnsavedEditor, selectedFile],
+  );
 
   const loadDirectory = useCallback(
     async (targetPath: string) => {
@@ -245,8 +290,33 @@ export function FilesView({
       for (const file of files) {
         const dest = joinCloudPath(currentPath, file.name);
         const bytes = new Uint8Array(await file.arrayBuffer());
-        await uploadFileBytes(dest, bytes);
+        try {
+          await uploadFileBytes(dest, bytes, false);
+        } catch (err) {
+          const uf = toUserFacingError(err);
+          if (uf.code === "already_exists") {
+            setPendingUploadOverwrite({ dest, name: file.name, bytes });
+            return;
+          }
+          throw err;
+        }
       }
+      await loadDirectory(currentPath);
+    } catch (err) {
+      setExplorerError(toUserFacingError(err));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handleConfirmUploadOverwrite() {
+    if (!pendingUploadOverwrite) return;
+    const { dest, bytes } = pendingUploadOverwrite;
+    setPendingUploadOverwrite(null);
+    setUploading(true);
+    setExplorerError(null);
+    try {
+      await uploadFileBytes(dest, bytes, true);
       await loadDirectory(currentPath);
     } catch (err) {
       setExplorerError(toUserFacingError(err));
@@ -268,7 +338,10 @@ export function FilesView({
           ? trimmed
           : `${trimmed}.md`;
         const fullPath = joinCloudPath(currentPath, fileName);
-        await saveMarkdownFile(fullPath, `# ${trimmed.replace(/\.md$/i, "")}\n\n`, null, false);
+        await createMarkdownFile(
+          fullPath,
+          `# ${trimmed.replace(/\.md$/i, "")}\n\n`,
+        );
       }
       setNewItemMode(null);
       setNewItemName("");
@@ -301,16 +374,16 @@ export function FilesView({
     }
   }
 
-  async function handleDelete(item: FileItemView_Serialize) {
-    const confirmed = window.confirm(
-      `Delete "${item.entry.name}" from Nextcloud?`,
-    );
-    if (!confirmed) return;
+  async function handleConfirmDelete() {
+    if (!pendingDelete) return;
+    const item = pendingDelete;
+    setPendingDelete(null);
     setExplorerError(null);
     try {
       await deleteFile(item.entry.path);
       if (selectedFile?.entry.path === item.entry.path) {
         setSelectedFile(null);
+        setEditorDirty(false);
       }
       await loadDirectory(currentPath);
     } catch (err) {
@@ -489,12 +562,97 @@ export function FilesView({
         />
       )}
 
+      {pendingNavAction && (
+        <div
+          role="alertdialog"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          <span>
+            You have unsaved edits in your Markdown note. A local draft will be kept so you can restore it later.
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                const fn = pendingNavAction;
+                setPendingNavAction(null);
+                fn();
+              }}
+              className="rounded-lg bg-amber-600 px-3 py-1 font-semibold text-white hover:bg-amber-700"
+            >
+              Leave &amp; keep local draft
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingNavAction(null)}
+              className="rounded-lg border border-amber-300 bg-white px-3 py-1 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+            >
+              Stay in editor
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pendingUploadOverwrite && (
+        <div
+          role="alertdialog"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          <span>
+            &ldquo;{pendingUploadOverwrite.name}&rdquo; already exists in this folder. Replace the existing file on Nextcloud?
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleConfirmUploadOverwrite()}
+              className="rounded-lg bg-amber-600 px-3 py-1 font-semibold text-white hover:bg-amber-700"
+            >
+              Replace file
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingUploadOverwrite(null)}
+              className="rounded-lg border border-amber-300 bg-white px-3 py-1 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+            >
+              Skip
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pendingDelete && (
+        <div
+          role="alertdialog"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-xs text-rose-900 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-200"
+        >
+          <span>
+            Delete &ldquo;{pendingDelete.entry.name}&rdquo; from Nextcloud?
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleConfirmDelete()}
+              className="rounded-lg bg-rose-600 px-3 py-1 font-semibold text-white hover:bg-rose-700"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={() => setPendingDelete(null)}
+              className="rounded-lg border border-rose-300 bg-white px-3 py-1 font-medium text-rose-900 hover:bg-rose-100 dark:border-rose-700 dark:bg-slate-900 dark:text-rose-200"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Pinned folders + Quota strip */}
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            onClick={() => setCurrentPath("/")}
+            onClick={() => navigateToFolder("/")}
             className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${
               currentPath === "/"
                 ? "bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300"
@@ -517,7 +675,7 @@ export function FilesView({
               >
                 <button
                   type="button"
-                  onClick={() => setCurrentPath(folder)}
+                  onClick={() => navigateToFolder(folder)}
                   className="inline-flex items-center gap-1 px-2 py-1"
                 >
                   <Pin className="h-3 w-3 text-blue-500" />
@@ -576,7 +734,7 @@ export function FilesView({
                     {idx > 0 && <ChevronRight className="h-3.5 w-3.5 text-slate-400" />}
                     <button
                       type="button"
-                      onClick={() => setCurrentPath(crumb.path)}
+                      onClick={() => navigateToFolder(crumb.path)}
                       className={`rounded px-1.5 py-0.5 font-medium hover:bg-slate-100 dark:hover:bg-slate-800 ${
                         idx === breadcrumbs.length - 1
                           ? "text-slate-900 dark:text-slate-100"
@@ -794,9 +952,9 @@ export function FilesView({
                           type="button"
                           onClick={() => {
                             if (item.entry.kind === "directory") {
-                              setCurrentPath(item.entry.path);
+                              navigateToFolder(item.entry.path);
                             } else {
-                              setSelectedFile(item);
+                              selectFileSafely(item);
                             }
                           }}
                           className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
@@ -847,7 +1005,7 @@ export function FilesView({
                             </button>
                             <button
                               type="button"
-                              onClick={() => void handleDelete(item)}
+                              onClick={() => setPendingDelete(item)}
                               title="Delete"
                               className="rounded p-1 text-slate-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950/60"
                             >
@@ -869,9 +1027,9 @@ export function FilesView({
                         type="button"
                         onClick={() => {
                           if (item.entry.kind === "directory") {
-                            setCurrentPath(item.entry.path);
+                            navigateToFolder(item.entry.path);
                           } else {
-                            setSelectedFile(item);
+                            selectFileSafely(item);
                           }
                         }}
                         className={`flex flex-col items-start rounded-xl border p-3 text-left transition-colors ${
@@ -911,11 +1069,15 @@ export function FilesView({
               item={selectedFile}
               expanded={previewExpanded}
               onToggleExpand={() => setPreviewExpanded((e) => !e)}
-              onClose={() => {
-                setSelectedFile(null);
-                setPreviewExpanded(false);
-              }}
+              onClose={() =>
+                guardUnsavedEditor(() => {
+                  setSelectedFile(null);
+                  setPreviewExpanded(false);
+                  setEditorDirty(false);
+                })
+              }
               onRefreshFolder={() => void loadDirectory(currentPath)}
+              onDirtyChange={setEditorDirty}
             />
           </section>
         )}

@@ -18,6 +18,7 @@ serde.workspace = true
 specta.workspace = true
 subtle.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

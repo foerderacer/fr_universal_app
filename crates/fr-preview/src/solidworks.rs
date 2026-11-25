@@ -7,7 +7,16 @@ use fr_core::{FrError, Result};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::image_helper::transcode_to_png;
+use crate::image_helper::normalize_thumbnail_png;
+
+/// Maximum bytes read from an embedded CFBF preview stream (8 MiB).
+const MAX_PREVIEW_STREAM_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum bytes read from a `SummaryInformation` property set stream (1 MiB).
+const MAX_SUMMARY_STREAM_BYTES: usize = 1024 * 1024;
+/// Maximum encoded PNG bytes placed into the IPC `data:` URL (2 MiB).
+const MAX_THUMBNAIL_PNG_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum thumbnail edge dimension in pixels after normalization.
+const MAX_THUMBNAIL_EDGE_PX: u32 = 1024;
 
 /// Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -66,11 +75,11 @@ pub fn extract_solidworks_preview(bytes: &[u8]) -> Result<SolidWorksPreview> {
     }
 
     let thumbnail_data_url = if let Some(path) = preview_png_path {
-        read_stream(&mut comp, &path)
+        read_stream_bounded(&mut comp, &path, MAX_PREVIEW_STREAM_BYTES)
             .ok()
             .and_then(|raw| normalize_preview_image(&raw))
     } else if let Some(path) = preview_dib_path {
-        read_stream(&mut comp, &path)
+        read_stream_bounded(&mut comp, &path, MAX_PREVIEW_STREAM_BYTES)
             .ok()
             .and_then(|raw| normalize_preview_image(&raw))
     } else {
@@ -78,7 +87,7 @@ pub fn extract_solidworks_preview(bytes: &[u8]) -> Result<SolidWorksPreview> {
     };
 
     let metadata = if let Some(path) = summary_info_path {
-        read_stream(&mut comp, &path)
+        read_stream_bounded(&mut comp, &path, MAX_SUMMARY_STREAM_BYTES)
             .map(|raw| parse_summary_information(&raw))
             .unwrap_or_default()
     } else {
@@ -92,53 +101,56 @@ pub fn extract_solidworks_preview(bytes: &[u8]) -> Result<SolidWorksPreview> {
     })
 }
 
-fn read_stream(comp: &mut cfb::CompoundFile<Cursor<&[u8]>>, path: &str) -> Result<Vec<u8>> {
-    let mut stream = comp
+fn read_stream_bounded(
+    comp: &mut cfb::CompoundFile<Cursor<&[u8]>>,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let stream = comp
         .open_stream(path)
         .map_err(|err| FrError::Other(format!("failed to open CFBF stream '{path}': {err}")))?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    let limit = (max_bytes as u64).saturating_add(1);
+    stream.take(limit).read_to_end(&mut buf)?;
+    if buf.len() > max_bytes {
+        return Err(FrError::Other(format!(
+            "CFBF stream '{path}' exceeds safety cap"
+        )));
+    }
     Ok(buf)
 }
 
 fn normalize_preview_image(raw: &[u8]) -> Option<String> {
-    if raw.len() < 16 {
+    if raw.len() < 16 || raw.len() > MAX_PREVIEW_STREAM_BYTES {
         return None;
     }
 
-    // Modern SolidWorks `PreviewPNG` starts with the PNG magic signature.
-    if raw.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
-        return Some(format!("data:image/png;base64,{}", BASE64.encode(raw)));
-    }
-
-    // Legacy `Preview` streams may already have a BMP header (`BM`) or start directly with a
-    // 40-byte BITMAPINFOHEADER DIB.
-    let bmp_bytes = if raw.starts_with(b"BM") {
+    // Modern SolidWorks `PreviewPNG` starts with the PNG magic signature. Validate dimensions
+    // and downscale via `image` so crafted files cannot produce huge IPC payloads.
+    let candidate = if raw.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) || raw.starts_with(b"BM")
+    {
         raw.to_vec()
     } else {
         wrap_dib_as_bmp(raw)?
     };
 
-    if let Ok(png) = transcode_to_png(&bmp_bytes) {
-        Some(format!("data:image/png;base64,{}", BASE64.encode(png)))
-    } else {
-        Some(format!(
-            "data:image/bmp;base64,{}",
-            BASE64.encode(bmp_bytes)
-        ))
+    let png = normalize_thumbnail_png(&candidate, MAX_THUMBNAIL_EDGE_PX).ok()?;
+    if png.len() > MAX_THUMBNAIL_PNG_BYTES {
+        return None;
     }
+    Some(format!("data:image/png;base64,{}", BASE64.encode(png)))
 }
 
 fn wrap_dib_as_bmp(dib: &[u8]) -> Option<Vec<u8>> {
-    if dib.len() < 40 {
+    if dib.len() < 40 || dib.len() > MAX_PREVIEW_STREAM_BYTES {
         return None;
     }
-    let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
+    let header_size = u32::from_le_bytes(dib.get(0..4)?.try_into().ok()?);
     if header_size != 40 {
         return None;
     }
-    let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
-    let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
+    let bit_count = u16::from_le_bytes(dib.get(14..16)?.try_into().ok()?);
+    let colors_used = u32::from_le_bytes(dib.get(32..36)?.try_into().ok()?);
     let palette_entries = if colors_used > 0 {
         colors_used
     } else if bit_count <= 8 {
@@ -151,7 +163,7 @@ fn wrap_dib_as_bmp(dib: &[u8]) -> Option<Vec<u8>> {
         .checked_add(palette_entries.checked_mul(4)?)?;
     let file_size = 14u32.checked_add(u32::try_from(dib.len()).ok()?)?;
 
-    let mut out = Vec::with_capacity(file_size as usize);
+    let mut out = Vec::with_capacity(usize::try_from(file_size).ok()?);
     out.extend_from_slice(b"BM");
     out.extend_from_slice(&file_size.to_le_bytes());
     out.extend_from_slice(&[0u8; 4]);
@@ -178,41 +190,54 @@ fn parse_summary_information(data: &[u8]) -> SolidWorksMetadata {
     }
 
     // First section descriptor starts at offset 28: FMTID (16 bytes) + Offset (u32 @ 44).
-    let Some(section_offset) = read_u32(data, 44).map(|v| v as usize) else {
+    let Some(section_offset) = read_u32(data, 44).and_then(|v| usize::try_from(v).ok()) else {
         return meta;
     };
-    if section_offset + 8 > data.len() {
+    let Some(table_start) = section_offset.checked_add(8) else {
+        return meta;
+    };
+    if table_start > data.len() {
         return meta;
     }
 
-    let num_props = read_u32(data, section_offset + 4).unwrap_or(0) as usize;
-    let table_start = section_offset + 8;
+    let num_props = read_u32(data, section_offset.saturating_add(4))
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0);
 
     for i in 0..num_props.min(64) {
-        let entry_off = table_start + i * 8;
-        if entry_off + 8 > data.len() {
+        let Some(entry_off) = i.checked_mul(8).and_then(|d| table_start.checked_add(d)) else {
+            break;
+        };
+        if entry_off.checked_add(8).is_none_or(|end| end > data.len()) {
             break;
         }
         let prop_id = read_u32(data, entry_off).unwrap_or(0);
-        let rel_offset = read_u32(data, entry_off + 4).unwrap_or(0) as usize;
+        let rel_offset = entry_off
+            .checked_add(4)
+            .and_then(|o| read_u32(data, o))
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0);
         let Some(prop_off) = section_offset.checked_add(rel_offset) else {
             continue;
         };
-        if prop_off + 4 > data.len() {
+        let Some(val_off) = prop_off.checked_add(4) else {
+            continue;
+        };
+        if val_off > data.len() {
             continue;
         }
 
         let prop_type = read_u32(data, prop_off).unwrap_or(0);
         match prop_id {
-            2 => meta.title = parse_ole_string(data, prop_off + 4, prop_type),
-            3 => meta.subject = parse_ole_string(data, prop_off + 4, prop_type),
-            4 => meta.author = parse_ole_string(data, prop_off + 4, prop_type),
-            5 => meta.keywords = parse_ole_string(data, prop_off + 4, prop_type),
-            6 => meta.comments = parse_ole_string(data, prop_off + 4, prop_type),
-            8 => meta.last_saved_by = parse_ole_string(data, prop_off + 4, prop_type),
-            12 => meta.created_at = parse_ole_filetime(data, prop_off + 4, prop_type),
-            13 => meta.last_saved_at = parse_ole_filetime(data, prop_off + 4, prop_type),
-            18 => meta.application_name = parse_ole_string(data, prop_off + 4, prop_type),
+            2 => meta.title = parse_ole_string(data, val_off, prop_type),
+            3 => meta.subject = parse_ole_string(data, val_off, prop_type),
+            4 => meta.author = parse_ole_string(data, val_off, prop_type),
+            5 => meta.keywords = parse_ole_string(data, val_off, prop_type),
+            6 => meta.comments = parse_ole_string(data, val_off, prop_type),
+            8 => meta.last_saved_by = parse_ole_string(data, val_off, prop_type),
+            12 => meta.created_at = parse_ole_filetime(data, val_off, prop_type),
+            13 => meta.last_saved_at = parse_ole_filetime(data, val_off, prop_type),
+            18 => meta.application_name = parse_ole_string(data, val_off, prop_type),
             _ => {}
         }
     }
@@ -221,18 +246,20 @@ fn parse_summary_information(data: &[u8]) -> SolidWorksMetadata {
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    let slice = data.get(offset..offset + 2)?;
+    let end = offset.checked_add(2)?;
+    let slice = data.get(offset..end)?;
     Some(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    let slice = data.get(offset..offset + 4)?;
+    let end = offset.checked_add(4)?;
+    let slice = data.get(offset..end)?;
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn parse_ole_string(data: &[u8], offset: usize, prop_type: u32) -> Option<String> {
-    let count = read_u32(data, offset)? as usize;
-    let payload_start = offset + 4;
+    let count = usize::try_from(read_u32(data, offset)?).ok()?;
+    let payload_start = offset.checked_add(4)?;
     match prop_type {
         // VT_LPSTR (30): count is byte length including null terminator.
         30 => {
@@ -268,7 +295,8 @@ fn parse_ole_filetime(data: &[u8], offset: usize, prop_type: u32) -> Option<Stri
     if prop_type != 64 {
         return None;
     }
-    let slice = data.get(offset..offset + 8)?;
+    let end = offset.checked_add(8)?;
+    let slice = data.get(offset..end)?;
     let raw = u64::from_le_bytes(slice.try_into().ok()?);
     const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
     if raw < EPOCH_DIFF_100NS {
@@ -284,6 +312,7 @@ fn parse_ole_filetime(data: &[u8], offset: usize, prop_type: u32) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageBuffer, ImageFormat, Rgba};
     use std::io::Write;
 
     fn build_summary_stream(title: &str, author: &str, app: &str) -> Vec<u8> {
@@ -320,13 +349,16 @@ mod tests {
 
     #[test]
     fn extracts_embedded_png_and_summary_metadata_from_solidworks_cfbf() {
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(16, 16, Rgba([40, 120, 220, 255]));
+        let mut png_bytes = Cursor::new(Vec::new());
+        img.write_to(&mut png_bytes, ImageFormat::Png).unwrap();
+
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut comp = cfb::CompoundFile::create(&mut cursor).unwrap();
             let mut png_stream = comp.create_stream("/PreviewPNG").unwrap();
-            png_stream
-                .write_all(&[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82])
-                .unwrap();
+            png_stream.write_all(png_bytes.get_ref()).unwrap();
 
             let mut sum_stream = comp.create_stream("/\x05SummaryInformation").unwrap();
             sum_stream
@@ -352,5 +384,28 @@ mod tests {
             Some("SOLIDWORKS 2025")
         );
         assert_eq!(preview.stream_count, 2);
+    }
+
+    #[test]
+    fn rejects_malformed_and_truncated_cfbf_without_panicking() {
+        assert!(extract_solidworks_preview(&[]).is_err());
+        assert!(extract_solidworks_preview(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1]).is_err());
+
+        // Malformed summary stream & bogus PNG header inside a valid CFBF must never panic.
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut comp = cfb::CompoundFile::create(&mut cursor).unwrap();
+            let mut png_stream = comp.create_stream("/PreviewPNG").unwrap();
+            png_stream
+                .write_all(&[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 1, 2, 3, 4, 5])
+                .unwrap();
+            let mut sum_stream = comp.create_stream("/\x05SummaryInformation").unwrap();
+            let mut crafted = vec![0xFFu8; 64];
+            crafted[0..2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+            sum_stream.write_all(&crafted).unwrap();
+        }
+        let preview = extract_solidworks_preview(cursor.get_ref()).unwrap();
+        assert!(preview.thumbnail_data_url.is_none());
+        assert_eq!(preview.metadata, SolidWorksMetadata::default());
     }
 }

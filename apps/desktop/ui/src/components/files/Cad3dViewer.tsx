@@ -51,14 +51,18 @@ function parseStlToGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
 
 export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{
+    message: string;
+    details: string | null;
+  } | null>(null);
 
   useEffect(() => {
     const ext = fileName.split(".").pop()?.toLowerCase();
     if (ext !== "stl") {
-      setError(
-        `Interactive 3D preview currently renders .stl meshes directly. Click "Open in Native App" to inspect .${ext ?? "cad"} files.`,
-      );
+      setError({
+        message: `Interactive 3D preview currently renders .stl meshes directly. Click "Open in Native App" to inspect .${ext ?? "cad"} files.`,
+        details: null,
+      });
       return;
     }
 
@@ -159,7 +163,11 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
       })
       .catch((err) => {
         if (!disposed) {
-          setError(`Failed to load 3D model (${err instanceof Error ? err.message : String(err)}).`);
+          setError({
+            message:
+              'We couldn\'t display this 3D model in the app. Click "Open in Native App" to inspect it in your CAD viewer.',
+            details: err instanceof Error ? err.message : String(err),
+          });
         }
       });
 
@@ -177,7 +185,13 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
   if (error) {
     return (
       <div className="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
-        {error}
+        <p>{error.message}</p>
+        {error.details && (
+          <details className="mt-2 text-xs text-slate-500">
+            <summary className="cursor-pointer font-medium">Technical details</summary>
+            <p className="mt-1 font-mono break-all">{error.details}</p>
+          </details>
+        )}
       </div>
     );
   }

@@ -13,10 +13,10 @@ fr-preview.workspace = true
 fr-storage.workspace = true
 serde.workspace = true
 specta.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

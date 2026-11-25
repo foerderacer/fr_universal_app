@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Box,
   ExternalLink,
   File as FileIcon,
@@ -30,6 +31,7 @@ interface FilePreviewPaneProps {
   onToggleExpand: () => void;
   onClose: () => void;
   onRefreshFolder: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 export function FilePreviewPane({
@@ -38,12 +40,16 @@ export function FilePreviewPane({
   onToggleExpand,
   onClose,
   onRefreshFolder,
+  onDirtyChange,
 }: FilePreviewPaneProps) {
   const [payload, setPayload] = useState<FilePreviewPayload_Serialize | null>(
     null,
   );
   const [loading, setLoading] = useState(false);
   const [openingNative, setOpeningNative] = useState(false);
+  const [execConfirmWarning, setExecConfirmWarning] = useState<string | null>(
+    null,
+  );
   const [error, setError] = useState<UserFacingError | null>(null);
   const [imageZoom, setImageZoom] = useState(1);
   const [imageRotation, setImageRotation] = useState(0);
@@ -52,6 +58,7 @@ export function FilePreviewPane({
 
   useEffect(() => {
     setError(null);
+    setExecConfirmWarning(null);
     setImageZoom(1);
     setImageRotation(0);
 
@@ -60,6 +67,8 @@ export function FilePreviewPane({
       setLoading(false);
       return;
     }
+
+    onDirtyChange?.(false);
 
     let cancelled = false;
     setLoading(true);
@@ -79,15 +88,21 @@ export function FilePreviewPane({
     return () => {
       cancelled = true;
     };
-  }, [item.entry.path, isMarkdown]);
+  }, [item.entry.path, isMarkdown, onDirtyChange]);
 
-  async function handleOpenNative() {
+  async function handleOpenNative(allowExecutable = false) {
     setOpeningNative(true);
     setError(null);
+    setExecConfirmWarning(null);
     try {
-      await openFileInNativeApp(item.entry.path);
+      await openFileInNativeApp(item.entry.path, allowExecutable);
     } catch (err) {
-      setError(toUserFacingError(err));
+      const uf = toUserFacingError(err);
+      if (uf.code === "executable_blocked") {
+        setExecConfirmWarning(uf.message);
+      } else {
+        setError(uf);
+      }
     } finally {
       setOpeningNative(false);
     }
@@ -158,10 +173,43 @@ export function FilePreviewPane({
           </div>
         )}
 
+        {execConfirmWarning && (
+          <div
+            role="alertdialog"
+            className="mb-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40"
+          >
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div className="flex-1 text-xs text-amber-900 dark:text-amber-200">
+                <p className="font-semibold">Confirm opening executable file</p>
+                <p className="mt-1">{execConfirmWarning}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={openingNative}
+                    onClick={() => void handleOpenNative(true)}
+                    className="rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    Open anyway
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setExecConfirmWarning(null)}
+                    className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {isMarkdown ? (
           <MarkdownEditor
             path={item.entry.path}
             onSaved={() => onRefreshFolder()}
+            onDirtyChange={onDirtyChange}
           />
         ) : loading ? (
           <div className="flex h-64 items-center justify-center gap-2 text-sm text-slate-500">
@@ -346,6 +394,38 @@ export function FilePreviewPane({
                 {payload.textContent}
               </pre>
             )}
+
+            {(payload.previewKind === "image" ||
+              payload.previewKind === "video" ||
+              payload.previewKind === "pdf" ||
+              payload.previewKind === "vectorAi" ||
+              payload.previewKind === "cad3d") &&
+              !payload.mediaUrl && (
+                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-8 text-center dark:border-slate-800 dark:bg-slate-950">
+                  <FileIcon className="mb-3 h-10 w-10 text-slate-400" />
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    In-app preview stream is unavailable
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    Click &ldquo;Open in Native App&rdquo; to view this file in your default program.
+                  </p>
+                </div>
+              )}
+
+            {(payload.previewKind === "vectorSvg" ||
+              payload.previewKind === "vectorDxf" ||
+              payload.previewKind === "plainText") &&
+              payload.textContent === null && (
+                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-8 text-center dark:border-slate-800 dark:bg-slate-950">
+                  <FileIcon className="mb-3 h-10 w-10 text-slate-400" />
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    Preview skipped for large file
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    Click &ldquo;Open in Native App&rdquo; to inspect the full file.
+                  </p>
+                </div>
+              )}
 
             {(payload.previewKind === "vectorEps" ||
               payload.previewKind === "unsupported") && (
