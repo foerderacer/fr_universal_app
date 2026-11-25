@@ -1,4 +1,4 @@
-import { Check, RotateCcw, Save, ShieldCheck } from "lucide-react";
+import { Check, LogOut, RotateCcw, Save, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import type {
   UpdateSettingsRequest,
@@ -6,11 +6,13 @@ import type {
   WorkspaceOverview_Serialize,
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { formatBytes } from "../lib/workspaceClient";
 
 interface SettingsViewProps {
   overview: WorkspaceOverview_Serialize;
   onSave: (input: UpdateSettingsRequest) => Promise<void>;
   onResetUrl: () => Promise<string>;
+  onSignOut: () => Promise<void>;
   error: UserFacingError | null;
   onClearError: () => void;
 }
@@ -19,11 +21,16 @@ export function SettingsView({
   overview,
   onSave,
   onResetUrl,
+  onSignOut,
   error,
   onClearError,
 }: SettingsViewProps) {
-  const [nextcloudUrl, setNextcloudUrl] = useState(overview.config.nextcloudUrl);
-  const [cacheLimitMb, setCacheLimitMb] = useState(overview.config.cacheLimitMb);
+  const [nextcloudUrl, setNextcloudUrl] = useState(
+    overview.config.nextcloudUrl,
+  );
+  const [cacheLimitMb, setCacheLimitMb] = useState(
+    overview.config.cacheLimitMb,
+  );
   const [theme, setTheme] = useState(overview.config.theme);
   const [mcpServerEnabled, setMcpServerEnabled] = useState(
     overview.config.mcpServerEnabled,
@@ -80,17 +87,67 @@ export function SettingsView({
     }
   }
 
+  async function handleSignOut() {
+    setSaving(true);
+    setSavedNotice(false);
+    try {
+      await onSignOut();
+    } catch {
+      // Error banner is displayed by parent.
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <form onSubmit={handleSubmit} className="mx-auto max-w-2xl space-y-6">
       {error && <ErrorBanner error={error} onDismiss={onClearError} />}
+
+      {overview.connectionStatus.state === "connected" && (
+        <section className="rounded-2xl border border-emerald-200 bg-white p-6 shadow-xs dark:border-emerald-900/60 dark:bg-slate-900">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Connected Account
+              </h2>
+              <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                Signed in as{" "}
+                <span className="font-medium text-slate-900 dark:text-slate-200">
+                  {overview.accountInfo?.displayName ||
+                    overview.connectionStatus.loginName}
+                </span>{" "}
+                ({overview.connectionStatus.loginName})
+              </p>
+              {overview.accountInfo && (
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  Quota: {formatBytes(overview.accountInfo.quotaUsedBytes)}
+                  {overview.accountInfo.quotaTotalBytes
+                    ? ` / ${formatBytes(overview.accountInfo.quotaTotalBytes)}`
+                    : ""}
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void handleSignOut()}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-rose-200 px-3.5 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900/60 dark:text-rose-300 dark:hover:bg-rose-950/40"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              Sign out &amp; clear cache
+            </button>
+          </div>
+        </section>
+      )}
 
       <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs dark:border-slate-800 dark:bg-slate-900">
         <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
           Nextcloud Server
         </h2>
         <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-          Your team&apos;s Nextcloud web address. Credentials are always stored in
-          your operating system&apos;s Keychain, never in plain files.
+          Your team&apos;s Nextcloud web address. Credentials are always stored
+          in your operating system&apos;s Keychain, never in plain files.
         </p>
 
         <div className="mt-4 space-y-2">
@@ -113,7 +170,7 @@ export function SettingsView({
             {overview.defaultNextcloudUrl && (
               <button
                 type="button"
-                onClick={handleResetUrl}
+                onClick={() => void handleResetUrl()}
                 disabled={saving}
                 title="Reset to build default server URL"
                 className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
@@ -123,6 +180,12 @@ export function SettingsView({
               </button>
             )}
           </div>
+          {nextcloudUrl.trim().toLowerCase().startsWith("http://") && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Heads up: this address uses unencrypted <code>http://</code>. Use{" "}
+              <code>https://</code> for production Nextcloud servers.
+            </p>
+          )}
         </div>
       </section>
 
@@ -184,7 +247,8 @@ export function SettingsView({
             </p>
             <p className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
               <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-              Loopback only: {overview.mcpServer.bindHost}:{overview.mcpServer.port}
+              Loopback only: {overview.mcpServer.bindHost}:
+              {overview.mcpServer.port}
             </p>
           </div>
 

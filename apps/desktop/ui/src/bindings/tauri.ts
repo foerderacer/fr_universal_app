@@ -10,6 +10,11 @@ export const commands = {
 	getWorkspaceOverview: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("get_workspace_overview", undefined, options),
 	updateSettings: (input: UpdateSettingsRequest, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("update_settings", { input }, options),
 	resetNextcloudUrl: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("reset_nextcloud_url", undefined, options),
+	startNextcloudLogin: (options?: InvokeOptions) => __TAURI_INVOKE<LoginStartResponse>("start_nextcloud_login", undefined, options),
+	pollNextcloudLogin: (options?: InvokeOptions) => __TAURI_INVOKE<LoginPollStatusResponse_Serialize>("poll_nextcloud_login", undefined, options),
+	cancelNextcloudLogin: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("cancel_nextcloud_login", undefined, options),
+	signOutNextcloud: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("sign_out_nextcloud", undefined, options),
+	refreshAccountInfo: (options?: InvokeOptions) => __TAURI_INVOKE<UserAccountInfo_Serialize | null>("refresh_account_info", undefined, options),
 };
 
 /* Types */
@@ -20,6 +25,8 @@ export type AppConfig = AppConfig_Serialize | AppConfig_Deserialize;
 export type AppConfig_Deserialize = {
 	/**  Base URL of the user's Nextcloud instance (e.g. `https://cloud.example.com`). */
 	nextcloudUrl: string,
+	/**  Active Nextcloud username (app password is stored exclusively in the OS keychain). */
+	nextcloudLoginName?: string | null,
 	/**  Pinned favorite folders shown in the Files sidebar (Nextcloud paths like `/Team`). */
 	pinnedFolders?: string[],
 	/**  Maximum local file cache size in megabytes. */
@@ -34,6 +41,8 @@ export type AppConfig_Deserialize = {
 export type AppConfig_Serialize = {
 	/**  Base URL of the user's Nextcloud instance (e.g. `https://cloud.example.com`). */
 	nextcloudUrl: string,
+	/**  Active Nextcloud username (app password is stored exclusively in the OS keychain). */
+	nextcloudLoginName: string | null,
 	/**  Pinned favorite folders shown in the Files sidebar (Nextcloud paths like `/Team`). */
 	pinnedFolders: string[],
 	/**  Maximum local file cache size in megabytes. */
@@ -42,6 +51,28 @@ export type AppConfig_Serialize = {
 	mcpServerEnabled: boolean,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme: string,
+};
+
+/**  Returned on each Login Flow v2 poll tick. */
+export type LoginPollStatusResponse = LoginPollStatusResponse_Serialize | LoginPollStatusResponse_Deserialize;
+
+/**  Returned on each Login Flow v2 poll tick. */
+export type LoginPollStatusResponse_Deserialize = {
+	completed: boolean,
+	overview?: WorkspaceOverview_Deserialize | null,
+};
+
+/**  Returned on each Login Flow v2 poll tick. */
+export type LoginPollStatusResponse_Serialize = {
+	completed: boolean,
+	overview: WorkspaceOverview_Serialize | null,
+};
+
+/**  Returned when Nextcloud Login Flow v2 has been initiated and opened in the browser. */
+export type LoginStartResponse = {
+	serverUrl: string,
+	loginUrl: string,
+	browserOpened: boolean,
 };
 
 /**  Configuration for the built-in local MCP Server. */
@@ -78,6 +109,29 @@ export type UpdateSettingsRequest = {
 	cacheLimitMb: number,
 	mcpServerEnabled: boolean,
 	theme: string,
+};
+
+/**  Account profile and storage quota fetched from Nextcloud OCS `/ocs/v2.php/cloud/user`. */
+export type UserAccountInfo = UserAccountInfo_Serialize | UserAccountInfo_Deserialize;
+
+/**  Account profile and storage quota fetched from Nextcloud OCS `/ocs/v2.php/cloud/user`. */
+export type UserAccountInfo_Deserialize = {
+	id: string,
+	displayName: string,
+	email?: string | null,
+	quotaUsedBytes: number | null,
+	quotaTotalBytes?: number | null,
+	quotaRelative?: number | null,
+};
+
+/**  Account profile and storage quota fetched from Nextcloud OCS `/ocs/v2.php/cloud/user`. */
+export type UserAccountInfo_Serialize = {
+	id: string,
+	displayName: string,
+	email: string | null,
+	quotaUsedBytes: number | null,
+	quotaTotalBytes: number | null,
+	quotaRelative: number | null,
 };
 
 /**
@@ -120,6 +174,8 @@ export type WorkspaceOverview_Deserialize = {
 	config: AppConfig_Deserialize,
 	defaultNextcloudUrl: string,
 	connectionStatus: NextcloudConnectionStatus,
+	accountInfo?: UserAccountInfo_Deserialize | null,
+	loginPendingUrl?: string | null,
 	mcpServer: McpServerConfig,
 	modules: ModuleDescriptor[],
 	startupError?: UserFacingError_Deserialize | null,
@@ -132,6 +188,8 @@ export type WorkspaceOverview_Serialize = {
 	config: AppConfig_Serialize,
 	defaultNextcloudUrl: string,
 	connectionStatus: NextcloudConnectionStatus,
+	accountInfo: UserAccountInfo_Serialize | null,
+	loginPendingUrl: string | null,
 	mcpServer: McpServerConfig,
 	modules: ModuleDescriptor[],
 	startupError: UserFacingError_Serialize | null,

@@ -12,6 +12,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::get_workspace_overview,
         commands::update_settings,
         commands::reset_nextcloud_url,
+        commands::start_nextcloud_login,
+        commands::poll_nextcloud_login,
+        commands::cancel_nextcloud_login,
+        commands::sign_out_nextcloud,
+        commands::refresh_account_info,
     ])
 }
 

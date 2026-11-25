@@ -25,6 +25,9 @@ pub fn default_nextcloud_url() -> String {
 pub struct AppConfig {
     /// Base URL of the user's Nextcloud instance (e.g. `https://cloud.example.com`).
     pub nextcloud_url: String,
+    /// Active Nextcloud username (app password is stored exclusively in the OS keychain).
+    #[serde(default)]
+    pub nextcloud_login_name: Option<String>,
     /// Pinned favorite folders shown in the Files sidebar (Nextcloud paths like `/Team`).
     #[serde(default)]
     pub pinned_folders: Vec<String>,
@@ -51,6 +54,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             nextcloud_url: default_nextcloud_url(),
+            nextcloud_login_name: None,
             pinned_folders: Vec::new(),
             cache_limit_mb: default_cache_limit_mb(),
             mcp_server_enabled: false,
@@ -80,6 +84,13 @@ impl ConfigStore {
         Ok(Self {
             path: proj_dirs.config_dir().join("config.json"),
         })
+    }
+
+    /// Resolves the default cross-platform cache directory (Windows LocalAppData / macOS Caches).
+    pub fn default_cache_dir() -> Result<PathBuf> {
+        let proj_dirs = ProjectDirs::from("de", "foerderacer", "FRUniversalApp")
+            .ok_or_else(|| FrError::InvalidConfig("unable to resolve OS cache directory".into()))?;
+        Ok(proj_dirs.cache_dir().to_path_buf())
     }
 
     pub fn path(&self) -> &Path {
@@ -138,6 +149,7 @@ mod tests {
         let store = ConfigStore::from_path(dir.path().join("nested").join("config.json"));
         let config = AppConfig {
             nextcloud_url: "https://cloud.example.com".into(),
+            nextcloud_login_name: Some("alice".into()),
             pinned_folders: vec!["/Projects".into(), "/Shared".into()],
             cache_limit_mb: 1024,
             mcp_server_enabled: false,

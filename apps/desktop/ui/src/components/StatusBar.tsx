@@ -1,5 +1,8 @@
 import { Cloud, CloudOff, Settings2 } from "lucide-react";
-import type { NextcloudConnectionStatus } from "../bindings/tauri";
+import type {
+  NextcloudConnectionStatus,
+  UserAccountInfo_Serialize,
+} from "../bindings/tauri";
 
 interface StatusBarProps {
   title: string;
@@ -7,6 +10,7 @@ interface StatusBarProps {
   appVersion: string;
   platform: string;
   connectionStatus: NextcloudConnectionStatus;
+  accountInfo: UserAccountInfo_Serialize | null;
   onOpenSettings: () => void;
 }
 
@@ -24,6 +28,7 @@ export function StatusBar({
   appVersion,
   platform,
   connectionStatus,
+  accountInfo,
   onOpenSettings,
 }: StatusBarProps) {
   return (
@@ -45,8 +50,11 @@ export function StatusBar({
         >
           {connectionStatus.state === "connected" ? (
             <>
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
               <Cloud className="h-3.5 w-3.5 text-emerald-500" />
-              <span>{connectionStatus.loginName}</span>
+              <span>
+                {accountInfo?.displayName || connectionStatus.loginName}
+              </span>
             </>
           ) : connectionStatus.state === "signedOut" ? (
             <>
