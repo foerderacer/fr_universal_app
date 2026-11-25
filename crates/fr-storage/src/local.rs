@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -11,9 +10,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use fr_core::{FrError, Result};
 use tempfile::NamedTempFile;
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock;
 
 use crate::backend::StorageBackend;
 use crate::path::CloudPath;
@@ -21,32 +18,27 @@ use crate::types::{Etag, FileEntry, FileKind};
 
 /// Local filesystem implementation of [`StorageBackend`], rooted in a sandbox directory.
 /// Used for fast deterministic unit/integration tests and offline development.
+///
+/// Concurrency & sandbox invariants:
+/// - A backend-level `Arc<RwLock<()>>` is acquired as an owned guard and moved into blocking I/O
+///   tasks so concurrent directory mutations, case-insensitive filename aliases, and future
+///   cancellation cannot bypass containment or ETag checks.
 #[derive(Debug, Clone)]
 pub struct LocalFsBackend {
     root: PathBuf,
-    path_locks: Arc<Mutex<HashMap<CloudPath, Arc<AsyncMutex<()>>>>>,
+    io_lock: Arc<RwLock<()>>,
 }
 
 impl LocalFsBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            path_locks: Arc::new(Mutex::new(HashMap::new())),
+            io_lock: Arc::new(RwLock::new(())),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    fn path_lock(&self, path: &CloudPath) -> Arc<AsyncMutex<()>> {
-        let mut map = self
-            .path_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.entry(path.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
     }
 
     fn is_symlink_or_reparse(meta: &std::fs::Metadata) -> bool {
@@ -64,18 +56,33 @@ impl LocalFsBackend {
         false
     }
 
-    /// Resolves `cloud_path` inside `self.root` while enforcing strict sandbox containment:
-    /// - Rejects any symlink or Windows junction/reparse point along the path.
-    /// - Verifies the canonicalized nearest existing ancestor stays inside canonical `self.root`.
-    async fn resolve_contained(&self, cloud_path: &CloudPath) -> Result<PathBuf> {
-        let canonical_root = fs::canonicalize(&self.root).await.map_err(|err| {
+    /// Resolves `cloud_path` inside `root` while enforcing strict sandbox containment:
+    /// - Rejects any symlink or Windows junction/reparse point along the path (including root).
+    /// - Verifies every existing ancestor canonicalizes inside canonical `root`.
+    /// - When `create_root_if_missing` is true, creates the sandbox root directory on first use.
+    fn resolve_contained_sync(
+        root: &Path,
+        cloud_path: &CloudPath,
+        create_root_if_missing: bool,
+    ) -> Result<PathBuf> {
+        if create_root_if_missing {
+            std::fs::create_dir_all(root)?;
+        }
+
+        let root_meta = std::fs::symlink_metadata(root).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(format!("storage root missing: {}", self.root.display()))
+                FrError::NotFound(format!("storage root missing: {}", root.display()))
             } else {
                 FrError::Io(err)
             }
         })?;
+        if Self::is_symlink_or_reparse(&root_meta) {
+            return Err(FrError::InvalidPath(
+                "storage root cannot be a symlink or junction".into(),
+            ));
+        }
 
+        let canonical_root = std::fs::canonicalize(root)?;
         let mut current = canonical_root.clone();
         let mut last_existing = canonical_root.clone();
         let mut missing_seen = false;
@@ -83,14 +90,14 @@ impl LocalFsBackend {
         for seg in cloud_path.segments() {
             current.push(seg);
             if !missing_seen {
-                match fs::symlink_metadata(&current).await {
+                match std::fs::symlink_metadata(&current) {
                     Ok(meta) => {
                         if Self::is_symlink_or_reparse(&meta) {
                             return Err(FrError::InvalidPath(format!(
                                 "symlinks and junctions are not permitted in local storage: {cloud_path}"
                             )));
                         }
-                        let canonical_step = fs::canonicalize(&current).await?;
+                        let canonical_step = std::fs::canonicalize(&current)?;
                         if !canonical_step.starts_with(&canonical_root) {
                             return Err(FrError::InvalidPath(format!(
                                 "path escapes storage sandbox: {cloud_path}"
@@ -121,14 +128,6 @@ impl LocalFsBackend {
         Etag::new(format!("local-{:016x}-{}", hasher.finish(), bytes.len()))
     }
 
-    async fn metadata_etag(fs_path: &Path, is_dir: bool) -> Result<Option<Etag>> {
-        if is_dir {
-            return Ok(None);
-        }
-        let data = fs::read(fs_path).await?;
-        Ok(Some(Self::compute_etag(&data)))
-    }
-
     fn guess_mime(path: &Path, is_dir: bool) -> Option<String> {
         if is_dir {
             return None;
@@ -156,8 +155,8 @@ impl LocalFsBackend {
         Some(mime.to_owned())
     }
 
-    async fn build_entry(&self, cloud_path: CloudPath, fs_path: &Path) -> Result<FileEntry> {
-        let meta = fs::symlink_metadata(fs_path).await.map_err(|err| {
+    fn build_entry_sync(cloud_path: CloudPath, fs_path: &Path) -> Result<FileEntry> {
+        let meta = std::fs::symlink_metadata(fs_path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 FrError::NotFound(cloud_path.to_string())
             } else {
@@ -178,7 +177,13 @@ impl LocalFsBackend {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()));
 
-        let etag = Self::metadata_etag(fs_path, is_dir).await?;
+        let etag = if is_dir {
+            None
+        } else {
+            let data = std::fs::read(fs_path)?;
+            Some(Self::compute_etag(&data))
+        };
+
         let name = cloud_path.file_name().unwrap_or("/").to_owned();
 
         Ok(FileEntry {
@@ -196,110 +201,127 @@ impl LocalFsBackend {
             modified_at: modified_at.map(|dt| dt.with_timezone(&Utc)),
         })
     }
-
-    async fn atomic_write_file(fs_path: PathBuf, data: Bytes) -> Result<()> {
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let parent = fs_path.parent().ok_or_else(|| {
-                FrError::InvalidPath("target path has no parent directory".into())
-            })?;
-            std::fs::create_dir_all(parent)?;
-
-            let mut tmp = NamedTempFile::new_in(parent)?;
-            tmp.write_all(&data)?;
-            tmp.as_file().sync_all()?;
-            tmp.persist(&fs_path)
-                .map_err(|err| FrError::Io(err.error))?;
-            Ok(())
-        })
-        .await
-        .map_err(|err| FrError::Other(format!("atomic write task failed: {err}")))?
-    }
 }
 
 #[async_trait]
 impl StorageBackend for LocalFsBackend {
     async fn list(&self, path: &CloudPath) -> Result<Vec<FileEntry>> {
-        let dir_path = self.resolve_contained(path).await?;
-        let mut read_dir = fs::read_dir(&dir_path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(path.to_string())
-            } else {
-                FrError::Io(err)
+        let guard = self.io_lock.clone().read_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let dir_path = Self::resolve_contained_sync(&root, &path, false)?;
+            let read_dir = std::fs::read_dir(&dir_path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    FrError::NotFound(path.to_string())
+                } else {
+                    FrError::Io(err)
+                }
+            })?;
+
+            let mut entries = Vec::new();
+            for entry_res in read_dir {
+                let entry = entry_res?;
+                let entry_path = entry.path();
+                let meta = std::fs::symlink_metadata(&entry_path)?;
+                if Self::is_symlink_or_reparse(&meta) {
+                    continue;
+                }
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                let Ok(child_cloud_path) = path.join(&file_name) else {
+                    continue;
+                };
+                entries.push(Self::build_entry_sync(child_cloud_path, &entry_path)?);
             }
-        })?;
 
-        let mut entries = Vec::new();
-        while let Some(entry) = read_dir.next_entry().await? {
-            let entry_path = entry.path();
-            let meta = fs::symlink_metadata(&entry_path).await?;
-            if Self::is_symlink_or_reparse(&meta) {
-                continue;
-            }
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(child_cloud_path) = path.join(&file_name) else {
-                continue;
-            };
-            let item = self.build_entry(child_cloud_path, &entry_path).await?;
-            entries.push(item);
-        }
+            entries.sort_by(|a, b| {
+                let rank = |k: FileKind| match k {
+                    FileKind::Directory => 0_u8,
+                    FileKind::File => 1_u8,
+                };
+                rank(a.kind)
+                    .cmp(&rank(b.kind))
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
 
-        // Folders first, then alphabetical by lowercase name.
-        entries.sort_by(|a, b| {
-            let rank = |k: FileKind| match k {
-                FileKind::Directory => 0_u8,
-                FileKind::File => 1_u8,
-            };
-            rank(a.kind)
-                .cmp(&rank(b.kind))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("list task failed: {err}")))?
     }
 
     async fn stat(&self, path: &CloudPath) -> Result<FileEntry> {
-        let fs_path = self.resolve_contained(path).await?;
-        self.build_entry(path.clone(), &fs_path).await
+        let guard = self.io_lock.clone().read_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, false)?;
+            Self::build_entry_sync(path, &fs_path)
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("stat task failed: {err}")))?
     }
 
     async fn read(&self, path: &CloudPath) -> Result<(Bytes, Etag)> {
-        let fs_path = self.resolve_contained(path).await?;
-        let data = fs::read(&fs_path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(path.to_string())
-            } else {
-                FrError::Io(err)
-            }
-        })?;
-        let etag = Self::compute_etag(&data);
-        Ok((Bytes::from(data), etag))
+        let guard = self.io_lock.clone().read_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, false)?;
+            let data = std::fs::read(&fs_path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    FrError::NotFound(path.to_string())
+                } else {
+                    FrError::Io(err)
+                }
+            })?;
+            let etag = Self::compute_etag(&data);
+            Ok((Bytes::from(data), etag))
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("read task failed: {err}")))?
     }
 
     async fn read_range(&self, path: &CloudPath, start: u64, end: Option<u64>) -> Result<Bytes> {
-        let fs_path = self.resolve_contained(path).await?;
-        let mut file = fs::File::open(&fs_path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(path.to_string())
-            } else {
-                FrError::Io(err)
+        let guard = self.io_lock.clone().read_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, false)?;
+            let mut file = std::fs::File::open(&fs_path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    FrError::NotFound(path.to_string())
+                } else {
+                    FrError::Io(err)
+                }
+            })?;
+
+            let len = file.metadata()?.len();
+            if start >= len {
+                return Ok(Bytes::new());
             }
-        })?;
 
-        let len = file.metadata().await?.len();
-        if start >= len {
-            return Ok(Bytes::new());
-        }
+            let inclusive_end = end.unwrap_or(len - 1).min(len - 1);
+            if inclusive_end < start {
+                return Ok(Bytes::new());
+            }
 
-        let inclusive_end = end.unwrap_or(len - 1).min(len - 1);
-        if inclusive_end < start {
-            return Ok(Bytes::new());
-        }
-
-        let to_read = (inclusive_end - start + 1) as usize;
-        file.seek(SeekFrom::Start(start)).await?;
-        let mut buf = vec![0_u8; to_read];
-        file.read_exact(&mut buf).await?;
-        Ok(Bytes::from(buf))
+            let to_read = (inclusive_end - start + 1) as usize;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0_u8; to_read];
+            file.read_exact(&mut buf)?;
+            Ok(Bytes::from(buf))
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("read_range task failed: {err}")))?
     }
 
     async fn write(
@@ -312,41 +334,66 @@ impl StorageBackend for LocalFsBackend {
             return Err(FrError::InvalidPath("cannot write directly to root".into()));
         }
 
-        // Serialize ETag check + atomic replacement per file path.
-        let lock = self.path_lock(path);
-        let _guard = lock.lock().await;
+        // Hold an owned write guard for the entire blocking check + atomic persist so:
+        // - Case-insensitive filename aliases serialize cleanly on Windows/macOS.
+        // - Cancelling the future cannot release the lock mid-replacement.
+        let guard = self.io_lock.clone().write_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+        let expected_etag = expected_etag.cloned();
 
-        let fs_path = self.resolve_contained(path).await?;
-        if let Some(expected) = expected_etag {
-            let current = fs::read(&fs_path).await.map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    FrError::NotFound(path.to_string())
-                } else {
-                    FrError::Io(err)
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, true)?;
+
+            if let Some(expected) = expected_etag {
+                let current = std::fs::read(&fs_path).map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        FrError::NotFound(path.to_string())
+                    } else {
+                        FrError::Io(err)
+                    }
+                })?;
+                let actual = Self::compute_etag(&current);
+                if actual != expected {
+                    return Err(FrError::Conflict {
+                        path: path.to_string(),
+                        expected: expected.0,
+                        actual: actual.0,
+                    });
                 }
-            })?;
-            let actual = Self::compute_etag(&current);
-            if actual != *expected {
-                return Err(FrError::Conflict {
-                    path: path.to_string(),
-                    expected: expected.0.clone(),
-                    actual: actual.0,
-                });
             }
-        }
 
-        let new_etag = Self::compute_etag(&data);
-        Self::atomic_write_file(fs_path, data).await?;
-        Ok(new_etag)
+            let parent = fs_path.parent().ok_or_else(|| {
+                FrError::InvalidPath("target path has no parent directory".into())
+            })?;
+            std::fs::create_dir_all(parent)?;
+
+            let new_etag = Self::compute_etag(&data);
+            let mut tmp = NamedTempFile::new_in(parent)?;
+            tmp.write_all(&data)?;
+            tmp.as_file().sync_all()?;
+            tmp.persist(&fs_path)
+                .map_err(|err| FrError::Io(err.error))?;
+            Ok(new_etag)
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("write task failed: {err}")))?
     }
 
     async fn mkdir(&self, path: &CloudPath) -> Result<()> {
-        if path.is_root() {
-            return Ok(());
-        }
-        let fs_path = self.resolve_contained(path).await?;
-        fs::create_dir_all(&fs_path).await?;
-        Ok(())
+        let guard = self.io_lock.clone().write_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, true)?;
+            std::fs::create_dir_all(&fs_path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("mkdir task failed: {err}")))?
     }
 
     async fn rename(&self, from: &CloudPath, to: &CloudPath) -> Result<()> {
@@ -357,56 +404,66 @@ impl StorageBackend for LocalFsBackend {
             return Ok(());
         }
 
-        // Acquire locks in canonical order to prevent deadlocks on concurrent swaps.
-        let (first_path, second_path) = if from < to { (from, to) } else { (to, from) };
-        let first_lock = self.path_lock(first_path);
-        let second_lock = self.path_lock(second_path);
-        let _g1 = first_lock.lock().await;
-        let _g2 = second_lock.lock().await;
+        let guard = self.io_lock.clone().write_owned().await;
+        let root = self.root.clone();
+        let from = from.clone();
+        let to = to.clone();
 
-        let from_fs = self.resolve_contained(from).await?;
-        let to_fs = self.resolve_contained(to).await?;
-        if let Some(parent) = to_fs.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::rename(&from_fs, &to_fs).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(from.to_string())
-            } else {
-                FrError::Io(err)
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let from_fs = Self::resolve_contained_sync(&root, &from, false)?;
+            let to_fs = Self::resolve_contained_sync(&root, &to, false)?;
+            if let Some(parent) = to_fs.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-        })?;
-        Ok(())
+            std::fs::rename(&from_fs, &to_fs).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    FrError::NotFound(from.to_string())
+                } else {
+                    FrError::Io(err)
+                }
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("rename task failed: {err}")))?
     }
 
     async fn delete(&self, path: &CloudPath) -> Result<()> {
         if path.is_root() {
             return Err(FrError::InvalidPath("cannot delete root directory".into()));
         }
-        let lock = self.path_lock(path);
-        let _guard = lock.lock().await;
 
-        let fs_path = self.resolve_contained(path).await?;
-        let meta = fs::symlink_metadata(&fs_path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                FrError::NotFound(path.to_string())
-            } else {
-                FrError::Io(err)
+        let guard = self.io_lock.clone().write_owned().await;
+        let root = self.root.clone();
+        let path = path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let fs_path = Self::resolve_contained_sync(&root, &path, false)?;
+            let meta = std::fs::symlink_metadata(&fs_path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    FrError::NotFound(path.to_string())
+                } else {
+                    FrError::Io(err)
+                }
+            })?;
+
+            if Self::is_symlink_or_reparse(&meta) {
+                return Err(FrError::InvalidPath(format!(
+                    "refusing to follow symlink during delete: {path}"
+                )));
             }
-        })?;
 
-        if Self::is_symlink_or_reparse(&meta) {
-            return Err(FrError::InvalidPath(format!(
-                "refusing to follow symlink during delete: {path}"
-            )));
-        }
-
-        if meta.is_dir() {
-            fs::remove_dir_all(&fs_path).await?;
-        } else {
-            fs::remove_file(&fs_path).await?;
-        }
-        Ok(())
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&fs_path)?;
+            } else {
+                std::fs::remove_file(&fs_path)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| FrError::Other(format!("delete task failed: {err}")))?
     }
 
     async fn thumbnail(&self, _file_id: &str, _width: u32, _height: u32) -> Result<Option<Bytes>> {
@@ -472,6 +529,28 @@ mod tests {
             Err(FrError::NotFound(_))
         ));
         backend.delete(&moved).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_and_mkdir_initialize_missing_root_directory() {
+        let parent = tempdir().expect("tempdir");
+        let new_root = parent.path().join("fresh-workspace");
+        let backend = LocalFsBackend::new(&new_root);
+
+        backend
+            .write(
+                &CloudPath::parse("/welcome.md").unwrap(),
+                Bytes::from_static(b"hi"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (bytes, _) = backend
+            .read(&CloudPath::parse("/welcome.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hi"));
     }
 
     #[tokio::test]

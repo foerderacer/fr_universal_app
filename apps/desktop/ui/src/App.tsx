@@ -73,13 +73,15 @@ export function App() {
     }
   }
 
-  async function handleResetUrl() {
+  async function handleResetUrl(): Promise<string> {
     setError(null);
     try {
       const updated = await resetWorkspaceNextcloudUrl();
       setOverview(updated);
+      return updated.config.nextcloudUrl;
     } catch (err) {
       setError(toUserFacingError(err));
+      throw err;
     }
   }
 

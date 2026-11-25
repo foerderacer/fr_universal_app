@@ -105,7 +105,8 @@ pub fn update_settings(
 pub fn reset_nextcloud_url(
     state: State<'_, AppState>,
 ) -> Result<WorkspaceOverview, UserFacingError> {
-    let default_url = default_nextcloud_url();
+    let default_url =
+        normalize_server_url(&default_nextcloud_url()).map_err(UserFacingError::from)?;
 
     {
         let mut guard = state

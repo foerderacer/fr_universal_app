@@ -86,12 +86,15 @@ impl ConfigStore {
         &self.path
     }
 
-    /// Loads config from disk, returning [`AppConfig::default()`] if no file exists yet.
+    /// Loads config from disk, returning [`AppConfig::default()`] only when the file does not exist.
     pub fn load(&self) -> Result<AppConfig> {
-        if !self.path.exists() {
-            return Ok(AppConfig::default());
-        }
-        let raw = fs::read_to_string(&self.path)?;
+        let raw = match fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AppConfig::default());
+            }
+            Err(err) => return Err(FrError::Io(err)),
+        };
         let config: AppConfig = serde_json::from_str(&raw)?;
         Ok(config)
     }

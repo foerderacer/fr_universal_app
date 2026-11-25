@@ -10,7 +10,7 @@ import { ErrorBanner } from "../components/ErrorBanner";
 interface SettingsViewProps {
   overview: WorkspaceOverview_Serialize;
   onSave: (input: UpdateSettingsRequest) => Promise<void>;
-  onResetUrl: () => Promise<void>;
+  onResetUrl: () => Promise<string>;
   error: UserFacingError | null;
   onClearError: () => void;
 }
@@ -60,6 +60,8 @@ export function SettingsView({
       });
       setSavedNotice(true);
       setTimeout(() => setSavedNotice(false), 2500);
+    } catch {
+      // Error banner is displayed by parent.
     } finally {
       setSaving(false);
     }
@@ -69,8 +71,10 @@ export function SettingsView({
     setSaving(true);
     setSavedNotice(false);
     try {
-      await onResetUrl();
-      setNextcloudUrl(overview.defaultNextcloudUrl);
+      const updatedUrl = await onResetUrl();
+      setNextcloudUrl(updatedUrl);
+    } catch {
+      // Error banner is displayed by parent; keep the user's current draft intact.
     } finally {
       setSaving(false);
     }
