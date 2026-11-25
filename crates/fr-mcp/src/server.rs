@@ -113,8 +113,11 @@ impl LocalMcpServer {
             .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
             .with_state(state);
 
-        let bind_addr = format!("{}:{}", config.bind_host, config.port);
-        let listener = TcpListener::bind(&bind_addr).await.map_err(|err| {
+        let ip: std::net::IpAddr = config.bind_host.parse().map_err(|_| {
+            FrError::InvalidConfig(format!("invalid MCP bind host '{}'", config.bind_host))
+        })?;
+        let bind_addr = SocketAddr::new(ip, config.port);
+        let listener = TcpListener::bind(bind_addr).await.map_err(|err| {
             FrError::Other(format!(
                 "failed to bind local MCP Server on {bind_addr}: {err}"
             ))
@@ -144,7 +147,7 @@ impl LocalMcpServer {
     }
 
     pub fn endpoint_url(&self) -> String {
-        format!("http://{}:{}/mcp", self.addr.ip(), self.addr.port())
+        format!("http://{}/mcp", self.addr)
     }
 
     pub fn set_require_write_approval(&self, require: bool) {
@@ -170,16 +173,20 @@ fn verify_bearer(headers: &HeaderMap, expected_token: &str) -> bool {
     else {
         return false;
     };
-    let Some(supplied) = raw.strip_prefix("Bearer ").map(str::trim) else {
+    let Some((scheme, rest)) = raw.split_once(' ') else {
         return false;
     };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let supplied = rest.trim();
     supplied.len() == expected_token.len()
         && bool::from(supplied.as_bytes().ct_eq(expected_token.as_bytes()))
 }
 
 fn is_valid_loopback_host(headers: &HeaderMap) -> bool {
     let Some(raw) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return true;
+        return false;
     };
     let host = if let Some(rest) = raw.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
@@ -201,7 +208,7 @@ fn is_allowed_origin(headers: &HeaderMap) -> bool {
         return false;
     };
     match parsed.scheme() {
-        "tauri" => true,
+        "tauri" => parsed.host_str() == Some("localhost"),
         "http" | "https" => matches!(
             parsed.host_str(),
             Some("127.0.0.1" | "localhost" | "::1" | "tauri.localhost")
@@ -376,6 +383,25 @@ async fn handle_tool_call(state: &ServerState, id: Value, params: Value) -> Resp
                     id,
                     json!({
                         "content": [{ "type": "text", "text": "Write operation denied by the desktop user." }],
+                        "isError": true
+                    }),
+                );
+            }
+            ApprovalOutcome::QueueFull => {
+                state.audit.record(McpAuditEntry {
+                    id: Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    tool_name: tool_name.to_owned(),
+                    summary,
+                    is_write,
+                    status: McpAuditStatus::Denied,
+                    duration_ms: started.elapsed().as_millis() as u32,
+                    error: Some("Too many pending write approvals".into()),
+                });
+                return json_rpc_ok(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": "Too many pending write approvals — resolve existing prompts first." }],
                         "isError": true
                     }),
                 );
@@ -571,6 +597,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_origin.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // 2b. DNS rebinding Host header -> 403
+        let bad_host = client
+            .post(&url)
+            .header("Host", "rebind.evil.example")
+            .bearer_auth(&token)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // 2c. Non-loopback start() must fail before binding
+        let non_loopback = LocalMcpServer::start(
+            &McpServerConfig {
+                enabled: true,
+                bind_host: "0.0.0.0".into(),
+                port: 0,
+                require_write_approval: true,
+            },
+            token.clone(),
+            Arc::new(McpToolRegistry::new()),
+            Arc::new(RwLock::new(None)),
+            Arc::new(McpAuditLog::new()),
+            Arc::new(WriteApprovalGate::new()),
+        )
+        .await;
+        assert!(non_loopback.is_err());
 
         // 3. Valid initialize + tools/list
         let list_resp: Value = client

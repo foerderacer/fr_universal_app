@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const MAX_AUDIT_ENTRIES: usize = 200;
+const MAX_PENDING_APPROVALS: usize = 5;
 
 /// Outcome of a single MCP Server tool invocation recorded in the local audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -88,11 +89,32 @@ pub enum ApprovalOutcome {
     Approved,
     Denied,
     TimedOut,
+    QueueFull,
 }
 
 struct PendingEntry {
     info: PendingWriteApproval,
     responder: oneshot::Sender<bool>,
+}
+
+/// RAII cleanup guard ensuring cancelled/dropped HTTP futures never leave ghost prompts behind.
+struct PendingDropGuard<'a> {
+    gate: &'a WriteApprovalGate,
+    id: String,
+    active: bool,
+}
+
+impl Drop for PendingDropGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut guard = self
+                .gate
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.remove(&self.id);
+        }
+    }
 }
 
 /// Interactive write-approval gate bridging incoming MCP Server HTTP calls to the desktop UI.
@@ -153,6 +175,9 @@ impl WriteApprovalGate {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.len() >= MAX_PENDING_APPROVALS {
+                return ApprovalOutcome::QueueFull;
+            }
             guard.insert(
                 id.clone(),
                 PendingEntry {
@@ -162,17 +187,22 @@ impl WriteApprovalGate {
             );
         }
 
+        let mut drop_guard = PendingDropGuard {
+            gate: self,
+            id,
+            active: true,
+        };
+
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(true)) => ApprovalOutcome::Approved,
-            Ok(Ok(false)) | Ok(Err(_)) => ApprovalOutcome::Denied,
-            Err(_) => {
-                let mut guard = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.remove(&id);
-                ApprovalOutcome::TimedOut
+            Ok(Ok(true)) => {
+                drop_guard.active = false;
+                ApprovalOutcome::Approved
             }
+            Ok(Ok(false)) | Ok(Err(_)) => {
+                drop_guard.active = false;
+                ApprovalOutcome::Denied
+            }
+            Err(_) => ApprovalOutcome::TimedOut,
         }
     }
 
@@ -258,6 +288,23 @@ mod tests {
             )
             .await;
         assert_eq!(outcome, ApprovalOutcome::TimedOut);
+        assert_eq!(gate.pending_count(), 0);
+
+        // Cancelled future (dropped HTTP connection) cleans up via RAII guard
+        let g3 = gate.clone();
+        let aborted = tokio::spawn(async move {
+            g3.request_approval(
+                "files_mkdir",
+                "Create /Cancelled".into(),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(gate.pending_count(), 1);
+        aborted.abort();
+        let _ = aborted.await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(gate.pending_count(), 0);
     }
 }

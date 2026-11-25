@@ -135,22 +135,32 @@ impl AppState {
 
         let mcp_store_path = McpClientManager::default_store_path()
             .unwrap_or_else(|_| std::path::PathBuf::from("mcp-servers.json"));
-        let mcp_client = Arc::new(
-            McpClientManager::open(
-                &mcp_store_path,
-                mcp_token_store.clone(),
-                http_client.clone(),
-            )
-            .unwrap_or_else(|err| {
-                tracing::warn!("Falling back to temp MCP server registry: {err}");
-                McpClientManager::open(
-                    std::env::temp_dir().join("fr-universal-app-mcp-servers.json"),
-                    mcp_token_store.clone(),
-                    http_client.clone(),
+        let mcp_client = match McpClientManager::open(
+            &mcp_store_path,
+            mcp_token_store.clone(),
+            http_client.clone(),
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(err) => {
+                if startup_error.is_none() {
+                    startup_error = Some(UserFacingError {
+                        code: "mcp_registry_load_error".into(),
+                        title: "External MCP server list couldn't be read".into(),
+                        message: "We started with a temporary empty MCP server list without overwriting your existing file.".into(),
+                        recovery_hint: Some("Check or repair mcp-servers.json, or re-add servers in MCP / AI.".into()),
+                        technical_details: Some(format!("{err} (path: {})", mcp_store_path.display())),
+                    });
+                }
+                Arc::new(
+                    McpClientManager::open(
+                        std::env::temp_dir().join("fr-universal-app-mcp-servers-fallback.json"),
+                        mcp_token_store.clone(),
+                        http_client.clone(),
+                    )
+                    .expect("fallback MCP registry"),
                 )
-                .expect("temp MCP registry")
-            }),
-        );
+            }
+        };
 
         let state = Self {
             config_store,

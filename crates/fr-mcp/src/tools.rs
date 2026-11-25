@@ -33,8 +33,8 @@ pub trait McpToolHandler: Send + Sync {
     fn input_schema(&self) -> Value;
 
     /// Returns a concise, secret-free human summary for the audit log & write-approval prompt.
-    fn summarize_call(&self, args: &Value) -> String {
-        format!("Call {}({})", self.name(), args)
+    fn summarize_call(&self, _args: &Value) -> String {
+        format!("Call {}", self.name())
     }
 
     async fn call(&self, args: Value) -> Result<Value>;
@@ -297,18 +297,26 @@ impl McpToolHandler for FilesWriteMarkdownTool {
             "properties": {
                 "path": { "type": "string", "description": "Destination cloud path." },
                 "content": { "type": "string", "description": "UTF-8 Markdown content." },
-                "expected_etag": { "type": "string", "description": "Optional ETag for optimistic locking (HTTP 412 on conflict)." },
-                "create_only": { "type": "boolean", "description": "When true, fails if the file already exists." }
+                "expected_etag": { "type": "string", "description": "Current file ETag required when updating an existing file (HTTP 412 on conflict)." },
+                "create_only": { "type": "boolean", "description": "When true, fails if the file already exists." },
+                "force_overwrite": { "type": "boolean", "description": "Explicitly overwrite an existing file without ETag check (defaults to false)." }
             }
         })
     }
     fn summarize_call(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
-        let len = args
-            .get("content")
-            .and_then(Value::as_str)
-            .map_or(0, str::len);
-        format!("Write {path} ({len} bytes)")
+        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+        let preview: String = content
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(100)
+            .collect();
+        let trimmed = preview.trim();
+        if trimmed.is_empty() {
+            format!("Write {path} ({} bytes)", content.len())
+        } else {
+            format!("Write {path} ({} bytes): \"{trimmed}\"", content.len())
+        }
     }
     async fn call(&self, args: Value) -> Result<Value> {
         let raw_path = required_string(&args, "path")?;
@@ -319,6 +327,10 @@ impl McpToolHandler for FilesWriteMarkdownTool {
             .get("create_only")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let force_overwrite = args
+            .get("force_overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let expected_etag = args
             .get("expected_etag")
             .and_then(Value::as_str)
@@ -326,15 +338,31 @@ impl McpToolHandler for FilesWriteMarkdownTool {
             .map(Etag::new);
 
         let service = require_files_service(&self.0)?;
+        let parsed = CloudPath::parse(raw_path)?;
         let etag = if create_only {
-            service.create_markdown(raw_path, content).await?
-        } else {
+            service.create_markdown(parsed.as_str(), content).await?
+        } else if expected_etag.is_some() || force_overwrite {
             service
-                .write_markdown(raw_path, content, expected_etag.as_ref())
+                .write_markdown(parsed.as_str(), content, expected_etag.as_ref())
+                .await?
+        } else {
+            // Never silently overwrite an existing file without an expected_etag or explicit force_overwrite.
+            if let Ok(existing) = service.storage().stat(&parsed).await {
+                return Err(FrError::Conflict {
+                    path: parsed.as_str().to_owned(),
+                    expected: "<none — pass expected_etag or force_overwrite: true>".into(),
+                    actual: existing
+                        .etag
+                        .map(|e| e.as_str().to_owned())
+                        .unwrap_or_else(|| "<exists>".into()),
+                });
+            }
+            service
+                .write_markdown(parsed.as_str(), content, None)
                 .await?
         };
         Ok(json!({
-            "path": CloudPath::parse(raw_path)?.as_str(),
+            "path": parsed.as_str(),
             "etag": etag.as_str()
         }))
     }

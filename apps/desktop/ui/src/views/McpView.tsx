@@ -54,6 +54,48 @@ interface McpViewProps {
   onOverviewUpdated: (overview: WorkspaceOverview_Serialize) => void;
 }
 
+function tokenizeCommandArgs(raw: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        args.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) {
+    args.push(current);
+  }
+  return args;
+}
+
+function formatAuditStatus(status: McpAuditEntry_Serialize["status"]): string {
+  switch (status) {
+    case "allowed":
+      return "Allowed";
+    case "denied":
+      return "Denied";
+    case "timedOut":
+      return "Timed out";
+    case "failed":
+      return "Failed";
+  }
+}
+
 export function McpView({
   isNextcloudConnected,
   pendingApprovals,
@@ -65,6 +107,9 @@ export function McpView({
   const [auditLog, setAuditLog] = useState<McpAuditEntry_Serialize[]>([]);
   const [portInput, setPortInput] = useState(38420);
   const [requireApproval, setRequireApproval] = useState(true);
+  const [confirmDisableApproval, setConfirmDisableApproval] = useState(false);
+  const [confirmEnableStdio, setConfirmEnableStdio] =
+    useState<ExternalMcpServerView | null>(null);
   const [savingServer, setSavingServer] = useState(false);
   const [snippet, setSnippet] = useState<McpClientConfigSnippetResponse | null>(
     null,
@@ -78,7 +123,6 @@ export function McpView({
   >([]);
   const [syncingTeam, setSyncingTeam] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [newId, setNewId] = useState("");
   const [newName, setNewName] = useState("");
   const [newTransport, setNewTransport] = useState<"streamableHttp" | "stdio">(
     "streamableHttp",
@@ -187,27 +231,23 @@ export function McpView({
   async function handleAddExternalServer(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    const id =
-      newId.trim() ||
-      newName
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
+    const id = newName
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
     const server: ExternalMcpServer = {
       id,
       name: newName.trim(),
-      enabled: true,
+      // Local command (stdio) servers default to disabled until explicitly confirmed.
+      enabled: newTransport === "streamableHttp",
       transport:
         newTransport === "streamableHttp"
           ? { transport: "streamableHttp", url: newUrl.trim() }
           : {
               transport: "stdio",
               command: newCommand.trim(),
-              args: newArgs
-                .split(/\s+/)
-                .map((s) => s.trim())
-                .filter(Boolean),
+              args: tokenizeCommandArgs(newArgs),
             },
     };
     try {
@@ -217,7 +257,6 @@ export function McpView({
       );
       setExternalServers(updated);
       setShowAddForm(false);
-      setNewId("");
       setNewName("");
       setNewUrl("https://");
       setNewCommand("");
@@ -228,8 +267,9 @@ export function McpView({
     }
   }
 
-  async function handleToggleExternalEnabled(srv: ExternalMcpServerView) {
+  async function applyToggleExternalEnabled(srv: ExternalMcpServerView) {
     setError(null);
+    setConfirmEnableStdio(null);
     try {
       const updated = await upsertExternalMcpServer(
         {
@@ -244,6 +284,14 @@ export function McpView({
     } catch (err) {
       setError(toUserFacingError(err));
     }
+  }
+
+  function handleToggleExternalEnabled(srv: ExternalMcpServerView) {
+    if (!srv.enabled && srv.transport.transport === "stdio") {
+      setConfirmEnableStdio(srv);
+      return;
+    }
+    void applyToggleExternalEnabled(srv);
   }
 
   async function handleDeleteExternal(id: string) {
@@ -489,11 +537,16 @@ export function McpView({
                   checked={requireApproval}
                   onChange={(e) => {
                     const next = e.target.checked;
-                    setRequireApproval(next);
+                    if (!next) {
+                      setConfirmDisableApproval(true);
+                      return;
+                    }
+                    setConfirmDisableApproval(false);
+                    setRequireApproval(true);
                     void configureMcpServer({
                       enabled: Boolean(status?.running),
                       port: portInput,
-                      requireWriteApproval: next,
+                      requireWriteApproval: true,
                     })
                       .then((res) => {
                         setStatus(res.status);
@@ -513,6 +566,46 @@ export function McpView({
                 </span>
               </label>
             </div>
+
+            {confirmDisableApproval && (
+              <div
+                role="alertdialog"
+                className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+              >
+                <span>
+                  Turn off write approval prompts? Connected local AI tools will be able to edit or move files without asking first.
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmDisableApproval(false);
+                      setRequireApproval(false);
+                      void configureMcpServer({
+                        enabled: Boolean(status?.running),
+                        port: portInput,
+                        requireWriteApproval: false,
+                      })
+                        .then((res) => {
+                          setStatus(res.status);
+                          onOverviewUpdated(res.overview);
+                        })
+                        .catch((err) => setError(toUserFacingError(err)));
+                    }}
+                    className="rounded-lg bg-amber-600 px-3 py-1 font-semibold text-white hover:bg-amber-700"
+                  >
+                    Turn off prompts
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDisableApproval(false)}
+                    className="rounded-lg border border-amber-300 bg-white px-3 py-1 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+                  >
+                    Keep enabled
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="mt-4 flex flex-wrap items-center gap-2">
               <button
@@ -627,16 +720,21 @@ export function McpView({
                       <span className="ml-2 text-slate-600 dark:text-slate-400">
                         {entry.summary}
                       </span>
+                      {entry.error && (
+                        <p className="mt-0.5 text-[11px] text-rose-600 dark:text-rose-400">
+                          {entry.error}
+                        </p>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 text-[11px]">
                       <span
-                        className={`rounded-full px-2 py-0.5 font-semibold capitalize ${
+                        className={`rounded-full px-2 py-0.5 font-semibold ${
                           entry.status === "allowed"
                             ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"
                             : "bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300"
                         }`}
                       >
-                        {entry.status}
+                        {formatAuditStatus(entry.status)}
                       </span>
                       <span className="text-slate-400">
                         {entry.durationMs} ms ·{" "}
@@ -775,6 +873,37 @@ export function McpView({
                 </div>
               </form>
             )}
+
+            {confirmEnableStdio &&
+              confirmEnableStdio.transport.transport === "stdio" && (
+                <div
+                  role="alertdialog"
+                  className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+                >
+                  <span>
+                    Enable local command server &ldquo;{confirmEnableStdio.name}&rdquo;? This allows the app to execute{" "}
+                    <code>{confirmEnableStdio.transport.command}</code> on your computer.
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void applyToggleExternalEnabled(confirmEnableStdio)
+                      }
+                      className="rounded-lg bg-amber-600 px-3 py-1 font-semibold text-white hover:bg-amber-700"
+                    >
+                      Enable command
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmEnableStdio(null)}
+                      className="rounded-lg border border-amber-300 bg-white px-3 py-1 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
 
             {externalServers.length === 0 ? (
               <p className="mt-5 text-xs text-slate-500 dark:text-slate-400">

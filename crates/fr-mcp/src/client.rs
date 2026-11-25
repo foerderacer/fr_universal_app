@@ -20,6 +20,8 @@ use crate::{ExternalMcpServer, ExternalMcpTransport};
 
 const MCP_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STDIO_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TEAM_SYNC_BYTES: u64 = 1024 * 1024;
 pub const TEAM_MCP_SERVERS_CLOUD_PATH: &str = "/_FR_App/mcp-servers.json";
 
 /// UI-safe projection of an [`ExternalMcpServer`] (never includes raw secrets; only `has_token`).
@@ -85,6 +87,27 @@ pub fn build_client_config_snippet(endpoint_url: &str, bearer_token: &str) -> St
     serde_json::to_string_pretty(&snippet).unwrap_or_else(|_| "{}".into())
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim_matches(|c| c == '[' || c == ']');
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    trimmed
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_forbidden_ssrf_host(host: &str) -> bool {
+    let trimmed = host.trim_matches(|c| c == '[' || c == ']');
+    let Ok(ip) = trimmed.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_unspecified() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_unspecified() || ((v6.segments()[0] & 0xffc0) == 0xfe80),
+    }
+}
+
 fn validate_server(server: &ExternalMcpServer) -> Result<()> {
     if server.id.trim().is_empty()
         || !server
@@ -111,10 +134,27 @@ fn validate_server(server: &ExternalMcpServer) -> Result<()> {
             let parsed = Url::parse(url.trim()).map_err(|err| {
                 FrError::InvalidConfig(format!("invalid MCP server URL '{url}': {err}"))
             })?;
-            if !matches!(parsed.scheme(), "http" | "https") {
+            let host = parsed.host_str().ok_or_else(|| {
+                FrError::InvalidConfig("MCP server URL must include a hostname".into())
+            })?;
+            if is_forbidden_ssrf_host(host) {
                 return Err(FrError::InvalidConfig(
-                    "MCP server URL must start with https:// or http://".into(),
+                    "MCP server URL cannot target link-local or unspecified IP addresses".into(),
                 ));
+            }
+            match parsed.scheme() {
+                "https" => {}
+                "http" if is_loopback_host(host) => {}
+                "http" => {
+                    return Err(FrError::InvalidConfig(
+                        "Remote MCP servers must use https:// so Bearer tokens are never sent in cleartext (http:// is allowed only for localhost/127.0.0.1)".into(),
+                    ));
+                }
+                _ => {
+                    return Err(FrError::InvalidConfig(
+                        "MCP server URL must start with https:// (or http:// for localhost)".into(),
+                    ));
+                }
             }
             if !parsed.username().is_empty() || parsed.password().is_some() {
                 return Err(FrError::InvalidConfig(
@@ -190,21 +230,27 @@ impl McpClientManager {
     }
 
     pub fn list_servers(&self) -> Vec<ExternalMcpServerView> {
-        let guard = self
-            .records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .iter()
-            .map(|r| ExternalMcpServerView {
-                id: r.id.clone(),
-                name: r.name.clone(),
-                enabled: r.enabled,
-                transport: r.transport.clone(),
-                has_token: self
+        let snapshot = {
+            let guard = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        snapshot
+            .into_iter()
+            .map(|r| {
+                let has_token = self
                     .token_store
-                    .has_token(&external_server_token_key(&r.id)),
-                from_team_sync: r.from_team_sync,
+                    .has_token(&external_server_token_key(&r.id));
+                ExternalMcpServerView {
+                    id: r.id,
+                    name: r.name,
+                    enabled: r.enabled,
+                    transport: r.transport,
+                    has_token,
+                    from_team_sync: r.from_team_sync,
+                }
             })
             .collect()
     }
@@ -215,16 +261,10 @@ impl McpClientManager {
         bearer_token: Option<String>,
     ) -> Result<Vec<ExternalMcpServerView>> {
         validate_server(&server)?;
+        let server_id = server.id.clone();
 
-        if let Some(tok) = bearer_token {
-            let key = external_server_token_key(&server.id);
-            if tok.trim().is_empty() {
-                self.token_store.delete_token(&key)?;
-            } else {
-                self.token_store.set_token(&key, tok.trim())?;
-            }
-        }
-
+        // Persist non-secret registry entry BEFORE writing to OS Keychain so persist failures
+        // never leave orphaned credentials behind.
         {
             let mut guard = self
                 .records
@@ -247,13 +287,21 @@ impl McpClientManager {
             *guard = candidate;
         }
 
+        if let Some(tok) = bearer_token {
+            let key = external_server_token_key(&server_id);
+            if tok.trim().is_empty() {
+                self.token_store.delete_token(&key)?;
+            } else {
+                self.token_store.set_token(&key, tok.trim())?;
+            }
+        }
+
         Ok(self.list_servers())
     }
 
     pub fn delete_server(&self, server_id: &str) -> Result<Vec<ExternalMcpServerView>> {
-        let _ = self
-            .token_store
-            .delete_token(&external_server_token_key(server_id));
+        self.token_store
+            .delete_token(&external_server_token_key(server_id))?;
         {
             let mut guard = self
                 .records
@@ -268,46 +316,52 @@ impl McpClientManager {
     }
 
     /// Imports shared team MCP server definitions from Nextcloud (`/_FR_App/mcp-servers.json`).
-    /// Security: newly imported `stdio` servers are ALWAYS forced `enabled: false` until the local
-    /// user explicitly reviews and enables them, preventing untrusted cloud JSON from running local binaries.
+    ///
+    /// Security invariants:
+    /// - Every newly imported server (both `Stdio` and `StreamableHttp`) defaults to `enabled: false`
+    ///   until explicitly reviewed and enabled by the local user.
+    /// - If team sync changes the `transport` (URL or command) of an existing server, it is forced
+    ///   `enabled: false` AND its stored OS Keychain Bearer token is cleared to prevent token
+    ///   exfiltration to a repointed URL.
     pub async fn sync_from_nextcloud(
         &self,
         storage: &dyn StorageBackend,
     ) -> Result<Vec<ExternalMcpServerView>> {
         let path = CloudPath::parse(TEAM_MCP_SERVERS_CLOUD_PATH)?;
+        let meta = storage.stat(&path).await?;
+        if meta.size > MAX_TEAM_SYNC_BYTES {
+            return Err(FrError::InvalidConfig(
+                "Team MCP server registry exceeds 1 MB safety limit".into(),
+            ));
+        }
         let (bytes, _) = storage.read(&path).await?;
         let imported: Vec<ExternalMcpServer> = serde_json::from_slice(&bytes)?;
 
+        let mut tokens_to_clear: Vec<String> = Vec::new();
         {
             let mut guard = self
                 .records
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut candidate = guard.clone();
-            for mut server in imported {
+            for server in imported {
                 if validate_server(&server).is_err() {
                     continue;
                 }
-                let is_stdio = matches!(server.transport, ExternalMcpTransport::Stdio { .. });
                 if let Some(existing) = candidate.iter_mut().find(|r| r.id == server.id) {
-                    // Never silently escalate a disabled stdio server to enabled on team sync.
-                    let keep_enabled = if is_stdio {
-                        existing.enabled && existing.transport == server.transport
-                    } else {
-                        server.enabled
-                    };
+                    let transport_changed = existing.transport != server.transport;
+                    if transport_changed {
+                        tokens_to_clear.push(server.id.clone());
+                        existing.enabled = false;
+                    }
                     existing.name = server.name.trim().to_owned();
                     existing.transport = server.transport;
-                    existing.enabled = keep_enabled;
                     existing.from_team_sync = true;
                 } else {
-                    if is_stdio {
-                        server.enabled = false;
-                    }
                     candidate.push(StoredServerRecord {
                         id: server.id,
                         name: server.name.trim().to_owned(),
-                        enabled: server.enabled,
+                        enabled: false,
                         transport: server.transport,
                         from_team_sync: true,
                     });
@@ -315,6 +369,12 @@ impl McpClientManager {
             }
             self.persist_locked(&candidate)?;
             *guard = candidate;
+        }
+
+        for id in tokens_to_clear {
+            let _ = self
+                .token_store
+                .delete_token(&external_server_token_key(&id));
         }
 
         Ok(self.list_servers())
@@ -525,12 +585,11 @@ impl McpClientManager {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let raw = resp
-            .text()
-            .await
-            .map_err(|err| FrError::Network(format!("failed reading MCP response: {err}")))?;
+        let raw_bytes = read_bounded_http_body(resp, MAX_HTTP_RESPONSE_BYTES).await?;
+        let raw = String::from_utf8_lossy(&raw_bytes);
 
-        let rpc_val = parse_http_or_sse_json_rpc(&raw, content_type.contains("text/event-stream"))?;
+        let rpc_val =
+            parse_http_or_sse_json_rpc(&raw, content_type.contains("text/event-stream"), 2)?;
         extract_json_rpc_result(rpc_val)
     }
 
@@ -541,7 +600,8 @@ impl McpClientManager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        let mut child = Command::new(command)
+        let resolved = resolve_stdio_command(command);
+        let mut child = Command::new(&resolved)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -564,103 +624,157 @@ impl McpClientManager {
             .ok_or_else(|| FrError::Other("failed to open stdio MCP stdout".into()))?;
         let mut reader = BufReader::new(stdout);
 
-        let init_line = serde_json::to_string(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": { "name": "fr-universal-app", "version": env!("CARGO_PKG_VERSION") }
-            }
-        }))?;
-        stdin.write_all(init_line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
+        let exchange = async {
+            let init_line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": { "name": "fr-universal-app", "version": env!("CARGO_PKG_VERSION") }
+                }
+            }))?;
+            stdin.write_all(init_line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
 
-        let _ = read_json_rpc_line(&mut reader, 1).await?;
+            let _ = read_json_rpc_line(&mut reader, 1).await?;
 
-        let notif_line = serde_json::to_string(
-            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-        )?;
-        stdin.write_all(notif_line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
+            let notif_line = serde_json::to_string(
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            )?;
+            stdin.write_all(notif_line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
 
-        let req_line = serde_json::to_string(&json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": method,
-            "params": params
-        }))?;
-        stdin.write_all(req_line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
+            let req_line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": method,
+                "params": params
+            }))?;
+            stdin.write_all(req_line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
 
-        let response = read_json_rpc_line(&mut reader, 2).await?;
+            read_json_rpc_line(&mut reader, 2).await
+        };
+
+        let result = tokio::time::timeout(MCP_CLIENT_TIMEOUT, exchange)
+            .await
+            .map_err(|_| FrError::Network("stdio MCP server timed out".into()))?;
         let _ = child.kill().await;
-        extract_json_rpc_result(response)
+        extract_json_rpc_result(result?)
     }
+}
+
+async fn read_bounded_http_body(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length()
+        && len as usize > max_bytes
+    {
+        return Err(FrError::Other(
+            "External MCP server response exceeded 8 MB safety limit".into(),
+        ));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|err| FrError::Network(format!("failed reading MCP response: {err}")))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(FrError::Other(
+                "External MCP server response exceeded 8 MB safety limit".into(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Resolves bare command names on Windows against `PATH` + `PATHEXT` so launchers such as `npx`
+/// (`npx.cmd`) work identically to macOS without requiring a shell wrapper.
+fn resolve_stdio_command(command: &str) -> String {
+    #[cfg(windows)]
+    {
+        let p = Path::new(command);
+        if p.extension().is_none() && !p.is_absolute() && !command.contains(['\\', '/']) {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+            let exts: Vec<&str> = pathext.split(';').filter(|e| !e.is_empty()).collect();
+            if let Some(path_env) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path_env) {
+                    for ext in &exts {
+                        let candidate = dir.join(format!("{command}{ext}"));
+                        if candidate.is_file() {
+                            return candidate.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    command.to_owned()
 }
 
 async fn read_json_rpc_line(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     expected_id: i64,
 ) -> Result<Value> {
-    tokio::time::timeout(MCP_CLIENT_TIMEOUT, async {
+    loop {
+        let mut buf = Vec::new();
+        let mut total = 0usize;
         loop {
-            let mut buf = Vec::new();
-            let mut total = 0usize;
-            loop {
-                let n = reader.read_until(b'\n', &mut buf).await?;
-                if n == 0 {
-                    return Err(FrError::Other(
-                        "stdio MCP server closed stdout before replying".into(),
-                    ));
-                }
-                total += n;
-                if total > MAX_STDIO_LINE_BYTES {
-                    return Err(FrError::Other(
-                        "stdio MCP server response exceeded 2 MB limit".into(),
-                    ));
-                }
-                if buf.ends_with(b"\n") {
-                    break;
-                }
+            let n = reader.read_until(b'\n', &mut buf).await?;
+            if n == 0 {
+                return Err(FrError::Other(
+                    "stdio MCP server closed stdout before replying".into(),
+                ));
             }
-            let line = String::from_utf8_lossy(&buf);
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            total += n;
+            if total > MAX_STDIO_LINE_BYTES {
+                return Err(FrError::Other(
+                    "stdio MCP server response exceeded 2 MB limit".into(),
+                ));
             }
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed)
-                && val.get("id").and_then(Value::as_i64) == Some(expected_id)
-            {
-                return Ok(val);
+            if buf.ends_with(b"\n") {
+                break;
             }
         }
-    })
-    .await
-    .map_err(|_| FrError::Network("stdio MCP server timed out".into()))?
+        let line = String::from_utf8_lossy(&buf);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed)
+            && val.get("id").and_then(Value::as_i64) == Some(expected_id)
+        {
+            return Ok(val);
+        }
+    }
 }
 
-fn parse_http_or_sse_json_rpc(raw: &str, is_sse: bool) -> Result<Value> {
+fn parse_http_or_sse_json_rpc(raw: &str, is_sse: bool, expected_id: i64) -> Result<Value> {
     if !is_sse {
         return serde_json::from_str(raw)
             .map_err(|err| FrError::Other(format!("invalid JSON-RPC response: {err}")));
     }
-    let mut last_data = None;
+    let mut fallback: Option<Value> = None;
     for line in raw.lines() {
         if let Some(payload) = line.strip_prefix("data:") {
             let trimmed = payload.trim();
-            if !trimmed.is_empty() && trimmed != "[DONE]" {
-                last_data = Some(trimmed);
+            if trimmed.is_empty() || trimmed == "[DONE]" {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                if val.get("id").and_then(Value::as_i64) == Some(expected_id) {
+                    return Ok(val);
+                }
+                fallback = Some(val);
             }
         }
     }
-    let payload = last_data
-        .ok_or_else(|| FrError::Other("SSE response contained no JSON-RPC data event".into()))?;
-    serde_json::from_str(payload)
-        .map_err(|err| FrError::Other(format!("invalid SSE JSON-RPC payload: {err}")))
+    fallback.ok_or_else(|| FrError::Other("SSE response contained no JSON-RPC data event".into()))
 }
 
 fn extract_json_rpc_result(rpc: Value) -> Result<Value> {
@@ -799,9 +913,10 @@ mod tests {
             .await
             .unwrap();
 
+        let token_store = Arc::new(MemoryMcpTokenStore::new());
         let mgr = McpClientManager::open(
             cfg_dir.path().join("mcp-servers.json"),
-            Arc::new(MemoryMcpTokenStore::new()),
+            token_store.clone(),
             reqwest::Client::new(),
         )
         .unwrap();
@@ -809,10 +924,94 @@ mod tests {
         let synced = mgr.sync_from_nextcloud(&local).await.unwrap();
         let http = synced.iter().find(|s| s.id == "team-http").unwrap();
         let stdio = synced.iter().find(|s| s.id == "team-stdio").unwrap();
-        assert!(http.enabled);
+        assert!(
+            !http.enabled,
+            "newly synced HTTP servers must default to disabled"
+        );
         assert!(
             !stdio.enabled,
             "synced stdio servers MUST default to disabled"
+        );
+
+        // Enable team-http with a Bearer token, then simulate a malicious URL repoint in Nextcloud.
+        mgr.upsert_server(
+            ExternalMcpServer {
+                id: "team-http".into(),
+                name: "Team ERP".into(),
+                enabled: true,
+                transport: ExternalMcpTransport::StreamableHttp {
+                    url: "https://mcp.example.com/mcp".into(),
+                },
+            },
+            Some("secret-erp-token".into()),
+        )
+        .unwrap();
+        assert!(token_store.has_token(&external_server_token_key("team-http")));
+
+        let repointed_json = serde_json::to_vec(&vec![ExternalMcpServer {
+            id: "team-http".into(),
+            name: "Team ERP".into(),
+            enabled: true,
+            transport: ExternalMcpTransport::StreamableHttp {
+                url: "https://attacker.example/mcp".into(),
+            },
+        }])
+        .unwrap();
+        local
+            .write(
+                &CloudPath::parse(TEAM_MCP_SERVERS_CLOUD_PATH).unwrap(),
+                Bytes::from(repointed_json),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let after_repoint = mgr.sync_from_nextcloud(&local).await.unwrap();
+        let repointed = after_repoint.iter().find(|s| s.id == "team-http").unwrap();
+        assert!(
+            !repointed.enabled,
+            "URL change on team sync must disable server"
+        );
+        assert!(
+            !repointed.has_token,
+            "URL change on team sync must clear stored token"
+        );
+    }
+
+    #[test]
+    fn rejects_remote_cleartext_http_and_link_local_ssrf() {
+        assert!(
+            validate_server(&ExternalMcpServer {
+                id: "remote-http".into(),
+                name: "Cleartext".into(),
+                enabled: true,
+                transport: ExternalMcpTransport::StreamableHttp {
+                    url: "http://mcp.company.example/mcp".into(),
+                },
+            })
+            .is_err()
+        );
+        assert!(
+            validate_server(&ExternalMcpServer {
+                id: "metadata".into(),
+                name: "Cloud Meta".into(),
+                enabled: true,
+                transport: ExternalMcpTransport::StreamableHttp {
+                    url: "https://169.254.169.254/latest".into(),
+                },
+            })
+            .is_err()
+        );
+        assert!(
+            validate_server(&ExternalMcpServer {
+                id: "local-dev".into(),
+                name: "Localhost".into(),
+                enabled: true,
+                transport: ExternalMcpTransport::StreamableHttp {
+                    url: "http://127.0.0.1:38420/mcp".into(),
+                },
+            })
+            .is_ok()
         );
     }
 }

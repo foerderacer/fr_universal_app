@@ -7,7 +7,8 @@ use uuid::Uuid;
 const KEYRING_SERVICE: &str = "de.foerderacer.fr-universal-app.mcp";
 pub const LOCAL_SERVER_TOKEN_KEY: &str = "local-mcp-server-bearer";
 
-/// Generates a 256-bit cryptographically random Bearer token encoded as 64 lowercase hex chars.
+/// Generates a cryptographically random Bearer token (two UUID v4 values = 244 random bits,
+/// encoded as 64 lowercase hex characters).
 pub fn generate_bearer_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
