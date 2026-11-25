@@ -31,6 +31,8 @@ pub enum NextcloudConnectionStatus {
 /// - Trims whitespace and trailing slashes.
 /// - Prepends `https://` when no scheme is supplied (helpful for non-technical users).
 /// - Accepts only `https://` and `http://` schemes.
+/// - Rejects embedded credentials (`user:pass@`), query strings (`?...`), and fragments (`#...`)
+///   so plaintext secrets are never persisted in `config.json` and endpoints stay well-formed.
 pub fn normalize_server_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -58,6 +60,18 @@ pub fn normalize_server_url(raw: &str) -> Result<String> {
     if parsed.host_str().is_none() {
         return Err(FrError::InvalidConfig(
             "Nextcloud URL must include a host name".into(),
+        ));
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FrError::InvalidConfig(
+            "Nextcloud URL must not include a username or password".into(),
+        ));
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(FrError::InvalidConfig(
+            "Nextcloud URL must not include query parameters or fragments".into(),
         ));
     }
 
@@ -96,6 +110,14 @@ mod tests {
     fn rejects_non_http_schemes() {
         assert!(normalize_server_url("file:///etc/passwd").is_err());
         assert!(normalize_server_url("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn rejects_embedded_credentials_queries_and_fragments() {
+        assert!(normalize_server_url("https://alice:secret@cloud.example.com").is_err());
+        assert!(normalize_server_url("https://alice@cloud.example.com").is_err());
+        assert!(normalize_server_url("https://cloud.example.com?token=123").is_err());
+        assert!(normalize_server_url("https://cloud.example.com#section").is_err());
     }
 
     #[test]

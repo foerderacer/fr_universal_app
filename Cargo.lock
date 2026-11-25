@@ -1186,6 +1186,7 @@ dependencies = [
  "chrono",
  "fr-core",
  "serde",
+ "serde_json",
  "specta",
  "tempfile",
  "tokio",

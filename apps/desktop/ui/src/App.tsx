@@ -134,6 +134,11 @@ export function App() {
         />
 
         <main className="flex-1 overflow-y-auto p-6">
+          {overview.startupError && (
+            <div className="mx-auto mb-4 max-w-4xl">
+              <ErrorBanner error={overview.startupError} />
+            </div>
+          )}
           {activeNav === "settings" ? (
             <SettingsView
               overview={overview}

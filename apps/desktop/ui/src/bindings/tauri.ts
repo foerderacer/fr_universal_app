@@ -122,6 +122,7 @@ export type WorkspaceOverview_Deserialize = {
 	connectionStatus: NextcloudConnectionStatus,
 	mcpServer: McpServerConfig,
 	modules: ModuleDescriptor[],
+	startupError?: UserFacingError_Deserialize | null,
 };
 
 /**  Initial snapshot loaded by the React workspace shell on startup. */
@@ -133,4 +134,5 @@ export type WorkspaceOverview_Serialize = {
 	connectionStatus: NextcloudConnectionStatus,
 	mcpServer: McpServerConfig,
 	modules: ModuleDescriptor[],
+	startupError: UserFacingError_Serialize | null,
 };

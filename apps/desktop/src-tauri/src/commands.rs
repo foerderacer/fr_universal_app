@@ -19,6 +19,7 @@ pub struct WorkspaceOverview {
     pub connection_status: NextcloudConnectionStatus,
     pub mcp_server: McpServerConfig,
     pub modules: Vec<ModuleDescriptor>,
+    pub startup_error: Option<UserFacingError>,
 }
 
 /// Partial update payload submitted from the Settings screen.
@@ -29,6 +30,16 @@ pub struct UpdateSettingsRequest {
     pub cache_limit_mb: u32,
     pub mcp_server_enabled: bool,
     pub theme: String,
+}
+
+fn lock_error(detail: &str) -> UserFacingError {
+    UserFacingError {
+        code: "state_lock".into(),
+        title: "Couldn't save settings".into(),
+        message: "The app couldn't access its local settings right now.".into(),
+        recovery_hint: Some("Please restart the app and try again.".into()),
+        technical_details: Some(detail.to_owned()),
+    }
 }
 
 #[tauri::command]
@@ -42,6 +53,7 @@ pub fn get_workspace_overview(state: State<'_, AppState>) -> WorkspaceOverview {
         connection_status: state.connection_status(),
         mcp_server: state.mcp_server_config(),
         modules: state.modules.descriptors(),
+        startup_error: state.current_startup_error(),
     }
 }
 
@@ -59,26 +71,28 @@ pub fn update_settings(
         _ => "system".to_owned(),
     };
 
-    let updated = {
-        let mut guard = state.config.write().map_err(|_| UserFacingError {
-            code: "state_lock".into(),
-            title: "Couldn't save settings".into(),
-            message: "The app couldn't access its local settings right now.".into(),
-            recovery_hint: Some("Please restart the app and try again.".into()),
-            technical_details: Some("RwLock poisoned while updating AppConfig".into()),
-        })?;
-        guard.nextcloud_url = normalized_url;
-        guard.cache_limit_mb = input.cache_limit_mb.clamp(128, 32_768);
-        guard.mcp_server_enabled = input.mcp_server_enabled;
-        guard.theme = theme;
-        guard.clone()
-    };
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while updating AppConfig"))?;
 
-    state
-        .config_store
-        .save(&updated)
-        .map_err(UserFacingError::from)?;
+        let mut candidate = guard.clone();
+        candidate.nextcloud_url = normalized_url;
+        candidate.cache_limit_mb = input.cache_limit_mb.clamp(128, 32_768);
+        candidate.mcp_server_enabled = input.mcp_server_enabled;
+        candidate.theme = theme;
 
+        // Persist atomically to disk BEFORE committing in-memory state so disk and memory stay consistent.
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+
+        *guard = candidate;
+    }
+
+    state.clear_startup_error();
     state.events.publish(AppEvent::ConfigUpdated {
         timestamp: Utc::now(),
     });
@@ -92,23 +106,25 @@ pub fn reset_nextcloud_url(
     state: State<'_, AppState>,
 ) -> Result<WorkspaceOverview, UserFacingError> {
     let default_url = default_nextcloud_url();
-    let updated = {
-        let mut guard = state.config.write().map_err(|_| UserFacingError {
-            code: "state_lock".into(),
-            title: "Couldn't reset server URL".into(),
-            message: "The app couldn't access its local settings right now.".into(),
-            recovery_hint: Some("Please restart the app and try again.".into()),
-            technical_details: Some("RwLock poisoned while resetting Nextcloud URL".into()),
-        })?;
-        guard.nextcloud_url = default_url;
-        guard.clone()
-    };
 
-    state
-        .config_store
-        .save(&updated)
-        .map_err(UserFacingError::from)?;
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while resetting Nextcloud URL"))?;
 
+        let mut candidate = guard.clone();
+        candidate.nextcloud_url = default_url;
+
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+
+        *guard = candidate;
+    }
+
+    state.clear_startup_error();
     state.events.publish(AppEvent::ConfigUpdated {
         timestamp: Utc::now(),
     });

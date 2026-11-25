@@ -1,8 +1,8 @@
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use fr_core::{
     AppConfig, ConfigStore, EventBus, FrModule, ModuleCapability, ModuleDescriptor, ModuleRegistry,
-    ModuleStatus,
+    ModuleStatus, UserFacingError,
 };
 use fr_mcp::McpServerConfig;
 use fr_mod_files::FilesModule;
@@ -47,16 +47,46 @@ impl FrModule for AutomationPlaceholderModule {
 /// Shared application state managed by Tauri.
 pub struct AppState {
     pub config_store: ConfigStore,
-    pub config: RwLock<AppConfig>,
+    pub config: Mutex<AppConfig>,
+    pub startup_error: Mutex<Option<UserFacingError>>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
 
 impl AppState {
     pub fn initialize() -> Self {
-        let config_store = ConfigStore::default_location()
-            .unwrap_or_else(|_| ConfigStore::from_path("config.json"));
-        let config = config_store.load().unwrap_or_default();
+        let mut startup_error = None;
+        let config_store = match ConfigStore::default_location() {
+            Ok(store) => store,
+            Err(err) => {
+                startup_error = Some(UserFacingError {
+                    code: "config_location_error".into(),
+                    title: "Couldn't open your settings folder".into(),
+                    message: "Default settings are active temporarily. Saving settings will use a local fallback.".into(),
+                    recovery_hint: Some("Review and save your settings to recreate the config file.".into()),
+                    technical_details: Some(err.to_string()),
+                });
+                ConfigStore::from_path("config.json")
+            }
+        };
+
+        let config = match config_store.load() {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                startup_error = Some(UserFacingError {
+                    code: "config_load_error".into(),
+                    title: "Your saved settings couldn't be read".into(),
+                    message: "We loaded safe defaults so the app could start, without overwriting your existing config file.".into(),
+                    recovery_hint: Some("Open Settings and click Save Settings to replace the corrupted file, or inspect the file on disk.".into()),
+                    technical_details: Some(format!(
+                        "{} (path: {})",
+                        err,
+                        config_store.path().display()
+                    )),
+                });
+                AppConfig::default()
+            }
+        };
 
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
@@ -65,7 +95,8 @@ impl AppState {
 
         Self {
             config_store,
-            config: RwLock::new(config),
+            config: Mutex::new(config),
+            startup_error: Mutex::new(startup_error),
             modules,
             events: EventBus::default(),
         }
@@ -73,9 +104,22 @@ impl AppState {
 
     pub fn current_config(&self) -> AppConfig {
         self.config
-            .read()
+            .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    pub fn current_startup_error(&self) -> Option<UserFacingError> {
+        self.startup_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn clear_startup_error(&self) {
+        if let Ok(mut guard) = self.startup_error.lock() {
+            *guard = None;
+        }
     }
 
     pub fn connection_status(&self) -> NextcloudConnectionStatus {

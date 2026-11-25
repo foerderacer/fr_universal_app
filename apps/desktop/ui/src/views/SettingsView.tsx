@@ -33,10 +33,19 @@ export function SettingsView({
 
   useEffect(() => {
     setNextcloudUrl(overview.config.nextcloudUrl);
+  }, [overview.config.nextcloudUrl]);
+
+  useEffect(() => {
     setCacheLimitMb(overview.config.cacheLimitMb);
+  }, [overview.config.cacheLimitMb]);
+
+  useEffect(() => {
     setTheme(overview.config.theme);
+  }, [overview.config.theme]);
+
+  useEffect(() => {
     setMcpServerEnabled(overview.config.mcpServerEnabled);
-  }, [overview]);
+  }, [overview.config.mcpServerEnabled]);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -61,6 +70,7 @@ export function SettingsView({
     setSavedNotice(false);
     try {
       await onResetUrl();
+      setNextcloudUrl(overview.defaultNextcloudUrl);
     } finally {
       setSaving(false);
     }

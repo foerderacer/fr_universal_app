@@ -41,6 +41,7 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
       port: 38420,
       requireWriteApproval: true,
     },
+    startupError: null,
     modules: [
       {
         id: "files",

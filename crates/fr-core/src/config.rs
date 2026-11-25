@@ -1,9 +1,11 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tempfile::NamedTempFile;
 
 use crate::error::{FrError, Result};
 
@@ -94,13 +96,21 @@ impl ConfigStore {
         Ok(config)
     }
 
-    /// Persists config to disk atomically (creating parent directories if needed).
+    /// Persists config to disk atomically (write to sibling temp file, fsync, atomic persist).
     pub fn save(&self, config: &AppConfig) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
         let json = serde_json::to_string_pretty(config)?;
-        fs::write(&self.path, json)?;
+        let mut tmp = NamedTempFile::new_in(parent)?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&self.path)
+            .map_err(|err| FrError::Io(err.error))?;
         Ok(())
     }
 }
@@ -134,5 +144,14 @@ mod tests {
         store.save(&config).expect("save config");
         let loaded = store.load().expect("load saved config");
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn load_returns_error_on_corrupt_json() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(&path, "{ not valid json").expect("write corrupt config");
+        let store = ConfigStore::from_path(&path);
+        assert!(store.load().is_err());
     }
 }

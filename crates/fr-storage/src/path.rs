@@ -1,7 +1,8 @@
 use std::fmt;
+use std::path::{Component, Path};
 
 use fr_core::{FrError, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use specta::Type;
 
 /// Normalized, POSIX-style virtual cloud path always starting with `/`.
@@ -10,9 +11,19 @@ use specta::Type;
 /// - Root: `/`
 /// - Folder: `/Projects/Design`
 /// - File: `/Projects/Design/spec.md`
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Type)]
 #[serde(transparent)]
 pub struct CloudPath(String);
+
+impl<'de> Deserialize<'de> for CloudPath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        CloudPath::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl CloudPath {
     /// Returns the root path (`/`).
@@ -20,7 +31,8 @@ impl CloudPath {
         Self("/".to_owned())
     }
 
-    /// Parses and normalizes an untrusted path string, rejecting path traversal (`..`).
+    /// Parses and normalizes an untrusted path string, rejecting path traversal (`..`),
+    /// Windows drive/UNC prefixes, colons, and null bytes.
     pub fn parse(raw: &str) -> Result<Self> {
         let normalized = raw.trim().replace('\\', "/");
         if normalized.is_empty() || normalized == "/" {
@@ -41,6 +53,22 @@ impl CloudPath {
                 return Err(FrError::InvalidPath(
                     "null bytes are not allowed in paths".into(),
                 ));
+            }
+            if segment.contains(':') {
+                return Err(FrError::InvalidPath(format!(
+                    "colon characters and drive prefixes are not allowed: {raw}"
+                )));
+            }
+            // Double-check against OS path component parsing so no platform-specific prefix
+            // or root component can ever alter `PathBuf::push`.
+            let mut comps = Path::new(segment).components();
+            match (comps.next(), comps.next()) {
+                (Some(Component::Normal(_)), None) => {}
+                _ => {
+                    return Err(FrError::InvalidPath(format!(
+                        "invalid path segment '{segment}' in '{raw}'"
+                    )));
+                }
             }
             segments.push(segment);
         }
@@ -122,9 +150,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal_paths() {
+    fn rejects_traversal_and_prefix_paths() {
         assert!(CloudPath::parse("/Projects/../secret").is_err());
         assert!(CloudPath::parse("..").is_err());
+        assert!(CloudPath::parse("C:/Windows/System32").is_err());
+        assert!(CloudPath::parse("/folder/C:/escape").is_err());
+        assert!(CloudPath::parse("file:stream").is_err());
+    }
+
+    #[test]
+    fn deserialize_validates_cloud_path() {
+        let ok: CloudPath = serde_json::from_str("\"/Team/notes.md\"").unwrap();
+        assert_eq!(ok.as_str(), "/Team/notes.md");
+
+        assert!(serde_json::from_str::<CloudPath>("\"../escape\"").is_err());
+        assert!(serde_json::from_str::<CloudPath>("\"C:/Windows\"").is_err());
     }
 
     #[test]
