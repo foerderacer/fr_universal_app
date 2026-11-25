@@ -1176,10 +1176,13 @@ pub async fn get_mcp_client_config_snippet(
 ) -> Result<McpClientConfigSnippetResponse, UserFacingError> {
     let status = state.mcp_server_status().await;
     let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
-        format!(
-            "http://{}:{}/mcp",
-            status.config.bind_host, status.config.port
-        )
+        let addr = status
+            .config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, status.config.port).to_string())
+            .unwrap_or_else(|_| format!("{}:{}", status.config.bind_host, status.config.port));
+        format!("http://{addr}/mcp")
     });
     let token_store = state.mcp_token_store.clone();
     let token = tokio::task::spawn_blocking(move || token_store.get_or_create_server_token())
@@ -1208,10 +1211,13 @@ pub async fn rotate_mcp_server_token(
         .await
         .map_err(mcp_error_to_user_facing)?;
     let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
-        format!(
-            "http://{}:{}/mcp",
-            status.config.bind_host, status.config.port
-        )
+        let addr = status
+            .config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, status.config.port).to_string())
+            .unwrap_or_else(|_| format!("{}:{}", status.config.bind_host, status.config.port));
+        format!("http://{addr}/mcp")
     });
     let json_snippet = build_client_config_snippet(&endpoint_url, &token);
     Ok(McpClientConfigSnippetResponse {
@@ -1307,7 +1313,7 @@ pub async fn sync_team_mcp_servers(
                 recovery_hint: Some("Fix the JSON syntax in Nextcloud and try syncing again.".into()),
                 technical_details: Some(se.to_string()),
             },
-            other => mcp_error_to_user_facing(other),
+            other => UserFacingError::from(other),
         })
 }
 

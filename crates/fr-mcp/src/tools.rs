@@ -32,9 +32,14 @@ pub trait McpToolHandler: Send + Sync {
     fn is_write(&self) -> bool;
     fn input_schema(&self) -> Value;
 
-    /// Returns a concise, secret-free human summary for the audit log & write-approval prompt.
-    fn summarize_call(&self, _args: &Value) -> String {
+    /// Returns a concise, content-free summary for the audit log (never includes file contents or secrets).
+    fn summarize_audit(&self, _args: &Value) -> String {
         format!("Call {}", self.name())
+    }
+
+    /// Returns a human-readable summary shown in the interactive write-approval prompt.
+    fn summarize_approval(&self, args: &Value) -> String {
+        self.summarize_audit(args)
     }
 
     async fn call(&self, args: Value) -> Result<Value>;
@@ -165,7 +170,7 @@ impl McpToolHandler for FilesListTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("/");
         format!("List folder {path}")
     }
@@ -204,7 +209,7 @@ impl McpToolHandler for FilesSearchTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
         let path = args.get("path").and_then(Value::as_str).unwrap_or("/");
         format!("Search '{query}' in {path}")
@@ -248,7 +253,7 @@ impl McpToolHandler for FilesReadMarkdownTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         format!("Read {path}")
     }
@@ -303,7 +308,15 @@ impl McpToolHandler for FilesWriteMarkdownTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+        let len = args
+            .get("content")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        format!("Write {path} ({len} bytes)")
+    }
+    fn summarize_approval(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         let content = args.get("content").and_then(Value::as_str).unwrap_or("");
         let preview: String = content
@@ -347,19 +360,24 @@ impl McpToolHandler for FilesWriteMarkdownTool {
                 .await?
         } else {
             // Never silently overwrite an existing file without an expected_etag or explicit force_overwrite.
-            if let Ok(existing) = service.storage().stat(&parsed).await {
-                return Err(FrError::Conflict {
-                    path: parsed.as_str().to_owned(),
-                    expected: "<none — pass expected_etag or force_overwrite: true>".into(),
-                    actual: existing
-                        .etag
-                        .map(|e| e.as_str().to_owned())
-                        .unwrap_or_else(|| "<exists>".into()),
-                });
+            match service.storage().stat(&parsed).await {
+                Ok(existing) => {
+                    return Err(FrError::Conflict {
+                        path: parsed.as_str().to_owned(),
+                        expected: "<none — pass expected_etag or force_overwrite: true>".into(),
+                        actual: existing
+                            .etag
+                            .map(|e| e.as_str().to_owned())
+                            .unwrap_or_else(|| "<exists>".into()),
+                    });
+                }
+                Err(FrError::NotFound(_)) => {
+                    service
+                        .write_markdown(parsed.as_str(), content, None)
+                        .await?
+                }
+                Err(err) => return Err(err),
             }
-            service
-                .write_markdown(parsed.as_str(), content, None)
-                .await?
         };
         Ok(json!({
             "path": parsed.as_str(),
@@ -393,7 +411,7 @@ impl McpToolHandler for FilesMetadataTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         format!("Inspect metadata for {path}")
     }
@@ -455,7 +473,7 @@ impl McpToolHandler for FilesMkdirTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
         format!("Create folder {path}")
     }
@@ -493,7 +511,7 @@ impl McpToolHandler for FilesMoveTool {
             }
         })
     }
-    fn summarize_call(&self, args: &Value) -> String {
+    fn summarize_audit(&self, args: &Value) -> String {
         let from = args.get("from").and_then(Value::as_str).unwrap_or("?");
         let to = args.get("to").and_then(Value::as_str).unwrap_or("?");
         format!("Move {from} -> {to}")

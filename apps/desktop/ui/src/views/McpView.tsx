@@ -231,11 +231,16 @@ export function McpView({
   async function handleAddExternalServer(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    const id = newName
+    const baseSlug = newName
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "");
+    const existingIds = new Set(externalServers.map((s) => s.id));
+    const id =
+      baseSlug && !existingIds.has(baseSlug)
+        ? baseSlug
+        : `${baseSlug || "mcp-server"}-${Date.now().toString(36)}`;
     const server: ExternalMcpServer = {
       id,
       name: newName.trim(),

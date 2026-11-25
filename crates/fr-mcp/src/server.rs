@@ -359,12 +359,13 @@ async fn handle_tool_call(state: &ServerState, id: Value, params: Value) -> Resp
 
     let started = Instant::now();
     let is_write = handler.is_write();
-    let summary = handler.summarize_call(&args);
+    let summary = handler.summarize_audit(&args);
+    let approval_summary = handler.summarize_approval(&args);
 
     if is_write && state.require_write_approval.load(Ordering::SeqCst) {
         match state
             .approvals
-            .request_approval(tool_name, summary.clone(), WRITE_APPROVAL_TIMEOUT)
+            .request_approval(tool_name, approval_summary, WRITE_APPROVAL_TIMEOUT)
             .await
         {
             ApprovalOutcome::Approved => {}

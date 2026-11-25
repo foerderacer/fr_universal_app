@@ -104,7 +104,12 @@ fn is_forbidden_ssrf_host(host: &str) -> bool {
     };
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_unspecified() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => v6.is_unspecified() || ((v6.segments()[0] & 0xffc0) == 0xfe80),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return mapped_v4.is_unspecified() || mapped_v4.is_link_local();
+            }
+            v6.is_unspecified() || ((v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
     }
 }
 
@@ -335,15 +340,22 @@ impl McpClientManager {
             ));
         }
         let (bytes, _) = storage.read(&path).await?;
+        if bytes.len() as u64 > MAX_TEAM_SYNC_BYTES {
+            return Err(FrError::InvalidConfig(
+                "Team MCP server registry exceeds 1 MB safety limit".into(),
+            ));
+        }
         let imported: Vec<ExternalMcpServer> = serde_json::from_slice(&bytes)?;
 
-        let mut tokens_to_clear: Vec<String> = Vec::new();
-        {
-            let mut guard = self
+        // Compute candidate & clear repointed tokens BEFORE persisting the repointed URL so a
+        // keychain deletion failure can never leave an old token attached to a new URL.
+        let (candidate, tokens_to_clear) = {
+            let guard = self
                 .records
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut candidate = guard.clone();
+            let mut tokens_to_clear: Vec<String> = Vec::new();
             for server in imported {
                 if validate_server(&server).is_err() {
                     continue;
@@ -367,14 +379,21 @@ impl McpClientManager {
                     });
                 }
             }
-            self.persist_locked(&candidate)?;
-            *guard = candidate;
-        }
+            (candidate, tokens_to_clear)
+        };
 
         for id in tokens_to_clear {
-            let _ = self
-                .token_store
-                .delete_token(&external_server_token_key(&id));
+            self.token_store
+                .delete_token(&external_server_token_key(&id))?;
+        }
+
+        {
+            let mut guard = self
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.persist_locked(&candidate)?;
+            *guard = candidate;
         }
 
         Ok(self.list_servers())
@@ -477,6 +496,13 @@ impl McpClientManager {
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        // Re-validate transport at connect time so pre-existing records cannot bypass HTTPS/SSRF rules.
+        validate_server(&ExternalMcpServer {
+            id: rec.id.clone(),
+            name: rec.name.clone(),
+            enabled: rec.enabled,
+            transport: rec.transport.clone(),
+        })?;
         match &rec.transport {
             ExternalMcpTransport::StreamableHttp { url } => {
                 let token = self
