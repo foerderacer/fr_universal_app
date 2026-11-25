@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 pub use image_helper::{ImageDimensions, inspect_image_dimensions, transcode_to_png};
-pub use media_proxy::MediaProxyServer;
+pub use media_proxy::{MediaProxyServer, SharedBackendSlot};
 pub use solidworks::{SolidWorksMetadata, SolidWorksPreview, extract_solidworks_preview};
 
 /// Rendering/preview strategy selected for a file in the Files workspace.

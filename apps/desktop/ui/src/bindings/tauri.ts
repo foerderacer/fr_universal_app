@@ -32,6 +32,20 @@ export const commands = {
 	getFileThumbnail: (fileId: string, width: number, height: number, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_file_thumbnail", { fileId, width, height }, options),
 	getMediaProxyUrl: (path: string, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_media_proxy_url", { path }, options),
 	openFileInNativeApp: (path: string, allowExecutable: boolean, options?: InvokeOptions) => __TAURI_INVOKE<string>("open_file_in_native_app", { path, allowExecutable }, options),
+	getMcpServerStatus: (options?: InvokeOptions) => __TAURI_INVOKE<McpServerStatus_Serialize>("get_mcp_server_status", undefined, options),
+	configureMcpServer: (input: ConfigureMcpServerRequest, options?: InvokeOptions) => __TAURI_INVOKE<ConfigureMcpServerResponse_Serialize>("configure_mcp_server", { input }, options),
+	getMcpClientConfigSnippet: (options?: InvokeOptions) => __TAURI_INVOKE<McpClientConfigSnippetResponse>("get_mcp_client_config_snippet", undefined, options),
+	rotateMcpServerToken: (options?: InvokeOptions) => __TAURI_INVOKE<McpClientConfigSnippetResponse>("rotate_mcp_server_token", undefined, options),
+	listMcpAuditLog: (options?: InvokeOptions) => __TAURI_INVOKE<McpAuditEntry_Serialize[]>("list_mcp_audit_log", undefined, options),
+	clearMcpAuditLog: (options?: InvokeOptions) => __TAURI_INVOKE<void>("clear_mcp_audit_log", undefined, options),
+	listPendingMcpApprovals: (options?: InvokeOptions) => __TAURI_INVOKE<PendingWriteApproval[]>("list_pending_mcp_approvals", undefined, options),
+	resolveMcpApproval: (approvalId: string, allow: boolean, options?: InvokeOptions) => __TAURI_INVOKE<boolean>("resolve_mcp_approval", { approvalId, allow }, options),
+	listExternalMcpServers: (options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpServerView[]>("list_external_mcp_servers", undefined, options),
+	upsertExternalMcpServer: (server: ExternalMcpServer, bearerToken: string | null, options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpServerView[]>("upsert_external_mcp_server", { server, bearerToken }, options),
+	deleteExternalMcpServer: (serverId: string, options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpServerView[]>("delete_external_mcp_server", { serverId }, options),
+	syncTeamMcpServers: (options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpServerView[]>("sync_team_mcp_servers", undefined, options),
+	discoverExternalMcpTools: (serverId: string, options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpTool_Serialize[]>("discover_external_mcp_tools", { serverId }, options),
+	testExternalMcpTool: (serverId: string, toolName: string, argumentsJson: string, options?: InvokeOptions) => __TAURI_INVOKE<McpToolCallOutput>("test_external_mcp_tool", { serverId, toolName, argumentsJson }, options),
 };
 
 /* Types */
@@ -50,6 +64,10 @@ export type AppConfig_Deserialize = {
 	cacheLimitMb?: number,
 	/**  Whether the built-in local MCP Server is enabled (always defaults to `false`). */
 	mcpServerEnabled?: boolean,
+	/**  Loopback TCP port for the built-in local MCP Server. */
+	mcpServerPort?: number,
+	/**  Whether mutating MCP Server tool calls require explicit user approval in the UI. */
+	mcpRequireWriteApproval?: boolean,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme?: string,
 };
@@ -66,6 +84,10 @@ export type AppConfig_Serialize = {
 	cacheLimitMb: number,
 	/**  Whether the built-in local MCP Server is enabled (always defaults to `false`). */
 	mcpServerEnabled: boolean,
+	/**  Loopback TCP port for the built-in local MCP Server. */
+	mcpServerPort: number,
+	/**  Whether mutating MCP Server tool calls require explicit user approval in the UI. */
+	mcpRequireWriteApproval: boolean,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme: string,
 };
@@ -80,8 +102,64 @@ export type AppConfig_Serialize = {
  */
 export type CloudPath = string;
 
+export type ConfigureMcpServerRequest = {
+	enabled: boolean,
+	port: number,
+	requireWriteApproval: boolean,
+};
+
+export type ConfigureMcpServerResponse = ConfigureMcpServerResponse_Serialize | ConfigureMcpServerResponse_Deserialize;
+
+export type ConfigureMcpServerResponse_Deserialize = {
+	status: McpServerStatus_Deserialize,
+	overview: WorkspaceOverview_Deserialize,
+};
+
+export type ConfigureMcpServerResponse_Serialize = {
+	status: McpServerStatus_Serialize,
+	overview: WorkspaceOverview_Serialize,
+};
+
 /**  Opaque entity tag used for optimistic concurrency (`If-Match` / HTTP 412 conflict detection). */
 export type Etag = string;
+
+/**  Metadata for an external MCP server registered in the workspace. */
+export type ExternalMcpServer = {
+	id: string,
+	name: string,
+	enabled: boolean,
+	transport: ExternalMcpTransport,
+};
+
+/**  UI-safe projection of an [`ExternalMcpServer`] (never includes raw secrets; only `has_token`). */
+export type ExternalMcpServerView = {
+	id: string,
+	name: string,
+	enabled: boolean,
+	transport: ExternalMcpTransport,
+	hasToken: boolean,
+	fromTeamSync: boolean,
+};
+
+/**  Discovered tool advertised by an external MCP server via `tools/list`. */
+export type ExternalMcpTool = ExternalMcpTool_Serialize | ExternalMcpTool_Deserialize;
+
+/**  Discovered tool advertised by an external MCP server via `tools/list`. */
+export type ExternalMcpTool_Deserialize = {
+	name: string,
+	description?: string | null,
+	inputSchemaJson: string,
+};
+
+/**  Discovered tool advertised by an external MCP server via `tools/list`. */
+export type ExternalMcpTool_Serialize = {
+	name: string,
+	description: string | null,
+	inputSchemaJson: string,
+};
+
+/**  Transport configuration for an external MCP server connected via the MCP Client. */
+export type ExternalMcpTransport = { transport: "stdio"; command: string; args: string[] } | { transport: "streamableHttp"; url: string };
 
 /**  Normalized metadata for a file or folder returned by any [`crate::StorageBackend`]. */
 export type FileEntry = FileEntry_Serialize | FileEntry_Deserialize;
@@ -224,12 +302,84 @@ export type MarkdownDraft_Serialize = {
 	updatedAtMs: number | null,
 };
 
+/**  Concise audit log record shown in the desktop UI (never stores file contents or secrets). */
+export type McpAuditEntry = McpAuditEntry_Serialize | McpAuditEntry_Deserialize;
+
+/**  Concise audit log record shown in the desktop UI (never stores file contents or secrets). */
+export type McpAuditEntry_Deserialize = {
+	id: string,
+	timestamp: string,
+	toolName: string,
+	summary: string,
+	isWrite: boolean,
+	status: McpAuditStatus,
+	durationMs: number,
+	error?: string | null,
+};
+
+/**  Concise audit log record shown in the desktop UI (never stores file contents or secrets). */
+export type McpAuditEntry_Serialize = {
+	id: string,
+	timestamp: string,
+	toolName: string,
+	summary: string,
+	isWrite: boolean,
+	status: McpAuditStatus,
+	durationMs: number,
+	error: string | null,
+};
+
+/**  Outcome of a single MCP Server tool invocation recorded in the local audit log. */
+export type McpAuditStatus = "allowed" | "denied" | "timedOut" | "failed";
+
+export type McpClientConfigSnippetResponse = {
+	endpointUrl: string,
+	jsonSnippet: string,
+};
+
 /**  Configuration for the built-in local MCP Server. */
 export type McpServerConfig = {
 	enabled: boolean,
 	bindHost: string,
 	port: number,
 	requireWriteApproval: boolean,
+};
+
+/**  Live runtime status of the built-in local MCP Server returned to the desktop UI. */
+export type McpServerStatus = McpServerStatus_Serialize | McpServerStatus_Deserialize;
+
+/**  Live runtime status of the built-in local MCP Server returned to the desktop UI. */
+export type McpServerStatus_Deserialize = {
+	running: boolean,
+	endpointUrl?: string | null,
+	config: McpServerConfig,
+	exposedTools: McpToolInfo[],
+	pendingApprovals: number,
+};
+
+/**  Live runtime status of the built-in local MCP Server returned to the desktop UI. */
+export type McpServerStatus_Serialize = {
+	running: boolean,
+	endpointUrl: string | null,
+	config: McpServerConfig,
+	exposedTools: McpToolInfo[],
+	pendingApprovals: number,
+};
+
+/**  Output returned from calling an external MCP server tool via `tools/call`. */
+export type McpToolCallOutput = {
+	serverId: string,
+	toolName: string,
+	isError: boolean,
+	text: string,
+};
+
+/**  Metadata for a tool registered in the built-in local MCP Server. */
+export type McpToolInfo = {
+	name: string,
+	description: string,
+	isWrite: boolean,
+	moduleId: string,
 };
 
 /**  Capabilities a workspace module can declare to the host shell. */
@@ -251,6 +401,14 @@ export type ModuleStatus = "active" | "preview" | "planned";
 
 /**  Connection state displayed in the desktop shell status bar and Settings view. */
 export type NextcloudConnectionStatus = { state: "notConfigured" } | { state: "signedOut"; serverUrl: string } | { state: "connected"; serverUrl: string; loginName: string };
+
+/**  A mutating MCP tool call awaiting explicit Allow/Deny confirmation from the desktop user. */
+export type PendingWriteApproval = {
+	id: string,
+	toolName: string,
+	summary: string,
+	createdAt: string,
+};
 
 /**  Rendering/preview strategy selected for a file in the Files workspace. */
 export type PreviewKind = "markdown" | "image" | "video" | "pdf" | "vectorSvg" | "vectorAi" | "vectorDxf" | "vectorEps" | "solidWorks" | "cad3d" | "plainText" | "unsupported";

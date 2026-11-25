@@ -8,7 +8,10 @@ use fr_core::{
     AppConfig, AppEvent, ConfigStore, FrError, ModuleDescriptor, UserFacingError,
     default_nextcloud_url,
 };
-use fr_mcp::McpServerConfig;
+use fr_mcp::{
+    ExternalMcpServer, ExternalMcpServerView, ExternalMcpTool, McpAuditEntry, McpServerConfig,
+    McpServerStatus, McpToolCallOutput, PendingWriteApproval, build_client_config_snippet,
+};
 use fr_mod_files::{FileItemView, FilePreviewPayload, FilesService, MarkdownDocument};
 use fr_nextcloud::{
     LoginPollResult, NextcloudConnectionStatus, UserAccountInfo, fetch_user_account_info,
@@ -115,7 +118,7 @@ pub fn get_workspace_overview(state: State<'_, AppState>) -> WorkspaceOverview {
 
 #[tauri::command]
 #[specta::specta]
-pub fn update_settings(
+pub async fn update_settings(
     state: State<'_, AppState>,
     input: UpdateSettingsRequest,
 ) -> Result<WorkspaceOverview, UserFacingError> {
@@ -173,6 +176,18 @@ pub fn update_settings(
     }
     if let Some(ref cache) = state.cache {
         let _ = cache.set_limit_mb(new_cache_limit);
+    }
+
+    if let Err(err) = state.sync_mcp_server_runtime(false).await {
+        tracing::warn!("MCP server sync error after settings save: {err}");
+        // Revert only the MCP enabled flag so disk & runtime stay consistent.
+        if let Ok(mut guard) = state.config.lock() {
+            let mut reverted = guard.clone();
+            reverted.mcp_server_enabled = false;
+            let _ = state.config_store.save(&reverted);
+            *guard = reverted;
+        }
+        return Err(mcp_error_to_user_facing(err));
     }
 
     state.clear_startup_error();
@@ -1010,6 +1025,333 @@ pub async fn open_file_in_native_app(
         })?;
 
     Ok(path_str)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Dual MCP Server & External MCP Client commands
+// ---------------------------------------------------------------------------
+
+/// Maps MCP-specific `FrError` values into accurate, non-technical MCP messages (never blaming Nextcloud).
+fn mcp_error_to_user_facing(err: FrError) -> UserFacingError {
+    match &err {
+        FrError::AuthRequired(_) => UserFacingError {
+            code: "mcp_auth_failed".into(),
+            title: "External MCP authentication failed".into(),
+            message: "The external MCP server rejected the configured Bearer token.".into(),
+            recovery_hint: Some(
+                "Update the server's Bearer token in MCP / AI and try again.".into(),
+            ),
+            technical_details: Some(err.to_string()),
+        },
+        FrError::Network(_) => UserFacingError {
+            code: "mcp_network_error".into(),
+            title: "Couldn't reach the external MCP server".into(),
+            message: "The MCP server did not respond or couldn't be reached.".into(),
+            recovery_hint: Some(
+                "Check the server URL or command in MCP / AI and confirm the server is running."
+                    .into(),
+            ),
+            technical_details: Some(err.to_string()),
+        },
+        FrError::InvalidConfig(msg) => UserFacingError {
+            code: "mcp_invalid_config".into(),
+            title: "Invalid MCP setting".into(),
+            message: msg.clone(),
+            recovery_hint: Some("Check the values entered in MCP / AI and try again.".into()),
+            technical_details: Some(err.to_string()),
+        },
+        FrError::Other(msg) if msg.contains("failed to bind local MCP Server") => UserFacingError {
+            code: "mcp_port_in_use".into(),
+            title: "Local MCP port is already in use".into(),
+            message: "Another app is already using that local port on this computer.".into(),
+            recovery_hint: Some(
+                "Pick a different port between 1024 and 65535 (e.g. 38421) and click Apply."
+                    .into(),
+            ),
+            technical_details: Some(err.to_string()),
+        },
+        FrError::Other(msg) if msg.contains("failed to start stdio MCP process") => {
+            UserFacingError {
+                code: "mcp_stdio_spawn_failed".into(),
+                title: "Couldn't launch local MCP command".into(),
+                message: "The configured program couldn't be found or started on this computer."
+                    .into(),
+                recovery_hint: Some(
+                    "Check that the executable is installed and on your PATH, or enter its full path."
+                        .into(),
+                ),
+                technical_details: Some(err.to_string()),
+            }
+        }
+        _ => UserFacingError::from(err),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigureMcpServerRequest {
+    pub enabled: bool,
+    pub port: u16,
+    pub require_write_approval: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigureMcpServerResponse {
+    pub status: McpServerStatus,
+    pub overview: WorkspaceOverview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct McpClientConfigSnippetResponse {
+    pub endpoint_url: String,
+    pub json_snippet: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mcp_server_status(
+    state: State<'_, AppState>,
+) -> Result<McpServerStatus, UserFacingError> {
+    Ok(state.mcp_server_status().await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn configure_mcp_server(
+    state: State<'_, AppState>,
+    input: ConfigureMcpServerRequest,
+) -> Result<ConfigureMcpServerResponse, UserFacingError> {
+    if input.port < 1024 {
+        return Err(mcp_error_to_user_facing(FrError::InvalidConfig(
+            "Choose a local port between 1024 and 65535.".into(),
+        )));
+    }
+
+    let previous = state.current_config();
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while saving MCP server settings"))?;
+        let mut candidate = guard.clone();
+        candidate.mcp_server_enabled = input.enabled;
+        candidate.mcp_server_port = input.port;
+        candidate.mcp_require_write_approval = input.require_write_approval;
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(mcp_error_to_user_facing)?;
+        *guard = candidate;
+    }
+
+    let status = match state.sync_mcp_server_runtime(false).await {
+        Ok(s) => s,
+        Err(err) => {
+            // Roll back config AND restore previous runtime so config and live state never drift.
+            if let Ok(mut guard) = state.config.lock() {
+                let _ = state.config_store.save(&previous);
+                *guard = previous;
+            }
+            let _ = state.sync_mcp_server_runtime(false).await;
+            return Err(mcp_error_to_user_facing(err));
+        }
+    };
+
+    state.events.publish(AppEvent::ConfigUpdated {
+        timestamp: Utc::now(),
+    });
+
+    Ok(ConfigureMcpServerResponse {
+        status,
+        overview: build_overview(&state),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mcp_client_config_snippet(
+    state: State<'_, AppState>,
+) -> Result<McpClientConfigSnippetResponse, UserFacingError> {
+    let status = state.mcp_server_status().await;
+    let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
+        let addr = status
+            .config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, status.config.port).to_string())
+            .unwrap_or_else(|_| format!("{}:{}", status.config.bind_host, status.config.port));
+        format!("http://{addr}/mcp")
+    });
+    let token_store = state.mcp_token_store.clone();
+    let token = tokio::task::spawn_blocking(move || token_store.get_or_create_server_token())
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(mcp_error_to_user_facing)?;
+    let json_snippet = build_client_config_snippet(&endpoint_url, &token);
+    Ok(McpClientConfigSnippetResponse {
+        endpoint_url,
+        json_snippet,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn rotate_mcp_server_token(
+    state: State<'_, AppState>,
+) -> Result<McpClientConfigSnippetResponse, UserFacingError> {
+    let token_store = state.mcp_token_store.clone();
+    let token = tokio::task::spawn_blocking(move || token_store.rotate_server_token())
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(mcp_error_to_user_facing)?;
+    let status = state
+        .sync_mcp_server_runtime(true)
+        .await
+        .map_err(mcp_error_to_user_facing)?;
+    let endpoint_url = status.endpoint_url.unwrap_or_else(|| {
+        let addr = status
+            .config
+            .bind_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, status.config.port).to_string())
+            .unwrap_or_else(|_| format!("{}:{}", status.config.bind_host, status.config.port));
+        format!("http://{addr}/mcp")
+    });
+    let json_snippet = build_client_config_snippet(&endpoint_url, &token);
+    Ok(McpClientConfigSnippetResponse {
+        endpoint_url,
+        json_snippet,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_mcp_audit_log(state: State<'_, AppState>) -> Vec<McpAuditEntry> {
+    state.mcp_audit.list()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn clear_mcp_audit_log(state: State<'_, AppState>) {
+    state.mcp_audit.clear();
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_pending_mcp_approvals(state: State<'_, AppState>) -> Vec<PendingWriteApproval> {
+    state.mcp_approvals.list_pending()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn resolve_mcp_approval(state: State<'_, AppState>, approval_id: String, allow: bool) -> bool {
+    state.mcp_approvals.resolve(&approval_id, allow)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_external_mcp_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    let client = state.mcp_client.clone();
+    tokio::task::spawn_blocking(move || client.list_servers())
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn upsert_external_mcp_server(
+    state: State<'_, AppState>,
+    server: ExternalMcpServer,
+    bearer_token: Option<String>,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    let client = state.mcp_client.clone();
+    tokio::task::spawn_blocking(move || client.upsert_server(server, bearer_token))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(mcp_error_to_user_facing)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_external_mcp_server(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    let client = state.mcp_client.clone();
+    tokio::task::spawn_blocking(move || client.delete_server(&server_id))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(mcp_error_to_user_facing)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_team_mcp_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<ExternalMcpServerView>, UserFacingError> {
+    let service = require_files_service(&state)?;
+    state
+        .mcp_client
+        .sync_from_nextcloud(service.storage().as_ref())
+        .await
+        .map_err(|err| match err {
+            FrError::NotFound(_) => UserFacingError {
+                code: "team_mcp_registry_missing".into(),
+                title: "No shared team MCP registry found".into(),
+                message: "Your Nextcloud workspace doesn't have a /_FR_App/mcp-servers.json file yet.".into(),
+                recovery_hint: Some("Ask your team admin to create /_FR_App/mcp-servers.json, or add servers manually.".into()),
+                technical_details: None,
+            },
+            FrError::Serialization(ref se) => UserFacingError {
+                code: "team_mcp_registry_invalid".into(),
+                title: "Shared MCP registry couldn't be read".into(),
+                message: "The team file /_FR_App/mcp-servers.json is not valid JSON.".into(),
+                recovery_hint: Some("Fix the JSON syntax in Nextcloud and try syncing again.".into()),
+                technical_details: Some(se.to_string()),
+            },
+            other => UserFacingError::from(other),
+        })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn discover_external_mcp_tools(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<ExternalMcpTool>, UserFacingError> {
+    state
+        .mcp_client
+        .discover_tools(&server_id)
+        .await
+        .map_err(mcp_error_to_user_facing)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn test_external_mcp_tool(
+    state: State<'_, AppState>,
+    server_id: String,
+    tool_name: String,
+    arguments_json: String,
+) -> Result<McpToolCallOutput, UserFacingError> {
+    let args: serde_json::Value = if arguments_json.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&arguments_json).map_err(|err| {
+            mcp_error_to_user_facing(FrError::InvalidConfig(format!(
+                "Tool arguments must be valid JSON: {err}"
+            )))
+        })?
+    };
+    state
+        .mcp_client
+        .call_tool(&server_id, &tool_name, args)
+        .await
+        .map_err(mcp_error_to_user_facing)
 }
 
 #[cfg(test)]

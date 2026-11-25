@@ -4,7 +4,11 @@ use fr_core::{
     AppConfig, ConfigStore, EventBus, FrModule, ModuleCapability, ModuleDescriptor, ModuleRegistry,
     ModuleStatus, UserFacingError,
 };
-use fr_mcp::McpServerConfig;
+use fr_mcp::{
+    KeyringMcpTokenStore, LocalMcpServer, McpAuditLog, McpClientManager, McpModule,
+    McpServerConfig, McpServerStatus, McpTokenStore, McpToolRegistry, WriteApprovalGate,
+    register_files_tools,
+};
 use fr_mod_files::FilesModule;
 use fr_nextcloud::{
     CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
@@ -63,6 +67,12 @@ pub struct AppState {
     pub media_proxy: Mutex<Option<Arc<MediaProxyServer>>>,
     pub active_login: Mutex<Option<LoginFlowSession>>,
     pub account_info: Mutex<Option<UserAccountInfo>>,
+    pub mcp_token_store: Arc<dyn McpTokenStore>,
+    pub mcp_registry: Arc<McpToolRegistry>,
+    pub mcp_audit: Arc<McpAuditLog>,
+    pub mcp_approvals: Arc<WriteApprovalGate>,
+    pub mcp_server: tokio::sync::Mutex<Option<LocalMcpServer>>,
+    pub mcp_client: Arc<McpClientManager>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
@@ -112,8 +122,45 @@ impl AppState {
 
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
+        modules.register(McpModule);
         modules.register(FinancePlaceholderModule);
         modules.register(AutomationPlaceholderModule);
+
+        let storage: Arc<RwLock<Option<Arc<dyn StorageBackend>>>> = Arc::new(RwLock::new(None));
+        let mcp_token_store: Arc<dyn McpTokenStore> = Arc::new(KeyringMcpTokenStore::new());
+        let mcp_registry = Arc::new(McpToolRegistry::new());
+        register_files_tools(&mcp_registry, storage.clone());
+        let mcp_audit = Arc::new(McpAuditLog::new());
+        let mcp_approvals = Arc::new(WriteApprovalGate::new());
+
+        let mcp_store_path = McpClientManager::default_store_path()
+            .unwrap_or_else(|_| std::path::PathBuf::from("mcp-servers.json"));
+        let mcp_client = match McpClientManager::open(
+            &mcp_store_path,
+            mcp_token_store.clone(),
+            http_client.clone(),
+        ) {
+            Ok(client) => Arc::new(client),
+            Err(err) => {
+                if startup_error.is_none() {
+                    startup_error = Some(UserFacingError {
+                        code: "mcp_registry_load_error".into(),
+                        title: "External MCP server list couldn't be read".into(),
+                        message: "We started with a temporary empty MCP server list without overwriting your existing file.".into(),
+                        recovery_hint: Some("Check or repair mcp-servers.json, or re-add servers in MCP / AI.".into()),
+                        technical_details: Some(format!("{err} (path: {})", mcp_store_path.display())),
+                    });
+                }
+                Arc::new(
+                    McpClientManager::open(
+                        std::env::temp_dir().join("fr-universal-app-mcp-servers-fallback.json"),
+                        mcp_token_store.clone(),
+                        http_client.clone(),
+                    )
+                    .expect("fallback MCP registry"),
+                )
+            }
+        };
 
         let state = Self {
             config_store,
@@ -123,10 +170,16 @@ impl AppState {
             http_client,
             cache,
             active_credentials: Mutex::new(None),
-            storage: Arc::new(RwLock::new(None)),
+            storage,
             media_proxy: Mutex::new(None),
             active_login: Mutex::new(None),
             account_info: Mutex::new(None),
+            mcp_token_store,
+            mcp_registry,
+            mcp_audit,
+            mcp_approvals,
+            mcp_server: tokio::sync::Mutex::new(None),
+            mcp_client,
             modules,
             events: EventBus::default(),
         };
@@ -278,7 +331,80 @@ impl AppState {
         let cfg = self.current_config();
         McpServerConfig {
             enabled: cfg.mcp_server_enabled,
+            port: cfg.mcp_server_port,
+            require_write_approval: cfg.mcp_require_write_approval,
             ..McpServerConfig::default()
         }
+    }
+
+    pub async fn mcp_server_status(&self) -> McpServerStatus {
+        let cfg = self.mcp_server_config();
+        let guard = self.mcp_server.lock().await;
+        let endpoint_url = guard.as_ref().map(LocalMcpServer::endpoint_url);
+        McpServerStatus {
+            running: guard.is_some(),
+            endpoint_url,
+            config: cfg,
+            exposed_tools: self.mcp_registry.list_info(),
+            pending_approvals: self.mcp_approvals.pending_count(),
+        }
+    }
+
+    /// Reconciles the running [`LocalMcpServer`] with the persisted [`AppConfig`].
+    pub async fn sync_mcp_server_runtime(
+        &self,
+        force_restart: bool,
+    ) -> fr_core::Result<McpServerStatus> {
+        let cfg = self.mcp_server_config();
+        let mut guard = self.mcp_server.lock().await;
+
+        if !cfg.enabled {
+            if let Some(running) = guard.take() {
+                self.mcp_approvals.deny_all();
+                running.stop();
+            }
+            return Ok(McpServerStatus {
+                running: false,
+                endpoint_url: None,
+                config: cfg,
+                exposed_tools: self.mcp_registry.list_info(),
+                pending_approvals: self.mcp_approvals.pending_count(),
+            });
+        }
+
+        let needs_restart = force_restart
+            || match guard.as_ref() {
+                None => true,
+                Some(running) => running.addr().port() != cfg.port,
+            };
+
+        if needs_restart {
+            if let Some(old) = guard.take() {
+                self.mcp_approvals.deny_all();
+                old.stop();
+            }
+            let token = self.mcp_token_store.get_or_create_server_token()?;
+            let started = LocalMcpServer::start(
+                &cfg,
+                token,
+                self.mcp_registry.clone(),
+                self.storage.clone(),
+                self.mcp_audit.clone(),
+                self.mcp_approvals.clone(),
+            )
+            .await?;
+            *guard = Some(started);
+        } else if let Some(running) = guard.as_ref() {
+            running.set_require_write_approval(cfg.require_write_approval);
+        }
+
+        let endpoint_url = guard.as_ref().map(LocalMcpServer::endpoint_url);
+        Ok(McpServerStatus {
+            running: guard.is_some(),
+            endpoint_url,
+            config: cfg,
+            exposed_tools: self.mcp_registry.list_info(),
+            pending_approvals: self.mcp_approvals.pending_count(),
+        })
     }
 }

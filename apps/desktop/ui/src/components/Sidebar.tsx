@@ -14,6 +14,7 @@ interface SidebarProps {
   modules: ModuleDescriptor[];
   activeId: ActiveNavItem;
   mcpEnabled: boolean;
+  pendingMcpApprovals: number;
   onSelect: (id: ActiveNavItem) => void;
 }
 
@@ -21,6 +22,8 @@ function ModuleIcon({ icon }: { icon: string }) {
   switch (icon) {
     case "folder":
       return <Folder className="h-4 w-4 shrink-0" />;
+    case "cpu":
+      return <Cpu className="h-4 w-4 shrink-0" />;
     case "wallet":
       return <Wallet className="h-4 w-4 shrink-0" />;
     case "workflow":
@@ -34,6 +37,7 @@ export function Sidebar({
   modules,
   activeId,
   mcpEnabled,
+  pendingMcpApprovals,
   onSelect,
 }: SidebarProps) {
   return (
@@ -84,26 +88,37 @@ export function Sidebar({
       </nav>
 
       <div className="space-y-1 border-t border-slate-200 p-3 dark:border-slate-800">
-        <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-xs text-slate-600 dark:bg-slate-800/60 dark:text-slate-300">
+        <button
+          type="button"
+          onClick={() => onSelect("mcp")}
+          className="flex w-full items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-xs text-slate-600 transition-colors hover:bg-slate-100 dark:bg-slate-800/60 dark:text-slate-300 dark:hover:bg-slate-800"
+        >
           <span className="flex items-center gap-2 font-medium">
             <Cpu className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
             Local MCP
           </span>
-          <span
-            className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${
-              mcpEnabled
-                ? "text-emerald-600 dark:text-emerald-400"
-                : "text-slate-500 dark:text-slate-400"
-            }`}
-          >
+          <span className="inline-flex items-center gap-1.5">
+            {pendingMcpApprovals > 0 && (
+              <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                {pendingMcpApprovals}
+              </span>
+            )}
             <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                mcpEnabled ? "bg-emerald-500" : "bg-slate-400"
+              className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${
+                mcpEnabled
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-slate-500 dark:text-slate-400"
               }`}
-            />
-            {mcpEnabled ? "Enabled" : "Off"}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  mcpEnabled ? "bg-emerald-500" : "bg-slate-400"
+                }`}
+              />
+              {mcpEnabled ? "Running" : "Off"}
+            </span>
           </span>
-        </div>
+        </button>
 
         <button
           type="button"

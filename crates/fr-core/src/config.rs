@@ -37,6 +37,12 @@ pub struct AppConfig {
     /// Whether the built-in local MCP Server is enabled (always defaults to `false`).
     #[serde(default)]
     pub mcp_server_enabled: bool,
+    /// Loopback TCP port for the built-in local MCP Server.
+    #[serde(default = "default_mcp_server_port")]
+    pub mcp_server_port: u16,
+    /// Whether mutating MCP Server tool calls require explicit user approval in the UI.
+    #[serde(default = "default_mcp_require_write_approval")]
+    pub mcp_require_write_approval: bool,
     /// Preferred UI color theme (`"system"`, `"light"`, or `"dark"`).
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -44,6 +50,14 @@ pub struct AppConfig {
 
 fn default_cache_limit_mb() -> u32 {
     2048
+}
+
+fn default_mcp_server_port() -> u16 {
+    38420
+}
+
+fn default_mcp_require_write_approval() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -58,6 +72,8 @@ impl Default for AppConfig {
             pinned_folders: Vec::new(),
             cache_limit_mb: default_cache_limit_mb(),
             mcp_server_enabled: false,
+            mcp_server_port: default_mcp_server_port(),
+            mcp_require_write_approval: default_mcp_require_write_approval(),
             theme: default_theme(),
         }
     }
@@ -153,6 +169,8 @@ mod tests {
             pinned_folders: vec!["/Projects".into(), "/Shared".into()],
             cache_limit_mb: 1024,
             mcp_server_enabled: false,
+            mcp_server_port: 38420,
+            mcp_require_write_approval: true,
             theme: "dark".into(),
         };
 
