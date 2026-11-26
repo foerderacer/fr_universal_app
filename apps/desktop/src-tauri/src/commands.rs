@@ -1761,12 +1761,17 @@ fn build_configured_updater(
     Some(built)
 }
 
-fn record_last_update_check(state: &AppState) -> String {
+async fn record_last_update_check(state: &AppState) -> String {
     let now = Utc::now().to_rfc3339();
-    if let Ok(mut guard) = state.config.lock() {
+    let candidate = {
+        let Ok(mut guard) = state.config.lock() else {
+            return now;
+        };
         guard.last_update_check_at = Some(now.clone());
-        let _ = state.config_store.save(&guard);
-    }
+        guard.clone()
+    };
+    let store = state.config_store.clone();
+    let _ = tokio::task::spawn_blocking(move || store.save(&candidate)).await;
     now
 }
 
@@ -1787,20 +1792,15 @@ pub(crate) async fn perform_update_check(
             notes: None,
             release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
             last_checked_at: cfg.last_update_check_at,
-            message: "Development build — signed automatic updates are only active in official GitHub Releases.".into(),
+            message: "Automatic updates aren't enabled in this build (no updater signing key embedded). Check GitHub Releases manually for newer installers.".into(),
         });
     };
     let updater = updater_res?;
     match updater.check().await {
         Ok(Some(update)) => {
-            let checked_at = record_last_update_check(state);
+            let checked_at = record_last_update_check(state).await;
             let skipped = !should_offer_update(&update.version, cfg.skipped_update_version.as_deref());
             let release_url = release_url_for_version(Some(&update.version));
-            state.events.publish(AppEvent::AppUpdateAvailable {
-                version: update.version.clone(),
-                notes: update.body.clone(),
-                timestamp: Utc::now(),
-            });
             Ok(AppUpdateCheckResult {
                 configured: true,
                 available: true,
@@ -1818,7 +1818,7 @@ pub(crate) async fn perform_update_check(
             })
         }
         Ok(None) => {
-            let checked_at = record_last_update_check(state);
+            let checked_at = record_last_update_check(state).await;
             Ok(AppUpdateCheckResult {
                 configured: true,
                 available: false,
@@ -1860,10 +1860,11 @@ pub async fn get_update_safety_status(
 ) -> Result<UpdateSafetyStatus, UserFacingError> {
     let running_workflows = state.workflow_runner.active_run_count();
     let cache = state.cache.clone();
+    let scope = state.active_account_scope();
     let pending_drafts = tokio::task::spawn_blocking(move || {
         cache
             .as_ref()
-            .and_then(|c| c.count_markdown_drafts(None).ok())
+            .and_then(|c| c.count_markdown_drafts(Some(&scope)).ok())
             .unwrap_or(0)
     })
     .await
@@ -1946,10 +1947,11 @@ pub async fn install_app_update(
     if !force {
         let running_workflows = state.workflow_runner.active_run_count();
         let cache = state.cache.clone();
+        let scope = state.active_account_scope();
         let pending_drafts = tokio::task::spawn_blocking(move || {
             cache
                 .as_ref()
-                .and_then(|c| c.count_markdown_drafts(None).ok())
+                .and_then(|c| c.count_markdown_drafts(Some(&scope)).ok())
                 .unwrap_or(0)
         })
         .await
@@ -1989,9 +1991,15 @@ pub async fn install_app_update(
     };
 
     let downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_emit = std::sync::Arc::new(std::sync::Mutex::new((
+        Option::<u8>::None,
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now),
+    )));
     let app_for_progress = app.clone();
-    let events_for_progress = state.events.clone();
     let downloaded_for_cb = downloaded.clone();
+    let last_emit_for_cb = last_emit.clone();
     let app_for_done = app.clone();
 
     update
@@ -2003,18 +2011,31 @@ pub async fn install_app_update(
                 let percent = content_length
                     .and_then(|total| total_so_far.saturating_mul(100).checked_div(total))
                     .map(|pct| pct.min(100) as u8);
-                let payload = UpdateProgressEvent {
-                    downloaded_bytes: total_so_far,
-                    total_bytes: content_length,
-                    percent,
+
+                // Throttle IPC progress events to avoid saturating the WebView on large installers.
+                let should_emit = if let Ok(mut guard) = last_emit_for_cb.lock() {
+                    let pct_changed = percent.is_some() && percent != guard.0;
+                    let interval_elapsed =
+                        guard.1.elapsed() >= std::time::Duration::from_millis(100);
+                    if pct_changed || interval_elapsed {
+                        guard.0 = percent;
+                        guard.1 = std::time::Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 };
-                let _ = app_for_progress.emit("app://update-progress", &payload);
-                events_for_progress.publish(AppEvent::AppUpdateProgress {
-                    downloaded_bytes: total_so_far,
-                    total_bytes: content_length,
-                    percent,
-                    timestamp: Utc::now(),
-                });
+
+                if should_emit {
+                    let payload = UpdateProgressEvent {
+                        downloaded_bytes: total_so_far,
+                        total_bytes: content_length,
+                        percent,
+                    };
+                    let _ = app_for_progress.emit("app://update-progress", &payload);
+                }
             },
             move || {
                 let final_bytes = downloaded.load(std::sync::atomic::Ordering::Relaxed);

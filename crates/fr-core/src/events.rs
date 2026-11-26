@@ -42,19 +42,6 @@ pub enum AppEvent {
         entry_id: String,
         timestamp: DateTime<Utc>,
     },
-    AppUpdateAvailable {
-        version: String,
-        notes: Option<String>,
-        timestamp: DateTime<Utc>,
-    },
-    AppUpdateProgress {
-        #[specta(type = f64)]
-        downloaded_bytes: u64,
-        #[specta(type = Option<f64>)]
-        total_bytes: Option<u64>,
-        percent: Option<u8>,
-        timestamp: DateTime<Utc>,
-    },
 }
 
 /// Lightweight in-process broadcast bus for decoupled module communication.

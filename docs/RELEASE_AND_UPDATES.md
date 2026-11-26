@@ -4,7 +4,7 @@ This guide covers how **FR Universal App** builds cross-platform releases and de
 
 ## 1. Installer Format & Platform Support
 
-- **Windows (primary verified target):** NSIS per-user installer (`-setup.exe`, `installMode: "currentUser"`), installed under `%LOCALAPPDATA%\Programs\`. Updates install silently without UAC elevation and work for non-admin accounts.
+- **Windows (primary verified target):** NSIS per-user installer (`-setup.exe`, `installMode: "currentUser"`), installed under `%LOCALAPPDATA%\Programs\`. Updates install in passive mode (compact progress dialog, no UAC elevation) and work for non-admin accounts.
 - **macOS (best-effort unsigned unless `APPLE_*` secrets are configured):** Universal `.dmg` + `.app.tar.gz`. Without Apple Developer ID notarization, first launch requires right-click → **Open** (or **System Settings → Privacy & Security → Open Anyway**).
 
 ## 2. One-Time Signing Key Setup
@@ -28,15 +28,15 @@ Configure the GitHub repository settings:
 
 ## 3. Cutting a Release
 
-1. Bump `version` in root `Cargo.toml` (Tauri inherits the Cargo workspace version automatically — `tauri.conf.json` intentionally omits `"version"`).
-2. Run `node scripts/release-prep.mjs` on clean `main`.
+1. Bump `version` in root `Cargo.toml` and `apps/desktop/ui/package.json` (Tauri inherits the Cargo workspace version automatically — `tauri.conf.json` intentionally omits `"version"`).
+2. Run `node scripts/release-prep.mjs` on clean `main` (verifies clean working tree and Cargo ↔ `package.json` version parity).
 3. Tag and push `vX.Y.Z`:
    ```bash
    git tag -a v0.2.0 -m "Release v0.2.0"
    git push origin v0.2.0
    ```
 4. Wait for `.github/workflows/release.yml` (`Build & Publish` + `Verify & Merge Updater Manifest`) to turn green.
-5. Open the Draft GitHub Release, write clear non-technical release notes (the app displays this release body directly in the update dialog), and click **Publish release**.
+5. Open the Draft GitHub Release, write clear non-technical release notes, and click **Publish release**. Publishing automatically re-runs `Verify & Merge Updater Manifest` (~10 s) to refresh `latest.json` with your published release notes so the in-app update dialog displays them directly.
 
 ## 4. Key-Rotation ("Bridge Release") Procedure
 

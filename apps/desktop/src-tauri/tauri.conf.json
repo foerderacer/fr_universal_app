@@ -24,6 +24,14 @@
       "csp": "default-src 'self'; img-src 'self' http://127.0.0.1:* asset: https://asset.localhost data: blob:; media-src 'self' http://127.0.0.1:* blob:; connect-src 'self' http://127.0.0.1:*; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis", "dmg", "app"],

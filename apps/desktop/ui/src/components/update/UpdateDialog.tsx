@@ -2,13 +2,14 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
+  CheckCircle2,
   Download,
   ExternalLink,
   Loader2,
   ShieldCheck,
   X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   AppUpdateCheckResult_Serialize,
   UpdateSafetyStatus,
@@ -44,61 +45,93 @@ export function UpdateDialog({
   const [checkingSafety, setCheckingSafety] = useState(true);
   const [confirmOverride, setConfirmOverride] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [installFinishedManualRestart, setInstallFinishedManualRestart] =
+    useState(false);
   const [progress, setProgress] = useState<UpdateProgressEvent | null>(null);
   const [error, setError] = useState<UserFacingError | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  const refreshSafety = useCallback(async () => {
     setCheckingSafety(true);
-    getUpdateSafetyStatus()
-      .then((res) => {
-        if (!cancelled) setSafety(res);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setSafety({
-            safeToRestart: true,
-            pendingDraftsCount: 0,
-            runningWorkflowsCount: 0,
-            warnings: [],
-          });
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setCheckingSafety(false);
+    try {
+      const res = await getUpdateSafetyStatus();
+      setSafety(res);
+    } catch {
+      setSafety({
+        safeToRestart: false,
+        pendingDraftsCount: 0,
+        runningWorkflowsCount: 0,
+        warnings: [
+          "Couldn't verify unsaved drafts automatically. Please make sure your work is saved before installing.",
+        ],
       });
-    return () => {
-      cancelled = true;
-    };
+    } finally {
+      setCheckingSafety(false);
+    }
   }, []);
 
   useEffect(() => {
+    void refreshSafety();
+  }, [refreshSafety]);
+
+  useEffect(() => {
     if (!isTauri()) return;
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<UpdateProgressEvent>("app://update-progress", (event) => {
-      setProgress(event.payload);
-    }).then((fn) => {
-      unlisten = fn;
-    });
+      if (!cancelled) {
+        setProgress(event.payload);
+      }
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
 
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !installing) {
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [installing, onClose]);
+
   const latest = update.latestVersion ?? "latest";
   const needsOverride = Boolean(safety && !safety.safeToRestart);
   const canStartInstall =
-    !checkingSafety && !installing && (!needsOverride || confirmOverride);
+    !checkingSafety &&
+    !installing &&
+    !installFinishedManualRestart &&
+    (!needsOverride || confirmOverride);
 
   async function handleInstall() {
     setError(null);
     setInstalling(true);
-    setProgress({ downloadedBytes: 0, totalBytes: null, percent: 0 });
+    setProgress({ downloadedBytes: 0, totalBytes: null, percent: null });
     try {
       await installAppUpdate(needsOverride && confirmOverride);
-    } catch (err) {
-      setError(toUserFacingError(err));
+      // If the platform does not exit/relaunch automatically (or no newer update was pending),
+      // never leave the modal stuck in an un-closable spinner state.
       setInstalling(false);
+      setInstallFinishedManualRestart(true);
+    } catch (err) {
+      const parsed = toUserFacingError(err);
+      setError(parsed);
+      setInstalling(false);
+      if (parsed.code === "update_unsafe_to_restart") {
+        setConfirmOverride(false);
+        await refreshSafety();
+      }
     }
   }
 
@@ -125,6 +158,7 @@ export function UpdateDialog({
           {!installing && (
             <button
               type="button"
+              aria-label="Close update dialog"
               onClick={onClose}
               className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
@@ -145,6 +179,16 @@ export function UpdateDialog({
                 <ExternalLink className="h-3.5 w-3.5" />
                 Download the latest installer from GitHub Releases
               </button>
+            </div>
+          )}
+
+          {installFinishedManualRestart && (
+            <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3.5 text-emerald-900 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+              <p>
+                <strong>Update ready.</strong> Close and reopen FR Universal App
+                if it does not relaunch automatically.
+              </p>
             </div>
           )}
 
@@ -207,7 +251,7 @@ export function UpdateDialog({
               <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
               <p>
                 FR Universal App will download the signed update, verify its
-                signature, and restart automatically to finish installing.
+                signature, and restart to finish installing.
               </p>
             </div>
           )}
@@ -223,7 +267,7 @@ export function UpdateDialog({
                       : `Downloading update… ${progress.percent}%`
                     : "Downloading update…"}
                 </span>
-                {progress && (
+                {progress && progress.downloadedBytes > 0 && (
                   <span className="font-mono text-[11px]">
                     {formatBytes(progress.downloadedBytes)}
                     {progress.totalBytes
@@ -233,19 +277,24 @@ export function UpdateDialog({
                 )}
               </div>
               <div className="h-2 overflow-hidden rounded-full bg-blue-200/80 dark:bg-blue-900/60">
-                <div
-                  className="h-full rounded-full bg-blue-600 transition-all duration-150"
-                  style={{
-                    width: `${Math.max(4, progress?.percent ?? 15)}%`,
-                  }}
-                />
+                {progress?.percent !== null &&
+                progress?.percent !== undefined ? (
+                  <div
+                    className="h-full rounded-full bg-blue-600 transition-all duration-150"
+                    style={{ width: `${Math.max(2, progress.percent)}%` }}
+                  />
+                ) : (
+                  <div className="h-full w-full animate-pulse rounded-full bg-blue-500/70" />
+                )}
               </div>
             </div>
           )}
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-5 py-3.5 dark:border-slate-800">
-          {!installing && update.latestVersion ? (
+          {!installing &&
+          !installFinishedManualRestart &&
+          update.latestVersion ? (
             <button
               type="button"
               onClick={() => onSkipVersion(update.latestVersion!)}
@@ -264,22 +313,24 @@ export function UpdateDialog({
                 onClick={onClose}
                 className="rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
               >
-                Later
+                {installFinishedManualRestart ? "Close" : "Later"}
               </button>
             )}
-            <button
-              type="button"
-              disabled={!canStartInstall}
-              onClick={() => void handleInstall()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
-            >
-              {installing ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Download className="h-3.5 w-3.5" />
-              )}
-              {installing ? "Updating..." : "Download & Install"}
-            </button>
+            {!installFinishedManualRestart && (
+              <button
+                type="button"
+                disabled={!canStartInstall}
+                onClick={() => void handleInstall()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {installing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                {installing ? "Updating..." : "Download & Install"}
+              </button>
+            )}
           </div>
         </div>
       </div>

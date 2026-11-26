@@ -16,6 +16,9 @@ if (!match) {
   process.exit(1);
 }
 const version = match[1];
+const uiPkg = JSON.parse(
+  fs.readFileSync(path.join(root, "apps/desktop/ui/package.json"), "utf8"),
+);
 const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: root })
   .toString()
   .trim();
@@ -23,9 +26,17 @@ const status = execSync("git status --porcelain", { cwd: root })
   .toString()
   .trim();
 
-console.log(`Workspace version : ${version}`);
+console.log(`Cargo version     : ${version}`);
+console.log(`UI package.json   : ${uiPkg.version}`);
 console.log(`Current branch    : ${branch}`);
 console.log(`Working tree      : ${status ? "DIRTY" : "clean"}`);
+
+if (uiPkg.version !== version) {
+  console.error(
+    `\nVersion mismatch: Cargo.toml (${version}) != apps/desktop/ui/package.json (${uiPkg.version}).`,
+  );
+  process.exit(1);
+}
 
 if (branch !== "main") {
   console.error("\nSwitch to main before cutting a release tag.");

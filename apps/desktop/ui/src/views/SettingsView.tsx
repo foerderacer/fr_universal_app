@@ -332,8 +332,8 @@ export function SettingsView({
             </h2>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
               Current version: <code>v{overview.appVersion}</code> (
-              {overview.platform}). Official releases check GitHub Releases
-              automatically every 6 hours and verify signatures before
+              {overview.platform}). Official signed releases check GitHub
+              Releases automatically every 6 hours and verify signatures before
               installing.
             </p>
             {overview.config.lastUpdateCheckAt && (

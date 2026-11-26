@@ -60,19 +60,27 @@ export function App() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<AppUpdateCheckResult_Serialize>(
       "app://update-available",
       (event) => {
-        if (event.payload.available && !event.payload.skipped) {
+        if (!cancelled && event.payload.available && !event.payload.skipped) {
           setAvailableUpdate(event.payload);
           setUpdateBannerDismissed(false);
         }
       },
-    ).then((fn) => {
-      unlisten = fn;
-    });
+    )
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
@@ -326,6 +334,7 @@ export function App() {
         <main className="flex-1 overflow-y-auto p-6">
           {availableUpdate &&
             availableUpdate.available &&
+            !availableUpdate.skipped &&
             !updateBannerDismissed && (
               <UpdateBanner
                 update={availableUpdate}

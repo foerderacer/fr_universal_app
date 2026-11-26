@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*.*.*"
+  release:
+    types:
+      - published
 
 permissions:
   contents: write
@@ -14,6 +17,7 @@ env:
 jobs:
   publish-release:
     name: Build & Publish (${{ matrix.platform }})
+    if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -50,7 +54,7 @@ jobs:
           fi
 
       - name: Prepare updater config overlay (when signing is configured)
-        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        if: ${{ vars.FR_UPDATER_PUBKEY != '' }}
         shell: bash
         env:
           FR_UPDATER_PUBKEY: ${{ vars.FR_UPDATER_PUBKEY }}
@@ -60,8 +64,10 @@ jobs:
             const path = "apps/desktop/src-tauri/tauri.updater.conf.json";
             const cfg = JSON.parse(fs.readFileSync(path, "utf8"));
             cfg.plugins = cfg.plugins || {};
-            cfg.plugins.updater = cfg.plugins.updater || {};
-            cfg.plugins.updater.pubkey = process.env.FR_UPDATER_PUBKEY.trim();
+            cfg.plugins.updater = {
+              pubkey: process.env.FR_UPDATER_PUBKEY.trim(),
+              windows: { installMode: "passive" },
+            };
             fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
           '
 
@@ -84,8 +90,8 @@ jobs:
       - name: Verify Rust tests before packaging
         run: cargo test --workspace
 
-      # Publishes a draft GitHub Release (D2: human publishes the draft after QA
-      # so releases/latest/download/latest.json only goes live once verified).
+      # Publishes a draft GitHub Release (D2: human writes release notes & publishes
+      # the draft after QA, which triggers finalize-release again to sync notes into latest.json).
       - name: Build & release Tauri installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -108,21 +114,19 @@ jobs:
           releaseBody: "Cross-platform Windows (NSIS per-user setup) and macOS universal (.dmg) release."
           releaseDraft: true
           prerelease: false
-          includeUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
-          args: ${{ matrix.args }} ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config tauri.updater.conf.json' || '' }}
+          includeUpdaterJson: ${{ vars.FR_UPDATER_PUBKEY != '' }}
+          args: ${{ matrix.args }} ${{ vars.FR_UPDATER_PUBKEY != '' && '--config tauri.updater.conf.json' || '' }}
 
   finalize-release:
     name: Verify & Merge Updater Manifest
     needs: publish-release
-    if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    if: ${{ always() && vars.FR_UPDATER_PUBKEY != '' && (needs.publish-release.result == 'success' || (github.event_name == 'release' && needs.publish-release.result == 'skipped')) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Verify latest.json and merge platform signatures
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           node -e '
@@ -132,10 +136,10 @@ jobs:
             const repo = process.env.REPO;
             const version = tag.replace(/^v/, "");
 
-            // Draft releases are not returned by /releases/tags/{tag}; list recent releases instead.
+            // Draft releases are not returned by /releases/tags/{tag}; list releases instead.
             const releasesJson = execFileSync(
               "gh",
-              ["api", `/repos/${repo}/releases?per_page=20`],
+              ["api", `/repos/${repo}/releases?per_page=100`],
               { encoding: "utf8" }
             );
             const releases = JSON.parse(releasesJson);
@@ -148,7 +152,7 @@ jobs:
             const byName = new Map(assets.map((a) => [a.name, a]));
             const sigAssets = assets.filter((a) => a.name.endsWith(".sig"));
             if (sigAssets.length === 0) {
-              throw new Error("No .sig updater signature assets were uploaded to the draft release.");
+              throw new Error("No .sig updater signature assets were uploaded to the release.");
             }
 
             const readAssetText = (asset) =>
@@ -189,7 +193,7 @@ jobs:
             const manifest = {
               version,
               notes: release.body || "",
-              pub_date: new Date().toISOString(),
+              pub_date: release.published_at || new Date().toISOString(),
               platforms,
             };
             fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
@@ -204,17 +208,15 @@ jobs:
               );
             }
             execFileSync(
-              "curl",
+              "gh",
               [
-                "-fsSL",
-                "-X",
+                "api",
+                "--method",
                 "POST",
                 "-H",
-                `Authorization: Bearer ${process.env.GH_TOKEN}`,
-                "-H",
                 "Content-Type: application/json",
-                "--data-binary",
-                "@latest.json",
+                "--input",
+                "latest.json",
                 `https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=latest.json`,
               ],
               { stdio: "inherit" }
