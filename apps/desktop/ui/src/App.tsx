@@ -1,6 +1,9 @@
+import { isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Check, ShieldAlert, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  AppUpdateCheckResult_Serialize,
   PendingWriteApproval,
   UpdateSettingsRequest,
   UserFacingError,
@@ -9,6 +12,8 @@ import type {
 import { ErrorBanner } from "./components/ErrorBanner";
 import { Sidebar, type ActiveNavItem } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
+import { UpdateBanner } from "./components/update/UpdateBanner";
+import { UpdateDialog } from "./components/update/UpdateDialog";
 import { listPendingMcpApprovals, resolveMcpApproval } from "./lib/mcpClient";
 import {
   cancelNextcloudLogin,
@@ -18,6 +23,7 @@ import {
   resetWorkspaceNextcloudUrl,
   saveWorkspaceSettings,
   signOutNextcloud,
+  skipAppUpdate,
   startNextcloudLogin,
   toUserFacingError,
 } from "./lib/workspaceClient";
@@ -46,7 +52,49 @@ export function App() {
   const [pendingMcpApprovals, setPendingMcpApprovals] = useState<
     PendingWriteApproval[]
   >([]);
+  const [availableUpdate, setAvailableUpdate] =
+    useState<AppUpdateCheckResult_Serialize | null>(null);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
   const pollInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<AppUpdateCheckResult_Serialize>(
+      "app://update-available",
+      (event) => {
+        if (!cancelled && event.payload.available && !event.payload.skipped) {
+          setAvailableUpdate(event.payload);
+          setUpdateBannerDismissed(false);
+        }
+      },
+    )
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  async function handleSkipUpdateVersion(version: string) {
+    try {
+      const updated = await skipAppUpdate(version);
+      setOverview(updated);
+      setAvailableUpdate(null);
+      setUpdateDialogOpen(false);
+    } catch (err) {
+      setError(toUserFacingError(err));
+    }
+  }
 
   const refreshPendingApprovals = useCallback(() => {
     void listPendingMcpApprovals()
@@ -284,6 +332,17 @@ export function App() {
         />
 
         <main className="flex-1 overflow-y-auto p-6">
+          {availableUpdate &&
+            availableUpdate.available &&
+            !availableUpdate.skipped &&
+            !updateBannerDismissed && (
+              <UpdateBanner
+                update={availableUpdate}
+                onReviewUpdate={() => setUpdateDialogOpen(true)}
+                onDismissLater={() => setUpdateBannerDismissed(true)}
+                onSkipVersion={(ver) => void handleSkipUpdateVersion(ver)}
+              />
+            )}
           {overview.startupError && (
             <div className="mx-auto mb-4 max-w-4xl">
               <ErrorBanner error={overview.startupError} />
@@ -340,6 +399,11 @@ export function App() {
               onSave={handleSaveSettings}
               onResetUrl={handleResetUrl}
               onSignOut={handleSignOut}
+              onOverviewUpdated={setOverview}
+              onOpenUpdateDialog={(upd) => {
+                setAvailableUpdate(upd);
+                setUpdateDialogOpen(true);
+              }}
               error={error}
               onClearError={() => setError(null)}
             />
@@ -379,6 +443,13 @@ export function App() {
           ) : null}
         </main>
       </div>
+      {updateDialogOpen && availableUpdate && (
+        <UpdateDialog
+          update={availableUpdate}
+          onClose={() => setUpdateDialogOpen(false)}
+          onSkipVersion={(ver) => void handleSkipUpdateVersion(ver)}
+        />
+      )}
     </div>
   );
 }

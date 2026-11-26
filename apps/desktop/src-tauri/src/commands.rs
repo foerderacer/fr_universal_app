@@ -22,7 +22,7 @@ use fr_storage::{CloudPath, Etag};
 use fr_workflows::{WorkflowDefinition, WorkflowRunRecord, WorkflowSyncReport};
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::State;
+use tauri::{Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -1601,108 +1601,244 @@ pub fn set_finance_folder(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: Signed Auto-Updater commands
+// Phase 4: Signed Auto-Updater commands (Plan 08)
 // ---------------------------------------------------------------------------
 
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/foerderacer/fr_universal_app/releases/latest/download/latest.json";
+const DEFAULT_RELEASES_PAGE_URL: &str = "https://github.com/foerderacer/fr_universal_app/releases";
+const UPDATER_CHECK_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AppUpdateCheckResult {
     pub configured: bool,
     pub available: bool,
+    pub skipped: bool,
     pub current_version: String,
     pub latest_version: Option<String>,
     pub notes: Option<String>,
+    pub release_url: String,
+    pub last_checked_at: Option<String>,
     pub message: String,
 }
 
-fn build_configured_updater(
-    app: &tauri::AppHandle,
-) -> Option<Result<tauri_plugin_updater::Updater, UserFacingError>> {
-    let pubkey = option_env!("FR_UPDATER_PUBKEY")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    let endpoint_str = option_env!("FR_UPDATER_ENDPOINT")
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSafetyStatus {
+    pub safe_to_restart: bool,
+    pub pending_drafts_count: u32,
+    pub running_workflows_count: u32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgressEvent {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub percent: Option<u8>,
+}
+
+/// Parses one or more comma-separated updater endpoint URLs, enforcing strict `https://`.
+pub(crate) fn parse_updater_endpoints(
+    raw: Option<&str>,
+) -> Result<Vec<tauri::Url>, UserFacingError> {
+    let source = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_UPDATER_ENDPOINT);
-    let url = match tauri::Url::parse(endpoint_str) {
-        Ok(u) if u.scheme() == "https" => u,
-        Ok(_) => {
-            return Some(Err(UserFacingError {
+    let mut urls = Vec::new();
+    for piece in source.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = tauri::Url::parse(piece).map_err(|err| UserFacingError {
+            code: "updater_invalid_endpoint".into(),
+            title: "Updater configuration error".into(),
+            message: "The built-in update server address is invalid.".into(),
+            recovery_hint: None,
+            technical_details: Some(err.to_string()),
+        })?;
+        if parsed.scheme() != "https" {
+            return Err(UserFacingError {
                 code: "updater_invalid_endpoint".into(),
                 title: "Updater configuration error".into(),
                 message: "The built-in update server address must use HTTPS.".into(),
                 recovery_hint: None,
-                technical_details: Some(endpoint_str.to_owned()),
-            }));
+                technical_details: Some(piece.to_owned()),
+            });
         }
-        Err(err) => {
-            return Some(Err(UserFacingError {
-                code: "updater_invalid_endpoint".into(),
-                title: "Updater configuration error".into(),
-                message: "The built-in update server address is invalid.".into(),
-                recovery_hint: None,
-                technical_details: Some(err.to_string()),
-            }));
-        }
+        urls.push(parsed);
+    }
+    if urls.is_empty() {
+        return Err(UserFacingError {
+            code: "updater_invalid_endpoint".into(),
+            title: "Updater configuration error".into(),
+            message: "No valid HTTPS update endpoints are configured.".into(),
+            recovery_hint: None,
+            technical_details: None,
+        });
+    }
+    Ok(urls)
+}
+
+/// Determines whether `available_version` should be offered to the user given an optional skipped version.
+pub(crate) fn should_offer_update(available_version: &str, skipped_version: Option<&str>) -> bool {
+    let normalized = available_version.trim().trim_start_matches('v');
+    match skipped_version.map(|s| s.trim().trim_start_matches('v')) {
+        Some(skipped) if !skipped.is_empty() => skipped != normalized,
+        _ => true,
+    }
+}
+
+/// Evaluates whether it is safe to run the installer and restart without risking unsaved edits.
+pub(crate) fn evaluate_pre_restart_safety(
+    pending_drafts_count: u32,
+    running_workflows_count: u32,
+) -> UpdateSafetyStatus {
+    let mut warnings = Vec::new();
+    if pending_drafts_count > 0 {
+        warnings.push(format!(
+            "You have {pending_drafts_count} unsaved Markdown draft{} stored locally. Save or discard before restarting.",
+            if pending_drafts_count == 1 { "" } else { "s" }
+        ));
+    }
+    if running_workflows_count > 0 {
+        warnings.push(format!(
+            "{running_workflows_count} automation workflow{} currently running and will be interrupted by a restart.",
+            if running_workflows_count == 1 { " is" } else { "s are" }
+        ));
+    }
+    UpdateSafetyStatus {
+        safe_to_restart: warnings.is_empty(),
+        pending_drafts_count,
+        running_workflows_count,
+        warnings,
+    }
+}
+
+fn release_url_for_version(version: Option<&str>) -> String {
+    match version
+        .map(|v| v.trim().trim_start_matches('v'))
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => format!("{DEFAULT_RELEASES_PAGE_URL}/tag/v{v}"),
+        None => DEFAULT_RELEASES_PAGE_URL.to_owned(),
+    }
+}
+
+fn build_configured_updater(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Option<Result<tauri_plugin_updater::Updater, UserFacingError>> {
+    let pubkey = option_env!("FR_UPDATER_PUBKEY")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let urls = match parse_updater_endpoints(option_env!("FR_UPDATER_ENDPOINT")) {
+        Ok(u) => u,
+        Err(err) => return Some(Err(err)),
     };
+    let cache_for_exit = state.cache.clone();
     let built = app
         .updater_builder()
         .pubkey(pubkey)
-        .endpoints(vec![url])
+        .timeout(std::time::Duration::from_secs(UPDATER_CHECK_TIMEOUT_SECS))
+        .on_before_exit(move || {
+            // Last-chance SQLite WAL checkpoint before Windows NSIS exits the process.
+            if let Some(ref cache) = cache_for_exit {
+                cache.flush_wal();
+            }
+        })
+        .endpoints(urls)
         .and_then(|b| b.build())
         .map_err(|err| UserFacingError {
             code: "updater_init_failed".into(),
             title: "Couldn't initialize updater".into(),
             message: "Automatic update checking isn't available in this build.".into(),
-            recovery_hint: None,
+            recovery_hint: Some(
+                "You can still download new versions manually from GitHub Releases.".into(),
+            ),
             technical_details: Some(err.to_string()),
         });
     Some(built)
 }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn check_for_app_update(
-    app: tauri::AppHandle,
+async fn record_last_update_check(state: &AppState) -> String {
+    let now = Utc::now().to_rfc3339();
+    let candidate = {
+        let Ok(mut guard) = state.config.lock() else {
+            return now;
+        };
+        guard.last_update_check_at = Some(now.clone());
+        guard.clone()
+    };
+    let store = state.config_store.clone();
+    let _ = tokio::task::spawn_blocking(move || store.save(&candidate)).await;
+    now
+}
+
+/// Shared update-check implementation called by both manual Settings checks and the 6h background loop.
+pub(crate) async fn perform_update_check(
+    app: &tauri::AppHandle,
+    state: &AppState,
 ) -> Result<AppUpdateCheckResult, UserFacingError> {
     let current_version = env!("CARGO_PKG_VERSION").to_owned();
-    let Some(updater_res) = build_configured_updater(&app) else {
+    let cfg = state.current_config();
+    let Some(updater_res) = build_configured_updater(app, state) else {
         return Ok(AppUpdateCheckResult {
             configured: false,
             available: false,
+            skipped: false,
             current_version,
             latest_version: None,
             notes: None,
-            message: "Automatic updates aren't enabled in this build (no updater signing key was embedded at build time). Check GitHub Releases manually for newer installers.".into(),
+            release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
+            last_checked_at: cfg.last_update_check_at,
+            message: "Automatic updates aren't enabled in this build (no updater signing key embedded). Check GitHub Releases manually for newer installers.".into(),
         });
     };
     let updater = updater_res?;
     match updater.check().await {
-        Ok(Some(update)) => Ok(AppUpdateCheckResult {
-            configured: true,
-            available: true,
-            current_version,
-            latest_version: Some(update.version.clone()),
-            notes: update.body.clone(),
-            message: format!("Version {} is ready to install.", update.version),
-        }),
-        Ok(None) => Ok(AppUpdateCheckResult {
-            configured: true,
-            available: false,
-            current_version: current_version.clone(),
-            latest_version: Some(current_version),
-            notes: None,
-            message: "You're already running the latest version of FR Universal App.".into(),
-        }),
+        Ok(Some(update)) => {
+            let checked_at = record_last_update_check(state).await;
+            let skipped = !should_offer_update(&update.version, cfg.skipped_update_version.as_deref());
+            let release_url = release_url_for_version(Some(&update.version));
+            Ok(AppUpdateCheckResult {
+                configured: true,
+                available: true,
+                skipped,
+                current_version,
+                latest_version: Some(update.version.clone()),
+                notes: update.body.clone(),
+                release_url,
+                last_checked_at: Some(checked_at),
+                message: if skipped {
+                    format!("Version {} is available (currently skipped).", update.version)
+                } else {
+                    format!("A new version ({}) of FR Universal App is ready.", update.version)
+                },
+            })
+        }
+        Ok(None) => {
+            let checked_at = record_last_update_check(state).await;
+            Ok(AppUpdateCheckResult {
+                configured: true,
+                available: false,
+                skipped: false,
+                current_version: current_version.clone(),
+                latest_version: Some(current_version),
+                notes: None,
+                release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
+                last_checked_at: Some(checked_at),
+                message: "You're running the latest version of FR Universal App.".into(),
+            })
+        }
         Err(err) => Err(UserFacingError {
             code: "updater_check_failed".into(),
             title: "Couldn't check for updates".into(),
-            message: "We couldn't reach the update server right now.".into(),
-            recovery_hint: Some("Check your internet connection and try again later.".into()),
+            message: "We couldn't reach GitHub Releases right now.".into(),
+            recovery_hint: Some(
+                "Check your internet connection, try again later, or download the latest installer from GitHub Releases."
+                    .into(),
+            ),
             technical_details: Some(err.to_string()),
         }),
     }
@@ -1710,30 +1846,209 @@ pub async fn check_for_app_update(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn install_app_update(app: tauri::AppHandle) -> Result<(), UserFacingError> {
-    let Some(updater_res) = build_configured_updater(&app) else {
+pub async fn check_for_app_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppUpdateCheckResult, UserFacingError> {
+    perform_update_check(&app, &state).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_update_safety_status(
+    state: State<'_, AppState>,
+) -> Result<UpdateSafetyStatus, UserFacingError> {
+    let running_workflows = state.workflow_runner.active_run_count();
+    let cache = state.cache.clone();
+    let scope = state.active_account_scope();
+    let pending_drafts = tokio::task::spawn_blocking(move || {
+        cache
+            .as_ref()
+            .and_then(|c| c.count_markdown_drafts(Some(&scope)).ok())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+    Ok(evaluate_pre_restart_safety(
+        pending_drafts,
+        running_workflows,
+    ))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn skip_app_update(
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<WorkspaceOverview, UserFacingError> {
+    let cleaned = version.trim().trim_start_matches('v').to_owned();
+    if cleaned.is_empty() || cleaned.len() > 64 {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "Invalid version to skip.".into(),
+        )));
+    }
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while saving skipped update version"))?;
+        let mut candidate = guard.clone();
+        candidate.skipped_update_version = Some(cleaned);
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+        *guard = candidate;
+    }
+    Ok(build_overview(&state))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn clear_skipped_app_update(
+    state: State<'_, AppState>,
+) -> Result<WorkspaceOverview, UserFacingError> {
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while clearing skipped update version"))?;
+        let mut candidate = guard.clone();
+        candidate.skipped_update_version = None;
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+        *guard = candidate;
+    }
+    Ok(build_overview(&state))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn install_app_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    force: bool,
+) -> Result<(), UserFacingError> {
+    let Some(updater_res) = build_configured_updater(&app, &state) else {
         return Err(UserFacingError {
             code: "updater_not_configured".into(),
             title: "Auto-updates not enabled in this build".into(),
-            message: "Install official releases from GitHub Releases to receive signed one-click updates.".into(),
+            message: "Download official releases from GitHub Releases to receive signed updates."
+                .into(),
             recovery_hint: None,
             technical_details: None,
         });
     };
+
+    // Pre-restart safety gate MUST run BEFORE download_and_install because on Windows
+    // the NSIS installer automatically terminates the running process during install (H7).
+    if !force {
+        let running_workflows = state.workflow_runner.active_run_count();
+        let cache = state.cache.clone();
+        let scope = state.active_account_scope();
+        let pending_drafts = tokio::task::spawn_blocking(move || {
+            cache
+                .as_ref()
+                .and_then(|c| c.count_markdown_drafts(Some(&scope)).ok())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
+        let safety = evaluate_pre_restart_safety(pending_drafts, running_workflows);
+        if !safety.safe_to_restart {
+            return Err(UserFacingError {
+                code: "update_unsafe_to_restart".into(),
+                title: "Save your work before installing".into(),
+                message: safety.warnings.join(" "),
+                recovery_hint: Some(
+                    "Save your open drafts or wait for active workflows to finish, or confirm you want to continue anyway."
+                        .into(),
+                ),
+                technical_details: None,
+            });
+        }
+    }
+
+    if let Some(ref cache) = state.cache {
+        let cache_clone = cache.clone();
+        let _ = tokio::task::spawn_blocking(move || cache_clone.flush_wal()).await;
+    }
+
     let updater = updater_res?;
     let Some(update) = updater.check().await.map_err(|err| UserFacingError {
         code: "updater_check_failed".into(),
         title: "Couldn't download update".into(),
-        message: "We couldn't check for the latest release right now.".into(),
-        recovery_hint: Some("Try again in a moment.".into()),
+        message: "We couldn't reach GitHub Releases right now.".into(),
+        recovery_hint: Some(
+            "Try again in a moment, or download the latest installer from GitHub Releases.".into(),
+        ),
         technical_details: Some(err.to_string()),
     })?
     else {
         return Ok(());
     };
 
+    let downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_emit = std::sync::Arc::new(std::sync::Mutex::new((
+        Option::<u8>::None,
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now),
+    )));
+    let app_for_progress = app.clone();
+    let downloaded_for_cb = downloaded.clone();
+    let last_emit_for_cb = last_emit.clone();
+    let app_for_done = app.clone();
+
     update
-        .download_and_install(|_, _| {}, || {})
+        .download_and_install(
+            move |chunk_len, content_length| {
+                let prev = downloaded_for_cb
+                    .fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed);
+                let total_so_far = prev.saturating_add(chunk_len as u64);
+                let percent = content_length
+                    .and_then(|total| total_so_far.saturating_mul(100).checked_div(total))
+                    .map(|pct| pct.min(100) as u8);
+
+                // Throttle IPC progress events to avoid saturating the WebView on large installers.
+                let should_emit = if let Ok(mut guard) = last_emit_for_cb.lock() {
+                    let pct_changed = percent.is_some() && percent != guard.0;
+                    let interval_elapsed =
+                        guard.1.elapsed() >= std::time::Duration::from_millis(100);
+                    if pct_changed || interval_elapsed {
+                        guard.0 = percent;
+                        guard.1 = std::time::Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if should_emit {
+                    let payload = UpdateProgressEvent {
+                        downloaded_bytes: total_so_far,
+                        total_bytes: content_length,
+                        percent,
+                    };
+                    let _ = app_for_progress.emit("app://update-progress", &payload);
+                }
+            },
+            move || {
+                let final_bytes = downloaded.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = app_for_done.emit(
+                    "app://update-progress",
+                    &UpdateProgressEvent {
+                        downloaded_bytes: final_bytes,
+                        total_bytes: Some(final_bytes),
+                        percent: Some(100),
+                    },
+                );
+            },
+        )
         .await
         .map_err(|err| UserFacingError {
             code: "updater_install_failed".into(),
@@ -1777,5 +2092,68 @@ mod tests {
         assert!(is_dangerous_executable_name("run.command"));
         assert!(!is_dangerous_executable_name("bracket.sldprt"));
         assert!(!is_dangerous_executable_name("drawing.pdf"));
+    }
+
+    #[test]
+    fn updater_endpoints_enforce_https_and_support_fallbacks() {
+        let default_urls = parse_updater_endpoints(None).unwrap();
+        assert_eq!(default_urls.len(), 1);
+        assert_eq!(default_urls[0].scheme(), "https");
+
+        let multi = parse_updater_endpoints(Some(
+            "https://github.com/a/b/latest.json, https://mirror.example.com/latest.json",
+        ))
+        .unwrap();
+        assert_eq!(multi.len(), 2);
+
+        assert!(parse_updater_endpoints(Some("http://insecure.example.com/latest.json")).is_err());
+        assert!(parse_updater_endpoints(Some("file:///tmp/latest.json")).is_err());
+    }
+
+    #[test]
+    fn skip_version_logic_suppresses_matching_and_offers_newer() {
+        assert!(should_offer_update("0.2.0", None));
+        assert!(!should_offer_update("0.2.0", Some("0.2.0")));
+        assert!(!should_offer_update("v0.2.0", Some("0.2.0")));
+        assert!(should_offer_update("0.2.1", Some("0.2.0")));
+    }
+
+    #[test]
+    fn pre_restart_safety_gate_flags_drafts_and_active_workflows() {
+        let clean = evaluate_pre_restart_safety(0, 0);
+        assert!(clean.safe_to_restart);
+        assert!(clean.warnings.is_empty());
+
+        let dirty = evaluate_pre_restart_safety(2, 1);
+        assert!(!dirty.safe_to_restart);
+        assert_eq!(dirty.warnings.len(), 2);
+    }
+
+    #[test]
+    fn parses_expected_latest_json_manifest_shape() {
+        let sample = r#"{
+            "version": "0.2.0",
+            "notes": "Bug fixes and improvements",
+            "pub_date": "2026-11-26T10:00:00Z",
+            "platforms": {
+                "windows-x86_64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6...",
+                    "url": "https://github.com/foerderacer/fr_universal_app/releases/download/v0.2.0/FR.Universal.App_0.2.0_x64-setup.exe"
+                },
+                "darwin-aarch64": {
+                    "signature": "dW50cnVzdGVkIGNvbW1lbnQ6...",
+                    "url": "https://github.com/foerderacer/fr_universal_app/releases/download/v0.2.0/FR.Universal.App_universal.app.tar.gz"
+                }
+            }
+        }"#;
+        let parsed: serde_json::Value = serde_json::from_str(sample).unwrap();
+        assert_eq!(parsed["version"].as_str(), Some("0.2.0"));
+        assert!(
+            parsed["platforms"]["windows-x86_64"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("-setup.exe")
+        );
+        assert!(parsed["platforms"]["darwin-aarch64"]["signature"].is_string());
     }
 }

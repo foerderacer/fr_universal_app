@@ -46,6 +46,12 @@ pub struct AppConfig {
     /// Nextcloud folder scoped for the Finance module (default `"/Finance"`).
     #[serde(default = "default_finance_folder")]
     pub finance_folder: String,
+    /// Optional app version string that the user chose to skip in update prompts.
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
+    /// RFC 3339 timestamp of the last completed update check.
+    #[serde(default)]
+    pub last_update_check_at: Option<String>,
     /// Preferred UI color theme (`"system"`, `"light"`, or `"dark"`).
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -82,6 +88,8 @@ impl Default for AppConfig {
             mcp_server_port: default_mcp_server_port(),
             mcp_require_write_approval: default_mcp_require_write_approval(),
             finance_folder: default_finance_folder(),
+            skipped_update_version: None,
+            last_update_check_at: None,
             theme: default_theme(),
         }
     }
@@ -180,6 +188,8 @@ mod tests {
             mcp_server_port: 38420,
             mcp_require_write_approval: true,
             finance_folder: "/Finance".into(),
+            skipped_update_version: Some("0.2.0".into()),
+            last_update_check_at: Some("2026-11-26T10:00:00Z".into()),
             theme: "dark".into(),
         };
 

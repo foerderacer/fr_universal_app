@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use fr_preview::MediaProxyServer;
 use specta_typescript::Typescript;
+#[cfg(not(debug_assertions))]
+use tauri::Emitter;
 use tauri::Manager;
 use tauri_specta::{Builder, collect_commands};
 use tracing_subscriber::EnvFilter;
@@ -66,6 +68,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::export_finance_csv,
         commands::set_finance_folder,
         commands::check_for_app_update,
+        commands::get_update_safety_status,
+        commands::skip_app_update,
+        commands::clear_skipped_app_update,
         commands::install_app_update,
     ])
 }
@@ -160,6 +165,35 @@ pub fn run() {
                     }
                 }
             });
+
+            // Background signed auto-update check loop (D4: ~10s startup delay, then every 6 hours;
+            // disabled in debug builds so `cargo tauri dev` never hits GitHub Releases automatically).
+            #[cfg(not(debug_assertions))]
+            {
+                let upd_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        ticker.tick().await;
+                        let state = upd_handle.state::<AppState>();
+                        match commands::perform_update_check(&upd_handle, &state).await {
+                            Ok(res) if res.configured && res.available && !res.skipped => {
+                                let _ = upd_handle.emit("app://update-available", &res);
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::debug!(
+                                    "Silent background update check failed: {}",
+                                    err.technical_details.unwrap_or(err.message)
+                                );
+                            }
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

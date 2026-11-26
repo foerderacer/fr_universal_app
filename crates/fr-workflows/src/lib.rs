@@ -514,6 +514,15 @@ impl WorkflowRunner {
         &self.store
     }
 
+    /// Returns the number of currently executing workflows (used by the pre-restart update gate).
+    pub fn active_run_count(&self) -> u32 {
+        let guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        u32::try_from(guard.len()).unwrap_or(u32::MAX)
+    }
+
     fn acquire_run_slot(&self, workflow_id: &str) -> Result<RunSlotGuard> {
         let mut guard = self
             .in_flight

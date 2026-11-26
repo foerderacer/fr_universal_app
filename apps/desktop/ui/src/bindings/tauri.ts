@@ -60,7 +60,10 @@ export const commands = {
 	exportFinanceCsv: (options?: InvokeOptions) => __TAURI_INVOKE<string>("export_finance_csv", undefined, options),
 	setFinanceFolder: (folderPath: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("set_finance_folder", { folderPath }, options),
 	checkForAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<AppUpdateCheckResult_Serialize>("check_for_app_update", undefined, options),
-	installAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<null>("install_app_update", undefined, options),
+	getUpdateSafetyStatus: (options?: InvokeOptions) => __TAURI_INVOKE<UpdateSafetyStatus>("get_update_safety_status", undefined, options),
+	skipAppUpdate: (version: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("skip_app_update", { version }, options),
+	clearSkippedAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("clear_skipped_app_update", undefined, options),
+	installAppUpdate: (force: boolean, options?: InvokeOptions) => __TAURI_INVOKE<null>("install_app_update", { force }, options),
 };
 
 /* Types */
@@ -85,6 +88,10 @@ export type AppConfig_Deserialize = {
 	mcpRequireWriteApproval?: boolean,
 	/**  Nextcloud folder scoped for the Finance module (default `"/Finance"`). */
 	financeFolder?: string,
+	/**  Optional app version string that the user chose to skip in update prompts. */
+	skippedUpdateVersion?: string | null,
+	/**  RFC 3339 timestamp of the last completed update check. */
+	lastUpdateCheckAt?: string | null,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme?: string,
 };
@@ -107,6 +114,10 @@ export type AppConfig_Serialize = {
 	mcpRequireWriteApproval: boolean,
 	/**  Nextcloud folder scoped for the Finance module (default `"/Finance"`). */
 	financeFolder: string,
+	/**  Optional app version string that the user chose to skip in update prompts. */
+	skippedUpdateVersion: string | null,
+	/**  RFC 3339 timestamp of the last completed update check. */
+	lastUpdateCheckAt: string | null,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme: string,
 };
@@ -116,18 +127,24 @@ export type AppUpdateCheckResult = AppUpdateCheckResult_Serialize | AppUpdateChe
 export type AppUpdateCheckResult_Deserialize = {
 	configured: boolean,
 	available: boolean,
+	skipped: boolean,
 	currentVersion: string,
 	latestVersion?: string | null,
 	notes?: string | null,
+	releaseUrl: string,
+	lastCheckedAt?: string | null,
 	message: string,
 };
 
 export type AppUpdateCheckResult_Serialize = {
 	configured: boolean,
 	available: boolean,
+	skipped: boolean,
 	currentVersion: string,
 	latestVersion: string | null,
 	notes: string | null,
+	releaseUrl: string,
+	lastCheckedAt: string | null,
 	message: string,
 };
 
@@ -557,6 +574,13 @@ export type SolidWorksPreview_Serialize = {
 	thumbnailDataUrl: string | null,
 	metadata: SolidWorksMetadata_Serialize,
 	streamCount: number,
+};
+
+export type UpdateSafetyStatus = {
+	safeToRestart: boolean,
+	pendingDraftsCount: number,
+	runningWorkflowsCount: number,
+	warnings: string[],
 };
 
 /**  Partial update payload submitted from the Settings screen. */
