@@ -72,6 +72,23 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::skip_app_update,
         commands::clear_skipped_app_update,
         commands::install_app_update,
+        commands::get_talk_capabilities,
+        commands::list_talk_rooms,
+        commands::create_talk_room,
+        commands::toggle_talk_room_favorite,
+        commands::leave_talk_room,
+        commands::get_talk_messages,
+        commands::send_talk_message,
+        commands::edit_talk_message,
+        commands::delete_talk_message,
+        commands::mark_talk_read,
+        commands::toggle_talk_reaction,
+        commands::share_talk_file_reference,
+        commands::upload_talk_attachment_base64,
+        commands::get_talk_draft,
+        commands::save_talk_draft,
+        commands::start_talk_polling,
+        commands::stop_talk_polling,
     ])
 }
 

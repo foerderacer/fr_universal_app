@@ -32,6 +32,9 @@ pub enum FrError {
     #[error("authentication required: {0}")]
     AuthRequired(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("network error: {0}")]
     Network(String),
 
@@ -116,6 +119,15 @@ impl From<FrError> for UserFacingError {
                     "Click Sign in with Nextcloud in the sidebar or Settings.".into(),
                 ),
                 technical_details: Some(err.to_string()),
+            },
+            FrError::PermissionDenied(msg) => Self {
+                code: "permission_denied".into(),
+                title: "Permission required".into(),
+                message: msg.clone(),
+                recovery_hint: Some(
+                    "Contact your Nextcloud workspace administrator if you need access.".into(),
+                ),
+                technical_details: None,
             },
             FrError::Network(_) => Self {
                 code: "network".into(),

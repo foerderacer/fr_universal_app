@@ -70,6 +70,16 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         capabilities: ["storage", "preview", "mcpServerTools"],
       },
       {
+        id: "talk",
+        name: "Talk",
+        description:
+          "Team group chat via Nextcloud Talk with zero-copy cloud file references.",
+        icon: "message",
+        version: "0.1.0",
+        status: "active",
+        capabilities: ["chat", "storage", "preview", "mcpServerTools"],
+      },
+      {
         id: "mcp",
         name: "MCP / AI",
         description:
@@ -212,7 +222,7 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult_Serializ
       releaseUrl: GITHUB_RELEASES_URL,
       lastCheckedAt: null,
       message:
-        "Development build — signed automatic updates are only active in official GitHub Releases.",
+        "Automatic updates aren't enabled in this build (no updater signing key embedded). Check GitHub Releases manually for newer installers.",
     };
   }
   return commands.checkForAppUpdate();

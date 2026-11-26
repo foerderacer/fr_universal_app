@@ -9,12 +9,14 @@ use fr_mcp::{
 use fr_mod_automation::{AutomationModule, register_automation_tools};
 use fr_mod_files::FilesModule;
 use fr_mod_finance::{FinanceLedger, FinanceModule, register_finance_tools};
+use fr_mod_talk::{TalkModule, register_talk_tools};
 use fr_nextcloud::{
     CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
     NextcloudConnectionStatus, NextcloudCredentials, UserAccountInfo, build_http_client,
 };
 use fr_preview::MediaProxyServer;
 use fr_storage::{CacheStore, CachedStorage, StorageBackend};
+use fr_talk::{TalkCacheStore, TalkCapabilities, TalkClient};
 use fr_workflows::{WorkflowRunner, WorkflowStore};
 
 /// Shared application state managed by Tauri.
@@ -39,6 +41,9 @@ pub struct AppState {
     pub mcp_client: Arc<McpClientManager>,
     pub workflow_runner: Arc<WorkflowRunner>,
     pub finance_ledger: Arc<FinanceLedger>,
+    pub talk_cache: Arc<TalkCacheStore>,
+    pub talk_capabilities: Mutex<Option<TalkCapabilities>>,
+    pub talk_poll_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
@@ -88,6 +93,7 @@ impl AppState {
 
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
+        modules.register(TalkModule);
         modules.register(FinanceModule);
         modules.register(AutomationModule);
         modules.register(McpModule);
@@ -191,6 +197,34 @@ impl AppState {
             }),
         );
 
+        let talk_db = TalkCacheStore::default_db_path()
+            .unwrap_or_else(|_| std::env::temp_dir().join("fr-universal-app-talk.sqlite"));
+        let talk_cache = Arc::new(match TalkCacheStore::open(&talk_db) {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::warn!("Falling back to temp Talk cache: {err}");
+                if startup_error.is_none() {
+                    startup_error = Some(UserFacingError {
+                        code: "talk_db_load_error".into(),
+                        title: "Talk chat cache couldn't be opened".into(),
+                        message: "We started with a temporary chat cache without overwriting your existing database file.".into(),
+                        recovery_hint: Some("Check permissions or disk space in your app data folder, then restart FR Universal App.".into()),
+                        technical_details: Some(format!("{err} (path: {})", talk_db.display())),
+                    });
+                }
+                TalkCacheStore::open(
+                    std::env::temp_dir().join("fr-universal-app-talk-fallback.sqlite"),
+                )
+                .expect("fallback Talk cache")
+            }
+        });
+        let creds_for_talk = active_credentials.clone();
+        register_talk_tools(
+            &mcp_registry,
+            http_client.clone(),
+            Arc::new(move || creds_for_talk.lock().ok().and_then(|g| g.clone())),
+        );
+
         let state = Self {
             config_store,
             config: Mutex::new(config.clone()),
@@ -211,6 +245,9 @@ impl AppState {
             mcp_client,
             workflow_runner,
             finance_ledger,
+            talk_cache,
+            talk_capabilities: Mutex::new(None),
+            talk_poll_handle: Mutex::new(None),
             modules,
             events,
         };
@@ -263,23 +300,53 @@ impl AppState {
             return Ok(format!("{}|{}", creds.server_url, creds.login_name));
         }
         Err(fr_core::FrError::AuthRequired(
-            "Please sign in to Nextcloud to access your account's Finance ledger.".into(),
+            "Please sign in to Nextcloud to continue.".into(),
         ))
     }
 
-    pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
-        let switched_account = self
+    pub fn talk_client(&self) -> fr_core::Result<TalkClient> {
+        let creds = self
             .active_credentials
             .lock()
             .ok()
-            .and_then(|guard| {
-                guard.as_ref().map(|prev| {
-                    prev.server_url != creds.server_url || prev.login_name != creds.login_name
-                })
+            .and_then(|g| g.clone())
+            .ok_or_else(|| {
+                fr_core::FrError::AuthRequired("Please sign in to Nextcloud to use Talk.".into())
+            })?;
+        Ok(TalkClient::new(self.http_client.clone(), creds))
+    }
+
+    pub fn stop_talk_polling(&self) {
+        if let Ok(mut guard) = self.talk_poll_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
+        }
+    }
+
+    pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
+        let prev_account_scope = self.active_credentials.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|prev| {
+                if prev.server_url != creds.server_url || prev.login_name != creds.login_name {
+                    Some(format!(
+                        "{}|{}",
+                        prev.server_url.trim_end_matches('/'),
+                        prev.login_name
+                    ))
+                } else {
+                    None
+                }
             })
-            .unwrap_or(false);
-        if switched_account && let Some(ref cache) = self.cache {
-            let _ = cache.clear_cached_data();
+        });
+        if let Some(prev_scope) = prev_account_scope {
+            self.stop_talk_polling();
+            if let Ok(mut guard) = self.talk_capabilities.lock() {
+                *guard = None;
+            }
+            let _ = self.talk_cache.clear_account_cache(&prev_scope);
+            if let Some(ref cache) = self.cache {
+                let _ = cache.clear_cached_data();
+            }
         }
 
         let nc = NextcloudBackend::with_client(self.http_client.clone(), creds.clone())?;
@@ -298,6 +365,14 @@ impl AppState {
     }
 
     pub fn clear_active_session(&self, wipe_cache: bool) {
+        self.stop_talk_polling();
+        if let Ok(mut guard) = self.talk_capabilities.lock() {
+            *guard = None;
+        }
+        let prev_scope = self.active_credentials.lock().ok().and_then(|g| {
+            g.as_ref()
+                .map(|c| format!("{}|{}", c.server_url, c.login_name))
+        });
         if let Ok(mut guard) = self.storage.write() {
             *guard = None;
         }
@@ -310,8 +385,13 @@ impl AppState {
         if let Ok(mut guard) = self.account_info.lock() {
             *guard = None;
         }
-        if wipe_cache && let Some(ref cache) = self.cache {
-            let _ = cache.clear_cached_data();
+        if wipe_cache {
+            if let Some(ref cache) = self.cache {
+                let _ = cache.clear_cached_data();
+            }
+            if let Some(scope) = prev_scope {
+                let _ = self.talk_cache.clear_account_cache(&scope);
+            }
         }
     }
 

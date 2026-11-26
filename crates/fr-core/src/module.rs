@@ -10,6 +10,7 @@ pub enum ModuleCapability {
     McpServerTools,
     McpClient,
     Workflows,
+    Chat,
 }
 
 /// Lifecycle state shown in the Workspace Shell sidebar.

@@ -11,7 +11,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   FileItemView_Serialize,
   FilePreviewPayload_Serialize,
@@ -32,6 +32,7 @@ interface FilePreviewPaneProps {
   onClose: () => void;
   onRefreshFolder: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onPreviewError?: (error: UserFacingError) => void;
 }
 
 export function FilePreviewPane({
@@ -41,6 +42,7 @@ export function FilePreviewPane({
   onClose,
   onRefreshFolder,
   onDirtyChange,
+  onPreviewError,
 }: FilePreviewPaneProps) {
   const [payload, setPayload] = useState<FilePreviewPayload_Serialize | null>(
     null,
@@ -55,6 +57,8 @@ export function FilePreviewPane({
   const [imageRotation, setImageRotation] = useState(0);
 
   const isMarkdown = item.previewKind === "markdown";
+  const onPreviewErrorRef = useRef(onPreviewError);
+  onPreviewErrorRef.current = onPreviewError;
 
   useEffect(() => {
     setError(null);
@@ -79,7 +83,11 @@ export function FilePreviewPane({
         if (!cancelled) setPayload(res);
       })
       .catch((err) => {
-        if (!cancelled) setError(toUserFacingError(err));
+        if (!cancelled) {
+          const uf = toUserFacingError(err);
+          setError(uf);
+          onPreviewErrorRef.current?.(uf);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
