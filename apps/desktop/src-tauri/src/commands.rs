@@ -19,7 +19,7 @@ use fr_nextcloud::{
     initiate_login_flow, normalize_server_url, poll_login_flow,
 };
 use fr_storage::{CloudPath, Etag};
-use fr_workflows::{WorkflowDefinition, WorkflowRunRecord};
+use fr_workflows::{WorkflowDefinition, WorkflowRunRecord, WorkflowSyncReport};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
@@ -1437,7 +1437,7 @@ pub async fn list_workflow_runs(
 #[specta::specta]
 pub async fn sync_workflows_from_nextcloud(
     state: State<'_, AppState>,
-) -> Result<Vec<WorkflowDefinition>, UserFacingError> {
+) -> Result<WorkflowSyncReport, UserFacingError> {
     let service = require_files_service(&state)?;
     state
         .workflow_runner
@@ -1470,7 +1470,21 @@ pub async fn push_workflow_to_nextcloud(
         .workflow_runner
         .push_to_nextcloud(&workflow_id, service.storage().as_ref())
         .await
-        .map_err(UserFacingError::from)?;
+        .map_err(|err| match err {
+            FrError::Conflict { .. } => UserFacingError {
+                code: "workflow_conflict".into(),
+                title: "A teammate updated this workflow on Nextcloud".into(),
+                message:
+                    "Another version of this workflow already exists in /_FR_App/workflows/."
+                        .into(),
+                recovery_hint: Some(
+                    "Click Sync from Nextcloud first to pull the latest version before sharing changes."
+                        .into(),
+                ),
+                technical_details: Some(err.to_string()),
+            },
+            other => UserFacingError::from(other),
+        })?;
     Ok(path.as_str().to_owned())
 }
 
@@ -1480,7 +1494,9 @@ pub async fn list_finance_entries(
     state: State<'_, AppState>,
 ) -> Result<Vec<FinanceEntry>, UserFacingError> {
     let ledger = state.finance_ledger.clone();
-    let scope = state.active_account_scope();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
     tokio::task::spawn_blocking(move || ledger.list_entries(&scope))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
@@ -1494,7 +1510,9 @@ pub async fn upsert_finance_entry(
     input: UpsertFinanceEntryRequest,
 ) -> Result<FinanceEntry, UserFacingError> {
     let ledger = state.finance_ledger.clone();
-    let scope = state.active_account_scope();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
     let entry = tokio::task::spawn_blocking(move || ledger.upsert_entry(&scope, input))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
@@ -1513,7 +1531,9 @@ pub async fn delete_finance_entry(
     entry_id: String,
 ) -> Result<(), UserFacingError> {
     let ledger = state.finance_ledger.clone();
-    let scope = state.active_account_scope();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
     let id_clone = entry_id.clone();
     tokio::task::spawn_blocking(move || ledger.delete_entry(&scope, &id_clone))
         .await
@@ -1532,7 +1552,9 @@ pub async fn get_finance_summary(
     state: State<'_, AppState>,
 ) -> Result<Vec<FinanceCurrencySummary>, UserFacingError> {
     let ledger = state.finance_ledger.clone();
-    let scope = state.active_account_scope();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
     tokio::task::spawn_blocking(move || ledger.summarize(&scope))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
@@ -1543,7 +1565,9 @@ pub async fn get_finance_summary(
 #[specta::specta]
 pub async fn export_finance_csv(state: State<'_, AppState>) -> Result<String, UserFacingError> {
     let ledger = state.finance_ledger.clone();
-    let scope = state.active_account_scope();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
     tokio::task::spawn_blocking(move || ledger.export_csv(&scope))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
@@ -1605,7 +1629,16 @@ fn build_configured_updater(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_UPDATER_ENDPOINT);
     let url = match tauri::Url::parse(endpoint_str) {
-        Ok(u) => u,
+        Ok(u) if u.scheme() == "https" => u,
+        Ok(_) => {
+            return Some(Err(UserFacingError {
+                code: "updater_invalid_endpoint".into(),
+                title: "Updater configuration error".into(),
+                message: "The built-in update server address must use HTTPS.".into(),
+                recovery_hint: None,
+                technical_details: Some(endpoint_str.to_owned()),
+            }));
+        }
         Err(err) => {
             return Some(Err(UserFacingError {
                 code: "updater_invalid_endpoint".into(),
@@ -1644,7 +1677,7 @@ pub async fn check_for_app_update(
             current_version,
             latest_version: None,
             notes: None,
-            message: "Signed auto-updates are active in official GitHub Releases. Local development builds check manually.".into(),
+            message: "Automatic updates aren't enabled in this build (no updater signing key was embedded at build time). Check GitHub Releases manually for newer installers.".into(),
         });
     };
     let updater = updater_res?;

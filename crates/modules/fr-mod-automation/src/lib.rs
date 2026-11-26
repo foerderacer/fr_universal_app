@@ -106,7 +106,25 @@ impl McpToolHandler for AutomationRunTool {
             .get("workflow_id")
             .and_then(Value::as_str)
             .unwrap_or("?");
-        format!("Run automation workflow '{id}'")
+        if let Ok(Some(wf)) = self.0.store().get_workflow(id) {
+            let preview_steps: Vec<String> =
+                wf.steps.iter().take(3).map(|s| s.short_summary()).collect();
+            let suffix = if wf.steps.len() > 3 {
+                format!(", +{} more", wf.steps.len() - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "Run workflow '{}' ({id}, {} step{}: {}{})",
+                wf.name,
+                wf.steps.len(),
+                if wf.steps.len() == 1 { "" } else { "s" },
+                preview_steps.join("; "),
+                suffix
+            )
+        } else {
+            format!("Run automation workflow '{id}'")
+        }
     }
     async fn call(&self, args: Value) -> Result<Value> {
         let id = args
@@ -115,7 +133,7 @@ impl McpToolHandler for AutomationRunTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                FrError::InvalidConfig("missing required string field 'workflow_id'".into())
+                FrError::InvalidInput("Missing required string field 'workflow_id'.".into())
             })?;
         let storage = self
             .1

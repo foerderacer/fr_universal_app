@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,6 +27,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify updater signing configuration
+        shell: bash
+        env:
+          HAS_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_PUBLIC_KEY: ${{ vars.FR_UPDATER_PUBKEY != '' }}
+        run: |
+          if [ "$HAS_PRIVATE_KEY" != "$HAS_PUBLIC_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY (secret) and FR_UPDATER_PUBKEY (repo variable) must either BOTH be configured or BOTH be empty."
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -47,6 +57,8 @@ jobs:
       - name: Verify Rust tests before packaging
         run: cargo test --workspace
 
+      # Publishes a draft GitHub Release; publish the draft once Windows & macOS
+      # artifacts have both uploaded so releases/latest/download/latest.json goes live.
       - name: Build & release Tauri installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -70,4 +82,4 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
-          args: ${{ matrix.args }} ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config "{\"bundle\":{\"createUpdaterArtifacts\":true}}"' || '' }}
+          args: ${{ matrix.args }} ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config tauri.updater.conf.json' || '' }}

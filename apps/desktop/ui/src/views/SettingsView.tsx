@@ -139,6 +139,7 @@ export function SettingsView({
       await installAppUpdate();
     } catch (err) {
       setUpdateError(toUserFacingError(err));
+    } finally {
       setInstallingUpdate(false);
     }
   }

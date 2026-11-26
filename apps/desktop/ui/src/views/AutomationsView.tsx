@@ -105,6 +105,7 @@ function emptyWorkflow(): WorkflowDefinition_Serialize {
     trigger: { type: "manual" },
     steps: [defaultStep("createFolder")],
     fromTeamSync: false,
+    remoteEtag: null,
   };
 }
 
@@ -135,8 +136,10 @@ export function AutomationsView({
   );
 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [confirmTeamEnable, setConfirmTeamEnable] =
-    useState<WorkflowDefinition_Serialize | null>(null);
+  const [confirmTeamAction, setConfirmTeamAction] = useState<{
+    wf: WorkflowDefinition_Serialize;
+    action: "enable" | "run";
+  } | null>(null);
   const [expandedRunIds, setExpandedRunIds] = useState<Record<string, boolean>>(
     {},
   );
@@ -170,11 +173,19 @@ export function AutomationsView({
     }, 4500);
   }
 
-  async function handleRunNow(wf: WorkflowDefinition_Serialize) {
+  async function handleRunNow(
+    wf: WorkflowDefinition_Serialize,
+    bypassTeamWarning = false,
+  ) {
+    if (!wf.enabled && wf.fromTeamSync && !bypassTeamWarning) {
+      setConfirmTeamAction({ wf, action: "run" });
+      return;
+    }
     setError(null);
     setBusyId(wf.id);
     try {
       const record = await runWorkflowNow(wf.id);
+      setConfirmTeamAction(null);
       setRuns((prev) => [record, ...prev].slice(0, 30));
       setExpandedRunIds((prev) => ({ ...prev, [record.runId]: true }));
       flashNotice(
@@ -194,7 +205,7 @@ export function AutomationsView({
     bypassTeamWarning = false,
   ) {
     if (!wf.enabled && wf.fromTeamSync && !bypassTeamWarning) {
-      setConfirmTeamEnable(wf);
+      setConfirmTeamAction({ wf, action: "enable" });
       return;
     }
     setError(null);
@@ -205,7 +216,7 @@ export function AutomationsView({
         enabled: !wf.enabled,
       });
       setWorkflows(updated);
-      setConfirmTeamEnable(null);
+      setConfirmTeamAction(null);
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -232,10 +243,14 @@ export function AutomationsView({
     setError(null);
     setSyncing(true);
     try {
-      const synced = await syncWorkflowsFromNextcloud();
-      setWorkflows(synced);
+      const report = await syncWorkflowsFromNextcloud();
+      setWorkflows(report.workflows);
+      const skippedPart =
+        report.skippedCount > 0
+          ? ` Skipped ${report.skippedCount} file${report.skippedCount === 1 ? "" : "s"} (${report.skippedNotes.join("; ")}).`
+          : "";
       flashNotice(
-        `Synced team workflows from /_FR_App/workflows/. Newly imported or changed workflows stay disabled until you review them.`,
+        `Synced ${report.importedCount} team workflow${report.importedCount === 1 ? "" : "s"} from /_FR_App/workflows/. Newly imported or changed workflows stay disabled until you review them.${skippedPart}`,
       );
     } catch (err) {
       setError(toUserFacingError(err));
@@ -261,9 +276,19 @@ export function AutomationsView({
     event.preventDefault();
     if (!editing) return;
     setError(null);
+    const finalId = editing.id.trim() || slugifyId(editing.name);
+    if (isNewWorkflow && workflows.some((w) => w.id === finalId)) {
+      setError({
+        code: "workflow_id_exists",
+        title: "Workflow ID already in use",
+        message: `A workflow with ID "${finalId}" already exists. Pick a different ID or edit the existing workflow.`,
+        recoveryHint: null,
+        technicalDetails: null,
+      });
+      return;
+    }
     setSaving(true);
     try {
-      const finalId = editing.id.trim() || slugifyId(editing.name);
       const updated = await upsertWorkflow({
         ...editing,
         id: finalId,
@@ -345,35 +370,70 @@ export function AutomationsView({
         </div>
       )}
 
-      {confirmTeamEnable && (
+      {confirmTeamAction && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
           <div className="flex items-start gap-3">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
             <div className="flex-1 space-y-2">
               <p className="font-semibold">
-                Review shared team workflow before enabling
+                Review shared team workflow before{" "}
+                {confirmTeamAction.action === "enable" ? "enabling" : "running"}
               </p>
               <p>
-                <strong>{confirmTeamEnable.name}</strong> was synced from
-                Nextcloud (<code>/_FR_App/workflows/</code>) with{" "}
-                {confirmTeamEnable.steps.length} step
-                {confirmTeamEnable.steps.length === 1 ? "" : "s"} (
-                {describeTrigger(confirmTeamEnable.trigger)}). Confirm you trust
-                its actions before allowing automatic execution.
+                <strong>{confirmTeamAction.wf.name}</strong> (
+                <code>{confirmTeamAction.wf.id}</code>) was synced from
+                Nextcloud (<code>/_FR_App/workflows/</code>) — Trigger:{" "}
+                <strong>{describeTrigger(confirmTeamAction.wf.trigger)}</strong>
+                . Review every step below before approving:
               </p>
+              <ol className="list-decimal space-y-1.5 rounded-lg border border-amber-200 bg-white/80 p-3 pl-7 font-mono text-[11px] text-amber-950 dark:border-amber-900/60 dark:bg-slate-900/80 dark:text-amber-100">
+                {confirmTeamAction.wf.steps.map((step, i) => (
+                  <li key={i} className="break-all">
+                    {step.type === "createFolder" && (
+                      <span>Create folder {step.path}</span>
+                    )}
+                    {step.type === "copyFile" && (
+                      <span>
+                        Copy {step.from} → {step.to}
+                      </span>
+                    )}
+                    {step.type === "moveFile" && (
+                      <span>
+                        Move {step.from} → {step.to}
+                      </span>
+                    )}
+                    {step.type === "writeMarkdown" && (
+                      <span>
+                        Write Markdown {step.path}
+                        {step.createOnly ? " (create only)" : " (overwrite)"}
+                      </span>
+                    )}
+                    {step.type === "callMcpTool" && (
+                      <span>
+                        Call external MCP {step.serverId}::{step.toolName} —
+                        args: {step.argumentsJson || "{}"}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ol>
               <div className="flex items-center gap-2 pt-1">
                 <button
                   type="button"
                   onClick={() =>
-                    void handleToggleEnabled(confirmTeamEnable, true)
+                    confirmTeamAction.action === "enable"
+                      ? void handleToggleEnabled(confirmTeamAction.wf, true)
+                      : void handleRunNow(confirmTeamAction.wf, true)
                   }
                   className="rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700"
                 >
-                  Enable workflow
+                  {confirmTeamAction.action === "enable"
+                    ? "I reviewed these steps — Enable"
+                    : "I reviewed these steps — Run Now"}
                 </button>
                 <button
                   type="button"
-                  onClick={() => setConfirmTeamEnable(null)}
+                  onClick={() => setConfirmTeamAction(null)}
                   className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
                 >
                   Cancel
@@ -736,6 +796,9 @@ export function AutomationsView({
             </div>
 
             <div className="flex-1 space-y-5 overflow-y-auto p-5">
+              {error && (
+                <ErrorBanner error={error} onDismiss={() => setError(null)} />
+              )}
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-1.5">
                   <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">

@@ -51,7 +51,7 @@ export const commands = {
 	deleteWorkflow: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowDefinition_Serialize[]>("delete_workflow", { workflowId }, options),
 	runWorkflowNow: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowRunRecord>("run_workflow_now", { workflowId }, options),
 	listWorkflowRuns: (workflowId: string | null, limit: number, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowRunRecord[]>("list_workflow_runs", { workflowId, limit }, options),
-	syncWorkflowsFromNextcloud: (options?: InvokeOptions) => __TAURI_INVOKE<WorkflowDefinition_Serialize[]>("sync_workflows_from_nextcloud", undefined, options),
+	syncWorkflowsFromNextcloud: (options?: InvokeOptions) => __TAURI_INVOKE<WorkflowSyncReport_Serialize>("sync_workflows_from_nextcloud", undefined, options),
 	pushWorkflowToNextcloud: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("push_workflow_to_nextcloud", { workflowId }, options),
 	listFinanceEntries: (options?: InvokeOptions) => __TAURI_INVOKE<FinanceEntry_Serialize[]>("list_finance_entries", undefined, options),
 	upsertFinanceEntry: (input: UpsertFinanceEntryRequest_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<FinanceEntry_Serialize>("upsert_finance_entry", { input }, options),
@@ -661,6 +661,8 @@ export type WorkflowDefinition_Deserialize = {
 	trigger: WorkflowTrigger,
 	steps: WorkflowStep_Deserialize[],
 	fromTeamSync?: boolean,
+	/**  Last known Nextcloud ETag for `/_FR_App/workflows/<id>.json` (used for `If-Match` safety). */
+	remoteEtag?: string | null,
 };
 
 export type WorkflowDefinition_Serialize = {
@@ -671,6 +673,8 @@ export type WorkflowDefinition_Serialize = {
 	trigger: WorkflowTrigger,
 	steps: WorkflowStep_Serialize[],
 	fromTeamSync: boolean,
+	/**  Last known Nextcloud ETag for `/_FR_App/workflows/<id>.json` (used for `If-Match` safety). */
+	remoteEtag: string | null,
 };
 
 export type WorkflowRunRecord = {
@@ -697,6 +701,22 @@ export type WorkflowStepLog = {
 export type WorkflowStep_Deserialize = { type: "createFolder"; path: string } | { type: "copyFile"; from: string; to: string } | { type: "moveFile"; from: string; to: string } | { type: "writeMarkdown"; path: string; content: string; createOnly?: boolean } | { type: "callMcpTool"; serverId: string; toolName: string; argumentsJson?: string };
 
 export type WorkflowStep_Serialize = { type: "createFolder"; path: string } | { type: "copyFile"; from: string; to: string } | { type: "moveFile"; from: string; to: string } | { type: "writeMarkdown"; path: string; content: string; createOnly: boolean } | { type: "callMcpTool"; serverId: string; toolName: string; argumentsJson: string };
+
+export type WorkflowSyncReport = WorkflowSyncReport_Serialize | WorkflowSyncReport_Deserialize;
+
+export type WorkflowSyncReport_Deserialize = {
+	workflows: WorkflowDefinition_Deserialize[],
+	importedCount: number,
+	skippedCount: number,
+	skippedNotes: string[],
+};
+
+export type WorkflowSyncReport_Serialize = {
+	workflows: WorkflowDefinition_Serialize[],
+	importedCount: number,
+	skippedCount: number,
+	skippedNotes: string[],
+};
 
 export type WorkflowTrigger = { type: "manual" } | { type: "folderWatch"; path: string } | { type: "schedule"; 
 /**  Polling interval in minutes (clamped to 1..=1440). */

@@ -145,15 +145,18 @@ pub fn run() {
             let wf_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 ticker.tick().await; // skip immediate boot tick
                 loop {
                     ticker.tick().await;
                     let state = wf_handle.state::<AppState>();
-                    if let Some(storage) = state.current_storage() {
-                        let _ = state
+                    if let Some(storage) = state.current_storage()
+                        && let Err(err) = state
                             .workflow_runner
                             .evaluate_triggers(storage.as_ref())
-                            .await;
+                            .await
+                    {
+                        tracing::warn!("Background workflow trigger tick failed: {err}");
                     }
                 }
             });

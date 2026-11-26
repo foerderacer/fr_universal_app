@@ -5,22 +5,25 @@
 //! (`CallMcpTool`).
 //!
 //! Security invariants:
-//! - Newly synced or step-modified team workflows from Nextcloud ALWAYS default to `enabled: false`
-//!   until explicitly reviewed and enabled by the local user.
+//! - Newly synced or step/trigger-modified team workflows from Nextcloud ALWAYS default to
+//!   `enabled: false` until explicitly reviewed and enabled by the local user.
+//! - External MCP clients (`trigger_source == "mcp"`) can NEVER run disabled workflows.
+//! - An RAII in-flight guard prevents both MCP self-recursion loops and concurrent double-runs.
 //! - Every cloud path is validated via [`CloudPath::parse`] (preventing traversal).
-//! - Synced workflow files are capped at 256 KiB and bounded to 50 files per sync.
+//! - Synced workflow files are bounded BEFORE full RAM read (`read_range` up to 256 KiB + 1 byte)
+//!   and capped at 50 files per sync; `CopyFile` rejects files larger than 100 MiB before reading.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use directories::ProjectDirs;
 use fr_core::{AppEvent, EventBus, FrError, Result};
 use fr_mcp::McpClientManager;
-use fr_storage::{CloudPath, FileKind, StorageBackend};
+use fr_storage::{CloudPath, Etag, FileKind, StorageBackend};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -31,6 +34,8 @@ const MAX_WORKFLOW_JSON_BYTES: usize = 256 * 1024;
 const MAX_TEAM_SYNC_FILES: usize = 50;
 const MAX_STORED_RUNS: i64 = 200;
 const MAX_STEPS_PER_WORKFLOW: usize = 25;
+const MAX_COPY_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_CONCURRENT_WORKFLOW_RUNS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(
@@ -81,6 +86,23 @@ pub enum WorkflowStep {
     },
 }
 
+impl WorkflowStep {
+    /// Human-readable one-line summary for approval banners and review dialogs.
+    pub fn short_summary(&self) -> String {
+        match self {
+            Self::CreateFolder { path } => format!("Create folder {path}"),
+            Self::CopyFile { from, to } => format!("Copy {from} -> {to}"),
+            Self::MoveFile { from, to } => format!("Move {from} -> {to}"),
+            Self::WriteMarkdown { path, .. } => format!("Write Markdown {path}"),
+            Self::CallMcpTool {
+                server_id,
+                tool_name,
+                ..
+            } => format!("Call MCP {server_id}::{tool_name}"),
+        }
+    }
+}
+
 fn default_empty_json_object() -> String {
     "{}".to_owned()
 }
@@ -96,6 +118,18 @@ pub struct WorkflowDefinition {
     pub steps: Vec<WorkflowStep>,
     #[serde(default)]
     pub from_team_sync: bool,
+    /// Last known Nextcloud ETag for `/_FR_App/workflows/<id>.json` (used for `If-Match` safety).
+    #[serde(default)]
+    pub remote_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowSyncReport {
+    pub workflows: Vec<WorkflowDefinition>,
+    pub imported_count: u32,
+    pub skipped_count: u32,
+    pub skipped_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -127,26 +161,35 @@ fn sqlite_err(err: rusqlite::Error) -> FrError {
 
 pub fn validate_workflow(wf: &WorkflowDefinition) -> Result<()> {
     if wf.id.trim().is_empty()
+        || wf.id.len() > 64
         || !wf
             .id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(FrError::InvalidConfig(
-            "Workflow ID must contain only letters, digits, hyphens, or underscores".into(),
+        return Err(FrError::InvalidInput(
+            "Workflow ID must be 1–64 characters using only letters, digits, hyphens, or underscores."
+                .into(),
         ));
     }
-    if wf.name.trim().is_empty() {
-        return Err(FrError::InvalidConfig("Workflow name is required".into()));
+    if wf.name.trim().is_empty() || wf.name.trim().len() > 160 {
+        return Err(FrError::InvalidInput(
+            "Workflow name is required and must be 160 characters or fewer.".into(),
+        ));
+    }
+    if wf.description.trim().len() > 1000 {
+        return Err(FrError::InvalidInput(
+            "Workflow description must be 1,000 characters or fewer.".into(),
+        ));
     }
     if wf.steps.is_empty() {
-        return Err(FrError::InvalidConfig(
-            "Workflow must contain at least one step".into(),
+        return Err(FrError::InvalidInput(
+            "Workflow must contain at least one step.".into(),
         ));
     }
     if wf.steps.len() > MAX_STEPS_PER_WORKFLOW {
-        return Err(FrError::InvalidConfig(format!(
-            "Workflow cannot have more than {MAX_STEPS_PER_WORKFLOW} steps"
+        return Err(FrError::InvalidInput(format!(
+            "Workflow cannot have more than {MAX_STEPS_PER_WORKFLOW} steps."
         )));
     }
     if let WorkflowTrigger::FolderWatch { ref path } = wf.trigger {
@@ -170,14 +213,14 @@ pub fn validate_workflow(wf: &WorkflowDefinition) -> Result<()> {
                 arguments_json,
             } => {
                 if server_id.trim().is_empty() || tool_name.trim().is_empty() {
-                    return Err(FrError::InvalidConfig(
-                        "MCP tool step requires both server_id and tool_name".into(),
+                    return Err(FrError::InvalidInput(
+                        "MCP tool step requires both a server and a tool name.".into(),
                     ));
                 }
                 if !arguments_json.trim().is_empty() {
                     let _: serde_json::Value =
                         serde_json::from_str(arguments_json).map_err(|err| {
-                            FrError::InvalidConfig(format!(
+                            FrError::InvalidInput(format!(
                                 "MCP tool step arguments must be valid JSON: {err}"
                             ))
                         })?;
@@ -232,6 +275,8 @@ impl WorkflowStore {
             );
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_started
                 ON workflow_runs (started_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_workflow_runs_wf_started
+                ON workflow_runs (workflow_id, started_at_ms DESC);
             ",
         )
         .map_err(sqlite_err)?;
@@ -335,6 +380,25 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Returns the most recent persisted start timestamp for `workflow_id` (used to avoid
+    /// re-firing `Schedule` workflows immediately on every app restart).
+    pub fn last_run_started_at(&self, workflow_id: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ms: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(started_at_ms) FROM workflow_runs WHERE workflow_id = ?1",
+                params![workflow_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?
+            .flatten();
+        Ok(ms.and_then(|v| Utc.timestamp_millis_opt(v).single()))
+    }
+
     pub fn list_runs(
         &self,
         workflow_id: Option<&str>,
@@ -386,14 +450,31 @@ impl WorkflowStore {
     }
 }
 
+/// RAII guard that releases a workflow's in-flight slot even if execution errors or is cancelled.
+struct RunSlotGuard {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    workflow_id: String,
+}
+
+impl Drop for RunSlotGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&self.workflow_id);
+    }
+}
+
 /// Executes workflows across [`StorageBackend`] and [`McpClientManager`], manages Nextcloud team
 /// sync, and evaluates periodic `Schedule` and `FolderWatch` triggers.
 pub struct WorkflowRunner {
     store: WorkflowStore,
     mcp_client: Arc<McpClientManager>,
     events: EventBus,
-    last_schedule_run: Mutex<HashMap<String, Instant>>,
+    last_schedule_run: Mutex<HashMap<String, DateTime<Utc>>>,
     folder_snapshots: Mutex<HashMap<String, Vec<String>>>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for WorkflowRunner {
@@ -410,6 +491,7 @@ impl WorkflowRunner {
             events,
             last_schedule_run: Mutex::new(HashMap::new()),
             folder_snapshots: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -417,17 +499,52 @@ impl WorkflowRunner {
         &self.store
     }
 
+    fn acquire_run_slot(&self, workflow_id: &str) -> Result<RunSlotGuard> {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.contains(workflow_id) {
+            return Err(FrError::InvalidInput(format!(
+                "Workflow '{workflow_id}' is already running."
+            )));
+        }
+        if guard.len() >= MAX_CONCURRENT_WORKFLOW_RUNS {
+            return Err(FrError::InvalidInput(
+                "Too many workflows are running at the same time. Please wait for one to finish."
+                    .into(),
+            ));
+        }
+        guard.insert(workflow_id.to_owned());
+        Ok(RunSlotGuard {
+            in_flight: self.in_flight.clone(),
+            workflow_id: workflow_id.to_owned(),
+        })
+    }
+
     /// Executes a single workflow by ID and persists its run record in SQLite.
+    ///
+    /// Security: when `trigger_source == "mcp"`, disabled workflows are ALWAYS rejected so
+    /// unreviewed team-synced workflows cannot be executed by an AI assistant.
     pub async fn run_workflow(
         &self,
         workflow_id: &str,
         trigger_source: &str,
         storage: &dyn StorageBackend,
     ) -> Result<WorkflowRunRecord> {
-        let wf = self
-            .store
-            .get_workflow(workflow_id)?
+        let store = self.store.clone();
+        let id_owned = workflow_id.to_owned();
+        let wf = tokio::task::spawn_blocking(move || store.get_workflow(&id_owned))
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??
             .ok_or_else(|| FrError::NotFound(format!("workflow '{workflow_id}'")))?;
+
+        if trigger_source == "mcp" && !wf.enabled {
+            return Err(FrError::InvalidInput(format!(
+                "Workflow '{}' is currently disabled. Review and enable it in Automations before running it from an AI assistant.",
+                wf.name
+            )));
+        }
         self.execute_definition(&wf, trigger_source, storage).await
     }
 
@@ -438,6 +555,8 @@ impl WorkflowRunner {
         storage: &dyn StorageBackend,
     ) -> Result<WorkflowRunRecord> {
         validate_workflow(wf)?;
+        let _slot = self.acquire_run_slot(&wf.id)?;
+
         let run_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let mut step_logs = Vec::with_capacity(wf.steps.len());
@@ -482,7 +601,11 @@ impl WorkflowRunner {
             succeeded: all_ok,
             step_logs,
         };
-        self.store.record_run(&record)?;
+        let store = self.store.clone();
+        let rec_clone = record.clone();
+        tokio::task::spawn_blocking(move || store.record_run(&rec_clone))
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??;
         self.events.publish(AppEvent::WorkflowCompleted {
             workflow_id: wf.id.clone(),
             run_id,
@@ -513,7 +636,20 @@ impl WorkflowRunner {
                 let res = async {
                     let src = CloudPath::parse(from)?;
                     let dst = CloudPath::parse(to)?;
+                    let meta = storage.stat(&src).await?;
+                    if meta.size > MAX_COPY_FILE_BYTES {
+                        return Err(FrError::InvalidInput(format!(
+                            "Source file '{}' is larger than the 100 MB workflow copy limit.",
+                            src.as_str()
+                        )));
+                    }
                     let (bytes, _) = storage.read(&src).await?;
+                    if bytes.len() as u64 > MAX_COPY_FILE_BYTES {
+                        return Err(FrError::InvalidInput(format!(
+                            "Source file '{}' exceeded the 100 MB workflow copy limit.",
+                            src.as_str()
+                        )));
+                    }
                     let etag = storage.write(&dst, bytes, None).await?;
                     Ok(format!(
                         "Copied to {} (ETag {})",
@@ -583,14 +719,21 @@ impl WorkflowRunner {
 
     /// Syncs shared team workflow JSON files from `/_FR_App/workflows/` in Nextcloud.
     ///
-    /// Security: every newly imported workflow OR existing workflow whose `steps` changed is
-    /// ALWAYS set to `enabled: false` until the local user reviews and enables it.
+    /// Security:
+    /// - Reads at most `MAX_WORKFLOW_JSON_BYTES + 1` bytes via `read_range` BEFORE buffering.
+    /// - Never overwrites a local user-owned workflow (`from_team_sync == false`) with the same ID.
+    /// - Every newly imported workflow OR existing team workflow whose `steps`/`trigger` changed is
+    ///   ALWAYS set to `enabled: false` until the local user reviews and enables it.
     pub async fn sync_from_nextcloud(
         &self,
         storage: &dyn StorageBackend,
-    ) -> Result<Vec<WorkflowDefinition>> {
+    ) -> Result<WorkflowSyncReport> {
         let dir = CloudPath::parse(TEAM_WORKFLOWS_DIR)?;
         let entries = storage.list(&dir).await?;
+
+        let mut imported_count = 0u32;
+        let mut skipped_count = 0u32;
+        let mut skipped_notes = Vec::new();
 
         for entry in entries
             .into_iter()
@@ -598,53 +741,142 @@ impl WorkflowRunner {
             .take(MAX_TEAM_SYNC_FILES)
         {
             if entry.size as usize > MAX_WORKFLOW_JSON_BYTES {
+                skipped_count += 1;
+                skipped_notes.push(format!("{}: exceeds 256 KB size limit", entry.name));
                 continue;
             }
-            let Ok((bytes, _)) = storage.read(&entry.path).await else {
-                continue;
+            // Enforce byte bound BEFORE pulling a potentially huge server body into memory.
+            let bytes = match storage
+                .read_range(&entry.path, 0, Some(MAX_WORKFLOW_JSON_BYTES as u64))
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => {
+                    skipped_count += 1;
+                    skipped_notes.push(format!("{}: could not be read", entry.name));
+                    continue;
+                }
             };
             if bytes.len() > MAX_WORKFLOW_JSON_BYTES {
+                skipped_count += 1;
+                skipped_notes.push(format!("{}: exceeds 256 KB size limit", entry.name));
                 continue;
             }
-            let Ok(mut imported) = serde_json::from_slice::<WorkflowDefinition>(&bytes) else {
-                continue;
+            let mut imported = match serde_json::from_slice::<WorkflowDefinition>(&bytes) {
+                Ok(wf) => wf,
+                Err(_) => {
+                    skipped_count += 1;
+                    skipped_notes.push(format!("{}: invalid workflow JSON", entry.name));
+                    continue;
+                }
             };
-            if validate_workflow(&imported).is_err() {
+            if let Err(err) = validate_workflow(&imported) {
+                skipped_count += 1;
+                skipped_notes.push(format!("{}: {err}", entry.name));
                 continue;
             }
 
-            let existing = self.store.get_workflow(&imported.id)?;
+            let store = self.store.clone();
+            let id_lookup = imported.id.clone();
+            let existing = tokio::task::spawn_blocking(move || store.get_workflow(&id_lookup))
+                .await
+                .map_err(|err| FrError::Other(err.to_string()))??;
+
+            // Never clobber a local user-created workflow that happens to share the same ID.
+            if let Some(ref prev) = existing
+                && !prev.from_team_sync
+            {
+                skipped_count += 1;
+                skipped_notes.push(format!(
+                    "{}: skipped because a local workflow with ID '{}' already exists",
+                    entry.name, imported.id
+                ));
+                continue;
+            }
+
             imported.from_team_sync = true;
+            imported.remote_etag = entry.etag.as_ref().map(|e| e.as_str().to_owned());
             imported.enabled = match existing {
                 Some(prev) if prev.steps == imported.steps && prev.trigger == imported.trigger => {
                     prev.enabled
                 }
                 _ => false,
             };
-            let _ = self.store.upsert_workflow(imported);
+
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || store.upsert_workflow(imported))
+                .await
+                .map_err(|err| FrError::Other(err.to_string()))??;
+            imported_count += 1;
         }
 
-        self.store.list_workflows()
+        let store = self.store.clone();
+        let workflows = tokio::task::spawn_blocking(move || store.list_workflows())
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??;
+
+        Ok(WorkflowSyncReport {
+            workflows,
+            imported_count,
+            skipped_count,
+            skipped_notes,
+        })
     }
 
-    /// Exports a single workflow definition to Nextcloud (`/_FR_App/workflows/<id>.json`).
+    /// Exports a single workflow definition to Nextcloud (`/_FR_App/workflows/<id>.json`)
+    /// using ETag optimistic concurrency (`If-Match`) so a teammate's newer edit is never silently
+    /// overwritten.
     pub async fn push_to_nextcloud(
         &self,
         workflow_id: &str,
         storage: &dyn StorageBackend,
     ) -> Result<CloudPath> {
-        let wf = self
-            .store
-            .get_workflow(workflow_id)?
+        let store = self.store.clone();
+        let id_owned = workflow_id.to_owned();
+        let mut wf = tokio::task::spawn_blocking(move || store.get_workflow(&id_owned))
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??
             .ok_or_else(|| FrError::NotFound(format!("workflow '{workflow_id}'")))?;
+
         let app_dir = CloudPath::parse("/_FR_App")?;
         let _ = storage.mkdir(&app_dir).await;
         let wf_dir = CloudPath::parse(TEAM_WORKFLOWS_DIR)?;
         let _ = storage.mkdir(&wf_dir).await;
 
         let target = wf_dir.join(&format!("{}.json", wf.id))?;
-        let json = serde_json::to_vec_pretty(&wf)?;
-        storage.write(&target, Bytes::from(json), None).await?;
+        let expected_etag = match wf.remote_etag.as_deref() {
+            Some(raw) if !raw.is_empty() => Some(Etag::new(raw)),
+            _ => {
+                // If we have never synced/pushed this ID before, refuse to silently overwrite an
+                // existing remote file authored by a teammate.
+                if let Ok(remote) = storage.stat(&target).await {
+                    return Err(FrError::Conflict {
+                        path: target.as_str().to_owned(),
+                        expected: "none".into(),
+                        actual: remote
+                            .etag
+                            .map(|e| e.as_str().to_owned())
+                            .unwrap_or_else(|| "existing".into()),
+                    });
+                }
+                None
+            }
+        };
+
+        // Never serialize machine-local `remote_etag` into the shared team JSON.
+        let mut export_copy = wf.clone();
+        export_copy.remote_etag = None;
+        export_copy.enabled = false;
+        let json = serde_json::to_vec_pretty(&export_copy)?;
+
+        let new_etag = storage
+            .write(&target, Bytes::from(json), expected_etag.as_ref())
+            .await?;
+
+        wf.remote_etag = Some(new_etag.as_str().to_owned());
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || store.upsert_workflow(wf)).await;
+
         Ok(target)
     }
 
@@ -653,7 +885,28 @@ impl WorkflowRunner {
         &self,
         storage: &dyn StorageBackend,
     ) -> Result<Vec<WorkflowRunRecord>> {
-        let workflows = self.store.list_workflows()?;
+        let store = self.store.clone();
+        let workflows = tokio::task::spawn_blocking(move || store.list_workflows())
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??;
+
+        // Prune cached state for deleted workflows so in-memory maps stay bounded.
+        let active_ids: HashSet<String> = workflows.iter().map(|w| w.id.clone()).collect();
+        {
+            let mut sched = self
+                .last_schedule_run
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sched.retain(|id, _| active_ids.contains(id));
+        }
+        {
+            let mut snaps = self
+                .folder_snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snaps.retain(|id, _| active_ids.contains(id));
+        }
+
         let mut triggered_runs = Vec::new();
 
         for wf in workflows.into_iter().filter(|w| w.enabled) {
@@ -662,14 +915,32 @@ impl WorkflowRunner {
                 WorkflowTrigger::Schedule { interval_minutes } => {
                     let interval =
                         Duration::from_secs(u64::from((*interval_minutes).clamp(1, 1440)) * 60);
-                    let due = {
+                    let mem_last = {
                         let guard = self
                             .last_schedule_run
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard
-                            .get(&wf.id)
-                            .is_none_or(|last| last.elapsed() >= interval)
+                        guard.get(&wf.id).copied()
+                    };
+                    let last_run = match mem_last {
+                        Some(dt) => Some(dt),
+                        None => {
+                            let store = self.store.clone();
+                            let wf_id = wf.id.clone();
+                            tokio::task::spawn_blocking(move || store.last_run_started_at(&wf_id))
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .flatten()
+                        }
+                    };
+                    let now = Utc::now();
+                    let due = match last_run {
+                        None => true,
+                        Some(prev) => {
+                            let elapsed_secs = (now - prev).num_seconds();
+                            elapsed_secs < 0 || (elapsed_secs as u64) >= interval.as_secs()
+                        }
                     };
                     if due {
                         {
@@ -677,7 +948,7 @@ impl WorkflowRunner {
                                 .last_schedule_run
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            guard.insert(wf.id.clone(), Instant::now());
+                            guard.insert(wf.id.clone(), now);
                         }
                         if let Ok(rec) = self.execute_definition(&wf, "schedule", storage).await {
                             triggered_runs.push(rec);
@@ -758,6 +1029,17 @@ mod tests {
     use std::sync::RwLock;
     use tempfile::tempdir;
 
+    fn test_mcp_client(dir: &std::path::Path) -> Arc<McpClientManager> {
+        Arc::new(
+            McpClientManager::open(
+                dir.join("mcp-servers.json"),
+                Arc::new(MemoryMcpTokenStore::new()),
+                reqwest::Client::new(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn workflow_runs_storage_and_mcp_tool_steps_and_records_history() {
         let data_dir = tempdir().unwrap();
@@ -772,7 +1054,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Start a loopback MCP server so CallMcpTool runs end-to-end.
         let slot: SharedBackendSlot = Arc::new(RwLock::new(Some(storage.clone())));
         let registry = Arc::new(McpToolRegistry::new());
         register_files_tools(&registry, slot.clone());
@@ -793,14 +1074,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mcp_client = Arc::new(
-            McpClientManager::open(
-                db_dir.path().join("mcp-servers.json"),
-                Arc::new(MemoryMcpTokenStore::new()),
-                reqwest::Client::new(),
-            )
-            .unwrap(),
-        );
+        let mcp_client = test_mcp_client(db_dir.path());
         mcp_client
             .upsert_server(
                 ExternalMcpServer {
@@ -822,7 +1096,7 @@ mod tests {
             id: "archive-and-read".into(),
             name: "Archive & Inspect".into(),
             description: "Creates archive folder, copies doc, calls MCP tool.".into(),
-            enabled: true,
+            enabled: false,
             trigger: WorkflowTrigger::Manual,
             steps: vec![
                 WorkflowStep::CreateFolder {
@@ -839,9 +1113,18 @@ mod tests {
                 },
             ],
             from_team_sync: false,
+            remote_etag: None,
         };
-        store.upsert_workflow(wf).unwrap();
+        store.upsert_workflow(wf.clone()).unwrap();
 
+        // MCP trigger MUST reject disabled workflows.
+        let mcp_err = runner
+            .run_workflow("archive-and-read", "mcp", storage.as_ref())
+            .await
+            .unwrap_err();
+        assert!(matches!(mcp_err, FrError::InvalidInput(_)));
+
+        // Manual run is allowed and executes all 3 steps.
         let run = runner
             .run_workflow("archive-and-read", "manual", storage.as_ref())
             .await
@@ -855,20 +1138,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_sync_disables_new_and_modified_workflows() {
+    async fn team_sync_disables_new_modified_and_protects_local_workflows() {
         let data_dir = tempdir().unwrap();
         let db_dir = tempdir().unwrap();
         let storage = LocalFsBackend::new(data_dir.path());
-        let mcp_client = Arc::new(
-            McpClientManager::open(
-                db_dir.path().join("mcp-servers.json"),
-                Arc::new(MemoryMcpTokenStore::new()),
-                reqwest::Client::new(),
-            )
-            .unwrap(),
-        );
         let store = WorkflowStore::open(db_dir.path().join("workflows.sqlite")).unwrap();
-        let runner = WorkflowRunner::new(store.clone(), mcp_client, EventBus::default());
+        let runner = WorkflowRunner::new(
+            store.clone(),
+            test_mcp_client(db_dir.path()),
+            EventBus::default(),
+        );
+
+        // Local user-created workflow must NOT be overwritten by a team file with the same ID.
+        store
+            .upsert_workflow(WorkflowDefinition {
+                id: "local-custom".into(),
+                name: "My Local Workflow".into(),
+                description: "User owned".into(),
+                enabled: true,
+                trigger: WorkflowTrigger::Manual,
+                steps: vec![WorkflowStep::CreateFolder {
+                    path: "/Mine".into(),
+                }],
+                from_team_sync: false,
+                remote_etag: None,
+            })
+            .unwrap();
 
         let remote_wf = WorkflowDefinition {
             id: "team-intake".into(),
@@ -880,6 +1175,19 @@ mod tests {
                 path: "/Intake".into(),
             }],
             from_team_sync: true,
+            remote_etag: None,
+        };
+        let collision_wf = WorkflowDefinition {
+            id: "local-custom".into(),
+            name: "Hijack Attempt".into(),
+            description: "Should be skipped".into(),
+            enabled: true,
+            trigger: WorkflowTrigger::Manual,
+            steps: vec![WorkflowStep::CreateFolder {
+                path: "/Hijack".into(),
+            }],
+            from_team_sync: true,
+            remote_etag: None,
         };
         storage
             .write(
@@ -889,16 +1197,45 @@ mod tests {
             )
             .await
             .unwrap();
+        storage
+            .write(
+                &CloudPath::parse("/_FR_App/workflows/local-custom.json").unwrap(),
+                Bytes::from(serde_json::to_vec(&collision_wf).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .write(
+                &CloudPath::parse("/_FR_App/workflows/broken.json").unwrap(),
+                Bytes::from_static(b"{not-valid-json"),
+                None,
+            )
+            .await
+            .unwrap();
 
-        let synced = runner.sync_from_nextcloud(&storage).await.unwrap();
-        assert_eq!(synced.len(), 1);
+        let report = runner.sync_from_nextcloud(&storage).await.unwrap();
+        assert_eq!(report.imported_count, 1);
+        assert_eq!(report.skipped_count, 2);
+        let synced = report
+            .workflows
+            .iter()
+            .find(|w| w.id == "team-intake")
+            .unwrap();
         assert!(
-            !synced[0].enabled,
+            !synced.enabled,
             "newly synced team workflows must default to disabled"
         );
+        let local = report
+            .workflows
+            .iter()
+            .find(|w| w.id == "local-custom")
+            .unwrap();
+        assert_eq!(local.name, "My Local Workflow");
+        assert!(!local.from_team_sync);
 
-        // User explicitly enables it locally.
-        let mut enabled_locally = synced[0].clone();
+        // User explicitly enables the synced workflow locally.
+        let mut enabled_locally = synced.clone();
         enabled_locally.enabled = true;
         store.upsert_workflow(enabled_locally).unwrap();
 
@@ -919,9 +1256,101 @@ mod tests {
             .unwrap();
 
         let resynced = runner.sync_from_nextcloud(&storage).await.unwrap();
+        let after = resynced
+            .workflows
+            .iter()
+            .find(|w| w.id == "team-intake")
+            .unwrap();
         assert!(
-            !resynced[0].enabled,
+            !after.enabled,
             "team workflow with modified steps must be re-disabled until reviewed"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_persists_across_restarts_and_folder_watch_avoids_self_loop() {
+        let data_dir = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let storage = LocalFsBackend::new(data_dir.path());
+        storage
+            .mkdir(&CloudPath::parse("/Watched").unwrap())
+            .await
+            .unwrap();
+
+        let store = WorkflowStore::open(db_dir.path().join("workflows.sqlite")).unwrap();
+        store
+            .upsert_workflow(WorkflowDefinition {
+                id: "daily-job".into(),
+                name: "Daily Job".into(),
+                description: String::new(),
+                enabled: true,
+                trigger: WorkflowTrigger::Schedule {
+                    interval_minutes: 1440,
+                },
+                steps: vec![WorkflowStep::CreateFolder {
+                    path: "/DailyOut".into(),
+                }],
+                from_team_sync: false,
+                remote_etag: None,
+            })
+            .unwrap();
+        store
+            .upsert_workflow(WorkflowDefinition {
+                id: "watch-self".into(),
+                name: "Watch Self".into(),
+                description: String::new(),
+                enabled: true,
+                trigger: WorkflowTrigger::FolderWatch {
+                    path: "/Watched".into(),
+                },
+                steps: vec![WorkflowStep::WriteMarkdown {
+                    path: "/Watched/summary.md".into(),
+                    content: "Updated".into(),
+                    create_only: false,
+                }],
+                from_team_sync: false,
+                remote_etag: None,
+            })
+            .unwrap();
+
+        // First runner instance: daily-job fires once; watch-self establishes baseline only.
+        let runner1 = WorkflowRunner::new(
+            store.clone(),
+            test_mcp_client(db_dir.path()),
+            EventBus::default(),
+        );
+        let tick1 = runner1.evaluate_triggers(&storage).await.unwrap();
+        assert_eq!(tick1.len(), 1);
+        assert_eq!(tick1[0].workflow_id, "daily-job");
+
+        // External file added to /Watched -> watch-self fires AND writes /Watched/summary.md.
+        storage
+            .write(
+                &CloudPath::parse("/Watched/input.txt").unwrap(),
+                Bytes::from_static(b"hello"),
+                None,
+            )
+            .await
+            .unwrap();
+        let tick2 = runner1.evaluate_triggers(&storage).await.unwrap();
+        assert_eq!(tick2.len(), 1);
+        assert_eq!(tick2[0].workflow_id, "watch-self");
+
+        // Next tick with no new external changes MUST NOT self-trigger on summary.md.
+        let tick3 = runner1.evaluate_triggers(&storage).await.unwrap();
+        assert!(tick3.is_empty());
+
+        // Simulated app restart (fresh WorkflowRunner against same SQLite store):
+        // daily-job MUST NOT re-fire immediately because its last run is persisted!
+        let runner2 = WorkflowRunner::new(
+            store.clone(),
+            test_mcp_client(db_dir.path()),
+            EventBus::default(),
+        );
+        let after_restart = runner2.evaluate_triggers(&storage).await.unwrap();
+        assert!(
+            after_restart.is_empty(),
+            "24h schedule must not re-fire immediately after app restart"
         );
     }
 }

@@ -142,6 +142,12 @@ export function FinanceView({
   }, [financeFolder]);
 
   const loadLedger = useCallback(async () => {
+    if (!isNextcloudConnected) {
+      setEntries([]);
+      setSummaries([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const [list, summary] = await Promise.all([
@@ -155,7 +161,7 @@ export function FinanceView({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isNextcloudConnected]);
 
   const loadFinanceFolderFiles = useCallback(async () => {
     if (!isNextcloudConnected) {
@@ -387,7 +393,7 @@ export function FinanceView({
             <button
               type="button"
               onClick={() => void handleExportCsv()}
-              disabled={entries.length === 0}
+              disabled={!isNextcloudConnected || entries.length === 0}
               className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
             >
               <Download className="h-3.5 w-3.5" />
@@ -396,8 +402,17 @@ export function FinanceView({
 
             <button
               type="button"
-              onClick={() => setDraft(emptyDraft())}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-blue-700"
+              disabled={!isNextcloudConnected}
+              onClick={() => {
+                setError(null);
+                setDraft(emptyDraft());
+              }}
+              title={
+                isNextcloudConnected
+                  ? "Add a new invoice, receipt, or budget entry"
+                  : "Sign in to Nextcloud first so entries are linked to your account"
+              }
+              className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-blue-700 disabled:opacity-40"
             >
               <Plus className="h-3.5 w-3.5" />
               Add Entry
@@ -495,7 +510,19 @@ export function FinanceView({
 
         {/* Ledger Table */}
         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs dark:border-slate-800 dark:bg-slate-900">
-          {loading ? (
+          {!isNextcloudConnected ? (
+            <div className="p-10 text-center">
+              <Wallet className="mx-auto h-9 w-9 text-slate-400" />
+              <h3 className="mt-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Sign in to Nextcloud to open your Finance ledger
+              </h3>
+              <p className="mx-auto mt-1 max-w-md text-xs text-slate-500 dark:text-slate-400">
+                Your invoices, receipts, and budgets are scoped per Nextcloud
+                account so they stay organized and link cleanly to files in{" "}
+                <code>{financeFolder}</code>.
+              </p>
+            </div>
+          ) : loading ? (
             <div className="p-8 text-center text-sm text-slate-500">
               Loading Finance ledger...
             </div>
@@ -679,6 +706,9 @@ export function FinanceView({
             </div>
 
             <div className="space-y-4 p-5">
+              {error && (
+                <ErrorBanner error={error} onDismiss={() => setError(null)} />
+              )}
               <div className="grid gap-3 sm:grid-cols-3">
                 <div className="space-y-1">
                   <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">

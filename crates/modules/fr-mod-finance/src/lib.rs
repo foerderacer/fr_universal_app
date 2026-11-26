@@ -11,7 +11,7 @@ use directories::ProjectDirs;
 use fr_core::{FrError, FrModule, ModuleCapability, ModuleDescriptor, ModuleStatus, Result};
 use fr_mcp::{McpToolHandler, McpToolRegistry};
 use fr_storage::CloudPath;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use specta::Type;
@@ -146,6 +146,11 @@ impl FrModule for FinanceModule {
     }
 }
 
+const MAX_VENDOR_LEN: usize = 200;
+const MAX_CATEGORY_LEN: usize = 100;
+const MAX_DESCRIPTION_LEN: usize = 2000;
+const MAX_ABS_AMOUNT_CENTS: i64 = 1_000_000_000_000; // +/- 10 billion
+
 fn sqlite_err(err: rusqlite::Error) -> FrError {
     FrError::Other(format!("finance database error: {err}"))
 }
@@ -259,19 +264,26 @@ impl FinanceLedger {
         req: UpsertFinanceEntryRequest,
     ) -> Result<FinanceEntry> {
         let vendor = req.vendor.trim().to_owned();
-        if vendor.is_empty() {
-            return Err(FrError::InvalidConfig("Vendor or title is required".into()));
+        if vendor.is_empty() || vendor.chars().count() > MAX_VENDOR_LEN {
+            return Err(FrError::InvalidInput(format!(
+                "Vendor or title is required and must be {MAX_VENDOR_LEN} characters or fewer."
+            )));
         }
         let currency = req.currency.trim().to_ascii_uppercase();
         if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Err(FrError::InvalidConfig(
-                "Currency must be a 3-letter ISO code (e.g. EUR, USD)".into(),
+            return Err(FrError::InvalidInput(
+                "Currency must be a 3-letter ISO code (e.g. EUR, USD).".into(),
+            ));
+        }
+        if req.amount_cents.abs() > MAX_ABS_AMOUNT_CENTS {
+            return Err(FrError::InvalidInput(
+                "Amount is outside the supported range.".into(),
             ));
         }
         let entry_date = req.entry_date.trim().to_owned();
         if entry_date.len() != 10 || NaiveDate::parse_from_str(&entry_date, "%Y-%m-%d").is_err() {
-            return Err(FrError::InvalidConfig(
-                "Date must be a valid calendar date in YYYY-MM-DD format".into(),
+            return Err(FrError::InvalidInput(
+                "Date must be a valid calendar date in YYYY-MM-DD format.".into(),
             ));
         }
         let cloud_file_path = match req.cloud_file_path {
@@ -287,16 +299,27 @@ impl FinanceLedger {
         let category = if req.category.trim().is_empty() {
             "General".to_owned()
         } else {
-            req.category.trim().to_owned()
+            let trimmed = req.category.trim().to_owned();
+            if trimmed.chars().count() > MAX_CATEGORY_LEN {
+                return Err(FrError::InvalidInput(format!(
+                    "Category must be {MAX_CATEGORY_LEN} characters or fewer."
+                )));
+            }
+            trimmed
         };
         let description = req.description.trim().to_owned();
+        if description.chars().count() > MAX_DESCRIPTION_LEN {
+            return Err(FrError::InvalidInput(format!(
+                "Description must be {MAX_DESCRIPTION_LEN} characters or fewer."
+            )));
+        }
 
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let affected = conn
-            .execute(
+        let created_raw: Option<String> = conn
+            .query_row(
                 "INSERT INTO finance_entries
                  (id, account_scope, kind, vendor, description, category, amount_cents, currency,
                   entry_date, status, cloud_file_path, created_at, updated_at)
@@ -312,7 +335,8 @@ impl FinanceLedger {
                    status = excluded.status,
                    cloud_file_path = excluded.cloud_file_path,
                    updated_at = excluded.updated_at
-                 WHERE account_scope = excluded.account_scope",
+                 WHERE account_scope = excluded.account_scope
+                 RETURNING created_at",
                 params![
                     id,
                     account_scope,
@@ -328,13 +352,19 @@ impl FinanceLedger {
                     now.to_rfc3339(),
                     now.to_rfc3339(),
                 ],
+                |r| r.get(0),
             )
+            .optional()
             .map_err(sqlite_err)?;
-        if affected == 0 {
+
+        let Some(created_str) = created_raw else {
             return Err(FrError::NotFound(format!(
                 "finance entry '{id}' does not belong to the active account"
             )));
-        }
+        };
+        let created_at = DateTime::parse_from_rfc3339(&created_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(now);
 
         Ok(FinanceEntry {
             id,
@@ -347,7 +377,7 @@ impl FinanceLedger {
             entry_date,
             status: req.status,
             cloud_file_path,
-            created_at: now,
+            created_at,
             updated_at: now,
         })
     }
@@ -357,11 +387,15 @@ impl FinanceLedger {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        conn.execute(
-            "DELETE FROM finance_entries WHERE id = ?1 AND account_scope = ?2",
-            params![id, account_scope],
-        )
-        .map_err(sqlite_err)?;
+        let affected = conn
+            .execute(
+                "DELETE FROM finance_entries WHERE id = ?1 AND account_scope = ?2",
+                params![id, account_scope],
+            )
+            .map_err(sqlite_err)?;
+        if affected == 0 {
+            return Err(FrError::NotFound(format!("finance entry '{id}'")));
+        }
         Ok(())
     }
 
@@ -420,7 +454,7 @@ impl FinanceLedger {
                 csv_escape(e.kind.as_db()),
                 csv_escape(&e.vendor),
                 csv_escape(&e.category),
-                amount,
+                csv_escape(&amount),
                 csv_escape(&e.currency),
                 csv_escape(e.status.as_db()),
                 csv_escape(&e.description),
@@ -550,10 +584,15 @@ impl McpToolHandler for FinanceAddTool {
             "required": ["vendor", "amount_cents", "currency", "entry_date"],
             "properties": {
                 "kind": { "type": "string", "enum": ["invoice", "receipt", "budget"], "default": "invoice" },
-                "vendor": { "type": "string" },
-                "description": { "type": "string" },
-                "category": { "type": "string" },
-                "amount_cents": { "type": "integer", "description": "Amount in minor units (e.g. 1250 = 12.50)." },
+                "vendor": { "type": "string", "maxLength": 200 },
+                "description": { "type": "string", "maxLength": 2000 },
+                "category": { "type": "string", "maxLength": 100 },
+                "amount_cents": {
+                    "type": "integer",
+                    "minimum": -MAX_ABS_AMOUNT_CENTS,
+                    "maximum": MAX_ABS_AMOUNT_CENTS,
+                    "description": "Amount in minor units (e.g. 1250 = 12.50)."
+                },
                 "currency": { "type": "string", "description": "3-letter ISO currency code (e.g. EUR)." },
                 "entry_date": { "type": "string", "description": "Date in YYYY-MM-DD format." },
                 "cloud_file_path": { "type": "string", "description": "Optional linked Nextcloud file path." }
@@ -569,7 +608,12 @@ impl McpToolHandler for FinanceAddTool {
             .get("currency")
             .and_then(Value::as_str)
             .unwrap_or("EUR");
-        format!("Add finance {kind} ({curr})")
+        let amount = args
+            .get("amount_cents")
+            .and_then(Value::as_i64)
+            .map(format_cents_exact)
+            .unwrap_or_else(|| "?".into());
+        format!("Add finance {kind} ({amount} {curr})")
     }
     fn summarize_approval(&self, args: &Value) -> String {
         let vendor = args.get("vendor").and_then(Value::as_str).unwrap_or("?");
@@ -589,12 +633,14 @@ impl McpToolHandler for FinanceAddTool {
         let vendor = args
             .get("vendor")
             .and_then(Value::as_str)
-            .ok_or_else(|| FrError::InvalidConfig("missing 'vendor'".into()))?
+            .ok_or_else(|| FrError::InvalidInput("Missing required field 'vendor'.".into()))?
             .to_owned();
         let amount_cents = args
             .get("amount_cents")
             .and_then(Value::as_i64)
-            .ok_or_else(|| FrError::InvalidConfig("missing integer 'amount_cents'".into()))?;
+            .ok_or_else(|| {
+                FrError::InvalidInput("Missing required integer 'amount_cents'.".into())
+            })?;
         let currency = args
             .get("currency")
             .and_then(Value::as_str)
@@ -603,7 +649,9 @@ impl McpToolHandler for FinanceAddTool {
         let entry_date = args
             .get("entry_date")
             .and_then(Value::as_str)
-            .ok_or_else(|| FrError::InvalidConfig("missing 'entry_date' (YYYY-MM-DD)".into()))?
+            .ok_or_else(|| {
+                FrError::InvalidInput("Missing required field 'entry_date' (YYYY-MM-DD).".into())
+            })?
             .to_owned();
         let kind = FinanceEntryKind::from_db(
             args.get("kind")
@@ -707,13 +755,13 @@ mod tests {
                 .is_err()
         );
 
-        // Bob cannot overwrite Alice's entry by reusing her entry ID.
+        // Bob cannot overwrite or delete Alice's entry by reusing her entry ID.
         assert!(
             ledger
                 .upsert_entry(
                     "https://cloud.example|bob",
                     UpsertFinanceEntryRequest {
-                        id: Some(e1.id),
+                        id: Some(e1.id.clone()),
                         kind: FinanceEntryKind::Invoice,
                         vendor: "Hijacked".into(),
                         description: String::new(),
@@ -727,5 +775,33 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(
+            ledger
+                .delete_entry("https://cloud.example|bob", &e1.id)
+                .is_err()
+        );
+
+        // Updating preserves created_at; negative amount & leading whitespace/tab CSV neutralized.
+        let updated = ledger
+            .upsert_entry(
+                "https://cloud.example|alice",
+                UpsertFinanceEntryRequest {
+                    id: Some(e1.id.clone()),
+                    kind: FinanceEntryKind::Receipt,
+                    vendor: "  +SUM(A1:A2)".into(),
+                    description: "\t@cmd".into(),
+                    category: "Materials".into(),
+                    amount_cents: -1250,
+                    currency: "EUR".into(),
+                    entry_date: "2026-11-25".into(),
+                    status: FinanceEntryStatus::Approved,
+                    cloud_file_path: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.created_at, e1.created_at);
+        let csv2 = ledger.export_csv("https://cloud.example|alice").unwrap();
+        assert!(csv2.contains("\"'+SUM(A1:A2)\""));
+        assert!(csv2.contains("\"'-12.50\""));
     }
 }

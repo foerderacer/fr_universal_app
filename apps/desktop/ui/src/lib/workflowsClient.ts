@@ -4,6 +4,7 @@ import {
   type WorkflowDefinition_Deserialize,
   type WorkflowDefinition_Serialize,
   type WorkflowRunRecord,
+  type WorkflowSyncReport_Serialize,
 } from "../bindings/tauri";
 
 function requireDesktop(action: string): never {
@@ -50,9 +51,7 @@ export async function listWorkflowRuns(
   return commands.listWorkflowRuns(workflowId, limit);
 }
 
-export async function syncWorkflowsFromNextcloud(): Promise<
-  WorkflowDefinition_Serialize[]
-> {
+export async function syncWorkflowsFromNextcloud(): Promise<WorkflowSyncReport_Serialize> {
   if (!isTauri()) requireDesktop("Syncing team workflows");
   return commands.syncWorkflowsFromNextcloud();
 }

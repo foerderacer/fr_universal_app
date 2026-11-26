@@ -256,6 +256,17 @@ impl AppState {
         )
     }
 
+    pub fn require_active_account_scope(&self) -> fr_core::Result<String> {
+        if let Ok(guard) = self.active_credentials.lock()
+            && let Some(ref creds) = *guard
+        {
+            return Ok(format!("{}|{}", creds.server_url, creds.login_name));
+        }
+        Err(fr_core::FrError::AuthRequired(
+            "Please sign in to Nextcloud to access your account's Finance ledger.".into(),
+        ))
+    }
+
     pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
         let switched_account = self
             .active_credentials
