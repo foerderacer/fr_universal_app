@@ -2,6 +2,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   commands,
+  type AppUpdateCheckResult_Serialize,
   type LoginPollStatusResponse_Serialize,
   type LoginStartResponse,
   type UpdateSettingsRequest,
@@ -21,6 +22,7 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     mcpServerEnabled: false,
     mcpServerPort: 38420,
     mcpRequireWriteApproval: true,
+    financeFolder: "/Finance",
     theme: "system",
   };
 
@@ -76,21 +78,21 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         id: "finance",
         name: "Finance",
         description:
-          "Track budgets, invoices, and team expenses synced with Nextcloud.",
+          "Track invoices, receipts, and budgets linked to Nextcloud documents with CSV export.",
         icon: "wallet",
         version: "0.1.0",
-        status: "planned",
-        capabilities: ["storage", "mcpServerTools"],
+        status: "active",
+        capabilities: ["storage", "preview", "mcpServerTools"],
       },
       {
         id: "automation",
         name: "Automations",
         description:
-          "Run team workflows across Nextcloud folders and connected MCP tools.",
+          "Build and run team workflows combining Nextcloud file actions with external MCP tools.",
         icon: "workflow",
         version: "0.1.0",
-        status: "planned",
-        capabilities: ["storage", "workflows", "mcpClient"],
+        status: "active",
+        capabilities: ["storage", "workflows", "mcpClient", "mcpServerTools"],
       },
     ],
   };
@@ -191,6 +193,34 @@ export async function refreshAccountInfo(): Promise<UserAccountInfo_Serialize | 
     return null;
   }
   return commands.refreshAccountInfo();
+}
+
+export async function checkForAppUpdate(): Promise<AppUpdateCheckResult_Serialize> {
+  if (!isTauri()) {
+    return {
+      configured: false,
+      available: false,
+      currentVersion: "0.1.0",
+      latestVersion: null,
+      notes: null,
+      message:
+        "Automatic update checks are available inside the desktop application.",
+    };
+  }
+  return commands.checkForAppUpdate();
+}
+
+export async function installAppUpdate(): Promise<void> {
+  if (!isTauri()) {
+    throw {
+      code: "browser_preview",
+      title: "Desktop app required",
+      message: "Installing updates works inside the desktop application.",
+      recoveryHint: null,
+      technicalDetails: null,
+    } satisfies UserFacingError;
+  }
+  await commands.installAppUpdate();
 }
 
 export async function openExternalUrl(url: string): Promise<void> {

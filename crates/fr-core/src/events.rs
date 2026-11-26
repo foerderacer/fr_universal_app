@@ -32,6 +32,16 @@ pub enum AppEvent {
         to: String,
         timestamp: DateTime<Utc>,
     },
+    WorkflowCompleted {
+        workflow_id: String,
+        run_id: String,
+        succeeded: bool,
+        timestamp: DateTime<Utc>,
+    },
+    FinanceEntryChanged {
+        entry_id: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Lightweight in-process broadcast bus for decoupled module communication.

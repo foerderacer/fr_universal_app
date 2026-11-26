@@ -1,57 +1,21 @@
 use std::sync::{Arc, Mutex, RwLock};
 
-use fr_core::{
-    AppConfig, ConfigStore, EventBus, FrModule, ModuleCapability, ModuleDescriptor, ModuleRegistry,
-    ModuleStatus, UserFacingError,
-};
+use fr_core::{AppConfig, ConfigStore, EventBus, ModuleRegistry, UserFacingError};
 use fr_mcp::{
     KeyringMcpTokenStore, LocalMcpServer, McpAuditLog, McpClientManager, McpModule,
     McpServerConfig, McpServerStatus, McpTokenStore, McpToolRegistry, WriteApprovalGate,
     register_files_tools,
 };
+use fr_mod_automation::{AutomationModule, register_automation_tools};
 use fr_mod_files::FilesModule;
+use fr_mod_finance::{FinanceLedger, FinanceModule, register_finance_tools};
 use fr_nextcloud::{
     CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
     NextcloudConnectionStatus, NextcloudCredentials, UserAccountInfo, build_http_client,
 };
 use fr_preview::MediaProxyServer;
 use fr_storage::{CacheStore, CachedStorage, StorageBackend};
-
-/// Placeholder descriptors for upcoming modules shown transparently in the Workspace Shell.
-struct FinancePlaceholderModule;
-impl FrModule for FinancePlaceholderModule {
-    fn descriptor(&self) -> ModuleDescriptor {
-        ModuleDescriptor {
-            id: "finance".into(),
-            name: "Finance".into(),
-            description: "Track budgets, invoices, and team expenses synced with Nextcloud.".into(),
-            icon: "wallet".into(),
-            version: "0.1.0".into(),
-            status: ModuleStatus::Planned,
-            capabilities: vec![ModuleCapability::Storage, ModuleCapability::McpServerTools],
-        }
-    }
-}
-
-struct AutomationPlaceholderModule;
-impl FrModule for AutomationPlaceholderModule {
-    fn descriptor(&self) -> ModuleDescriptor {
-        ModuleDescriptor {
-            id: "automation".into(),
-            name: "Automations".into(),
-            description: "Run team workflows across Nextcloud folders and connected MCP tools."
-                .into(),
-            icon: "workflow".into(),
-            version: "0.1.0".into(),
-            status: ModuleStatus::Planned,
-            capabilities: vec![
-                ModuleCapability::Storage,
-                ModuleCapability::Workflows,
-                ModuleCapability::McpClient,
-            ],
-        }
-    }
-}
+use fr_workflows::{WorkflowRunner, WorkflowStore};
 
 /// Shared application state managed by Tauri.
 pub struct AppState {
@@ -61,8 +25,8 @@ pub struct AppState {
     pub credential_store: Arc<dyn CredentialStore>,
     pub http_client: reqwest::Client,
     pub cache: Option<CacheStore>,
-    pub active_credentials: Mutex<Option<NextcloudCredentials>>,
-    /// Shared storage backend slot read by both IPC commands and the local `MediaProxyServer`.
+    pub active_credentials: Arc<Mutex<Option<NextcloudCredentials>>>,
+    /// Shared storage backend slot read by IPC commands, `MediaProxyServer`, MCP, and Workflows.
     pub storage: Arc<RwLock<Option<Arc<dyn StorageBackend>>>>,
     pub media_proxy: Mutex<Option<Arc<MediaProxyServer>>>,
     pub active_login: Mutex<Option<LoginFlowSession>>,
@@ -73,6 +37,8 @@ pub struct AppState {
     pub mcp_approvals: Arc<WriteApprovalGate>,
     pub mcp_server: tokio::sync::Mutex<Option<LocalMcpServer>>,
     pub mcp_client: Arc<McpClientManager>,
+    pub workflow_runner: Arc<WorkflowRunner>,
+    pub finance_ledger: Arc<FinanceLedger>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
@@ -122,10 +88,12 @@ impl AppState {
 
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
+        modules.register(FinanceModule);
+        modules.register(AutomationModule);
         modules.register(McpModule);
-        modules.register(FinancePlaceholderModule);
-        modules.register(AutomationPlaceholderModule);
 
+        let events = EventBus::default();
+        let active_credentials = Arc::new(Mutex::new(None::<NextcloudCredentials>));
         let storage: Arc<RwLock<Option<Arc<dyn StorageBackend>>>> = Arc::new(RwLock::new(None));
         let mcp_token_store: Arc<dyn McpTokenStore> = Arc::new(KeyringMcpTokenStore::new());
         let mcp_registry = Arc::new(McpToolRegistry::new());
@@ -162,6 +130,67 @@ impl AppState {
             }
         };
 
+        let workflow_db = WorkflowStore::default_db_path()
+            .unwrap_or_else(|_| std::env::temp_dir().join("fr-universal-app-workflows.sqlite"));
+        let workflow_store = match WorkflowStore::open(&workflow_db) {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::warn!("Falling back to temp workflow store: {err}");
+                if startup_error.is_none() {
+                    startup_error = Some(UserFacingError {
+                        code: "workflow_db_load_error".into(),
+                        title: "Workflow database couldn't be opened".into(),
+                        message: "We started with a temporary workflow store without overwriting your existing database file.".into(),
+                        recovery_hint: Some("Check permissions or disk space in your app data folder, then restart FR Universal App.".into()),
+                        technical_details: Some(format!("{err} (path: {})", workflow_db.display())),
+                    });
+                }
+                WorkflowStore::open(
+                    std::env::temp_dir().join("fr-universal-app-workflows-fallback.sqlite"),
+                )
+                .expect("fallback workflow store")
+            }
+        };
+        let workflow_runner = Arc::new(WorkflowRunner::new(
+            workflow_store,
+            mcp_client.clone(),
+            events.clone(),
+        ));
+        register_automation_tools(&mcp_registry, workflow_runner.clone(), storage.clone());
+
+        let finance_db = FinanceLedger::default_db_path()
+            .unwrap_or_else(|_| std::env::temp_dir().join("fr-universal-app-finance.sqlite"));
+        let finance_ledger = Arc::new(match FinanceLedger::open(&finance_db) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!("Falling back to temp finance ledger: {err}");
+                if startup_error.is_none() {
+                    startup_error = Some(UserFacingError {
+                        code: "finance_db_load_error".into(),
+                        title: "Finance ledger couldn't be opened".into(),
+                        message: "We started with a temporary Finance ledger without overwriting your existing database file.".into(),
+                        recovery_hint: Some("Check permissions or disk space in your app data folder, then restart FR Universal App.".into()),
+                        technical_details: Some(format!("{err} (path: {})", finance_db.display())),
+                    });
+                }
+                FinanceLedger::open(
+                    std::env::temp_dir().join("fr-universal-app-finance-fallback.sqlite"),
+                )
+                .expect("fallback finance ledger")
+            }
+        });
+        let creds_for_finance = active_credentials.clone();
+        register_finance_tools(
+            &mcp_registry,
+            finance_ledger.clone(),
+            Arc::new(move || {
+                creds_for_finance.lock().ok().and_then(|g| {
+                    g.as_ref()
+                        .map(|c| format!("{}|{}", c.server_url, c.login_name))
+                })
+            }),
+        );
+
         let state = Self {
             config_store,
             config: Mutex::new(config.clone()),
@@ -169,7 +198,7 @@ impl AppState {
             credential_store,
             http_client,
             cache,
-            active_credentials: Mutex::new(None),
+            active_credentials,
             storage,
             media_proxy: Mutex::new(None),
             active_login: Mutex::new(None),
@@ -180,8 +209,10 @@ impl AppState {
             mcp_approvals,
             mcp_server: tokio::sync::Mutex::new(None),
             mcp_client,
+            workflow_runner,
+            finance_ledger,
             modules,
-            events: EventBus::default(),
+            events,
         };
 
         // Silently restore previous Nextcloud session from OS Keychain if present.

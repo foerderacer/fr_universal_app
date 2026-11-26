@@ -1,12 +1,27 @@
-import { Check, LogOut, RotateCcw, Save, ShieldCheck } from "lucide-react";
+import {
+  Check,
+  Download,
+  Loader2,
+  LogOut,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  ShieldCheck,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import type {
+  AppUpdateCheckResult_Serialize,
   UpdateSettingsRequest,
   UserFacingError,
   WorkspaceOverview_Serialize,
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
-import { formatBytes } from "../lib/workspaceClient";
+import {
+  checkForAppUpdate,
+  formatBytes,
+  installAppUpdate,
+  toUserFacingError,
+} from "../lib/workspaceClient";
 
 interface SettingsViewProps {
   overview: WorkspaceOverview_Serialize;
@@ -37,6 +52,11 @@ export function SettingsView({
   );
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateResult, setUpdateResult] =
+    useState<AppUpdateCheckResult_Serialize | null>(null);
+  const [updateError, setUpdateError] = useState<UserFacingError | null>(null);
 
   useEffect(() => {
     setNextcloudUrl(overview.config.nextcloudUrl);
@@ -96,6 +116,30 @@ export function SettingsView({
       // Error banner is displayed by parent.
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleCheckForUpdate() {
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      const res = await checkForAppUpdate();
+      setUpdateResult(res);
+    } catch (err) {
+      setUpdateError(toUserFacingError(err));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleInstallUpdate() {
+    setInstallingUpdate(true);
+    setUpdateError(null);
+    try {
+      await installAppUpdate();
+    } catch (err) {
+      setUpdateError(toUserFacingError(err));
+      setInstallingUpdate(false);
     }
   }
 
@@ -263,6 +307,74 @@ export function SettingsView({
             <div className="absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-xs transition-transform peer-checked:translate-x-5" />
           </label>
         </div>
+      </section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+              App Updates
+            </h2>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              Current version: <code>v{overview.appVersion}</code> (
+              {overview.platform}). Official GitHub Releases deliver signed
+              one-click updates automatically.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            disabled={checkingUpdate || installingUpdate}
+            onClick={() => void handleCheckForUpdate()}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            {checkingUpdate ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            {checkingUpdate ? "Checking..." : "Check for Updates"}
+          </button>
+        </div>
+
+        {updateError && (
+          <div className="mt-3">
+            <ErrorBanner
+              error={updateError}
+              onDismiss={() => setUpdateError(null)}
+            />
+          </div>
+        )}
+
+        {updateResult && (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-950/60">
+            <p className="font-medium text-slate-800 dark:text-slate-200">
+              {updateResult.message}
+            </p>
+            {updateResult.notes && (
+              <p className="mt-1.5 whitespace-pre-wrap text-slate-600 dark:text-slate-400">
+                {updateResult.notes}
+              </p>
+            )}
+            {updateResult.available && (
+              <button
+                type="button"
+                disabled={installingUpdate}
+                onClick={() => void handleInstallUpdate()}
+                className="mt-3 inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {installingUpdate ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                {installingUpdate
+                  ? "Downloading & Installing..."
+                  : `Install v${updateResult.latestVersion}`}
+              </button>
+            )}
+          </div>
+        )}
       </section>
 
       <div className="flex items-center justify-end gap-3">
