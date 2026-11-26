@@ -1,0 +1,20 @@
+[package]
+name = "fr-slicer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+directories.workspace = true
+fr-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+specta.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true

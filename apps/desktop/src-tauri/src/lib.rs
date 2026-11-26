@@ -89,6 +89,19 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::save_talk_draft,
         commands::start_talk_polling,
         commands::stop_talk_polling,
+        commands::get_slicer_overview,
+        commands::set_prusaslicer_path,
+        commands::save_custom_material_preset,
+        commands::delete_custom_material_preset,
+        commands::save_material_preset_draft,
+        commands::clear_material_preset_draft,
+        commands::validate_slicer_plate,
+        commands::load_cloud_model_base64,
+        commands::start_slice_job,
+        commands::cancel_slice_job,
+        commands::get_slice_job_status,
+        commands::read_slice_job_gcode_base64,
+        commands::save_slice_job_to_nextcloud,
     ])
 }
 

@@ -85,6 +85,19 @@ export const commands = {
 	 */
 	startTalkPolling: (token: string, lastKnownMessageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("start_talk_polling", { token, lastKnownMessageId }, options),
 	stopTalkPolling: (options?: InvokeOptions) => __TAURI_INVOKE<void>("stop_talk_polling", undefined, options),
+	getSlicerOverview: (options?: InvokeOptions) => __TAURI_INVOKE<SlicerOverview_Serialize>("get_slicer_overview", undefined, options),
+	setPrusaslicerPath: (path: string | null, options?: InvokeOptions) => __TAURI_INVOKE<SlicerBinaryInfo_Serialize>("set_prusaslicer_path", { path }, options),
+	saveCustomMaterialPreset: (preset: MaterialPreset_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<MaterialPreset_Serialize>("save_custom_material_preset", { preset }, options),
+	deleteCustomMaterialPreset: (id: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("delete_custom_material_preset", { id }, options),
+	saveMaterialPresetDraft: (draft: MaterialPreset_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_material_preset_draft", { draft }, options),
+	clearMaterialPresetDraft: (options?: InvokeOptions) => __TAURI_INVOKE<null>("clear_material_preset_draft", undefined, options),
+	validateSlicerPlate: (fileName: string, modelSizeBytes: number, bounds: PlateBoundsMm | null, quality: QualityPreset, materialId: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("validate_slicer_plate", { fileName, modelSizeBytes, bounds, quality, materialId }, options),
+	loadCloudModelBase64: (cloudPath: string, options?: InvokeOptions) => __TAURI_INVOKE<CloudModelPayload>("load_cloud_model_base64", { cloudPath }, options),
+	startSliceJob: (request: StartSliceJobRequest_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<SliceJobRecord_Serialize>("start_slice_job", { request }, options),
+	cancelSliceJob: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<SliceJobRecord_Serialize>("cancel_slice_job", { jobId }, options),
+	getSliceJobStatus: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<SliceJobRecord_Serialize>("get_slice_job_status", { jobId }, options),
+	readSliceJobGcodeBase64: (jobId: string, options?: InvokeOptions) => __TAURI_INVOKE<SliceGcodeDownload>("read_slice_job_gcode_base64", { jobId }, options),
+	saveSliceJobToNextcloud: (jobId: string, folderPath: string, options?: InvokeOptions) => __TAURI_INVOKE<SliceJobRecord_Serialize>("save_slice_job_to_nextcloud", { jobId, folderPath }, options),
 };
 
 /* Types */
@@ -113,6 +126,8 @@ export type AppConfig_Deserialize = {
 	skippedUpdateVersion?: string | null,
 	/**  RFC 3339 timestamp of the last completed update check. */
 	lastUpdateCheckAt?: string | null,
+	/**  Optional user-configured path to the local PrusaSlicer CLI executable. */
+	prusaslicerPath?: string | null,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme?: string,
 };
@@ -139,6 +154,8 @@ export type AppConfig_Serialize = {
 	skippedUpdateVersion: string | null,
 	/**  RFC 3339 timestamp of the last completed update check. */
 	lastUpdateCheckAt: string | null,
+	/**  Optional user-configured path to the local PrusaSlicer CLI executable. */
+	prusaslicerPath: string | null,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme: string,
 };
@@ -167,6 +184,12 @@ export type AppUpdateCheckResult_Serialize = {
 	releaseUrl: string,
 	lastCheckedAt: string | null,
 	message: string,
+};
+
+export type CloudModelPayload = {
+	fileName: string,
+	dataBase64: string,
+	sizeBytes: number,
 };
 
 /**
@@ -449,6 +472,45 @@ export type MarkdownDraft_Serialize = {
 	updatedAtMs: number | null,
 };
 
+/**  Filament preset (built-in or user-created custom material). */
+export type MaterialPreset = MaterialPreset_Serialize | MaterialPreset_Deserialize;
+
+/**  Filament preset (built-in or user-created custom material). */
+export type MaterialPreset_Deserialize = {
+	id: string,
+	name: string,
+	filamentType: string,
+	builtIn: boolean,
+	nozzleTempC: number,
+	firstLayerNozzleTempC: number,
+	bedTempC: number,
+	firstLayerBedTempC: number,
+	fanMinPercent: number,
+	fanMaxPercent: number,
+	disableFanFirstLayers: number,
+	maxVolumetricSpeedMm3S: number | null,
+	extrusionMultiplier: number | null,
+	hint?: string | null,
+};
+
+/**  Filament preset (built-in or user-created custom material). */
+export type MaterialPreset_Serialize = {
+	id: string,
+	name: string,
+	filamentType: string,
+	builtIn: boolean,
+	nozzleTempC: number,
+	firstLayerNozzleTempC: number,
+	bedTempC: number,
+	firstLayerBedTempC: number,
+	fanMinPercent: number,
+	fanMaxPercent: number,
+	disableFanFirstLayers: number,
+	maxVolumetricSpeedMm3S: number | null,
+	extrusionMultiplier: number | null,
+	hint: string | null,
+};
+
 /**  Concise audit log record shown in the desktop UI (never stores file contents or secrets). */
 export type McpAuditEntry = McpAuditEntry_Serialize | McpAuditEntry_Deserialize;
 
@@ -530,7 +592,7 @@ export type McpToolInfo = {
 };
 
 /**  Capabilities a workspace module can declare to the host shell. */
-export type ModuleCapability = "storage" | "preview" | "mcpServerTools" | "mcpClient" | "workflows" | "chat";
+export type ModuleCapability = "storage" | "preview" | "mcpServerTools" | "mcpClient" | "workflows" | "chat" | "slicing";
 
 /**  Serializable metadata describing a registered workspace module. */
 export type ModuleDescriptor = {
@@ -557,8 +619,55 @@ export type PendingWriteApproval = {
 	createdAt: string,
 };
 
+/**  Axis-aligned bounding box of all models arranged on the MK3S build plate (in mm). */
+export type PlateBoundsMm = {
+	minX: number | null,
+	maxX: number | null,
+	minY: number | null,
+	maxY: number | null,
+	minZ: number | null,
+	maxZ: number | null,
+	objectCount: number,
+};
+
 /**  Rendering/preview strategy selected for a file in the Files workspace. */
 export type PreviewKind = "markdown" | "image" | "video" | "pdf" | "vectorSvg" | "vectorAi" | "vectorDxf" | "vectorEps" | "solidWorks" | "cad3d" | "plainText" | "unsupported";
+
+/**  Fixed target printer metadata exposed to the UI. */
+export type PrinterSpecs = {
+	id: string,
+	name: string,
+	bedXMm: number | null,
+	bedYMm: number | null,
+	bedZMm: number | null,
+	nozzleDiameterMm: number | null,
+	maxNozzleTempC: number,
+	maxBedTempC: number,
+};
+
+/**  Three fixed quality choices (raw mm numbers are kept out of the primary UX). */
+export type QualityPreset = "fine" | "standard" | "fast";
+
+export type QualityPresetInfo = {
+	id: QualityPreset,
+	label: string,
+	subtitle: string,
+	layerHeightMm: number | null,
+};
+
+/**  Headline structural preset controlling walls, infill, and shell thickness. */
+export type RigidityPreset = "low" | "medium" | "high" | "mold";
+
+export type RigidityPresetInfo = {
+	id: RigidityPreset,
+	label: string,
+	subtitle: string,
+	perimeters: number,
+	fillDensityPercent: number,
+	topSolidLayers: number,
+	bottomSolidLayers: number,
+	fillPattern: string,
+};
 
 /**  Result of saving a Markdown document to Nextcloud. */
 export type SaveMarkdownResponse = {
@@ -583,6 +692,112 @@ export type SendTalkMessageRequest_Serialize = {
 	message: string,
 	replyTo: number | null,
 	referenceId: string | null,
+};
+
+export type SliceGcodeDownload = {
+	fileName: string,
+	dataBase64: string,
+	sizeBytes: number,
+};
+
+export type SliceJobRecord = SliceJobRecord_Serialize | SliceJobRecord_Deserialize;
+
+export type SliceJobRecord_Deserialize = {
+	id: string,
+	outputFileName: string,
+	materialName: string,
+	rigidity: RigidityPreset,
+	quality: QualityPreset,
+	state: SliceJobState,
+	percent: number,
+	stage: string,
+	createdAt: string,
+	finishedAt?: string | null,
+	estimatedTime?: string | null,
+	filamentGrams?: number | null,
+	filamentMm?: number | null,
+	gcodeSizeBytes?: number | null,
+	cloudSavedPath?: string | null,
+	errorMessage?: string | null,
+	technicalLog?: string | null,
+};
+
+export type SliceJobRecord_Serialize = {
+	id: string,
+	outputFileName: string,
+	materialName: string,
+	rigidity: RigidityPreset,
+	quality: QualityPreset,
+	state: SliceJobState,
+	percent: number,
+	stage: string,
+	createdAt: string,
+	finishedAt: string | null,
+	estimatedTime: string | null,
+	filamentGrams: number | null,
+	filamentMm: number | null,
+	gcodeSizeBytes: number | null,
+	cloudSavedPath: string | null,
+	errorMessage: string | null,
+	technicalLog: string | null,
+};
+
+export type SliceJobState = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+/**  Safe optional overrides that never touch locked machine start/end G-code. */
+export type SliceOverrides = SliceOverrides_Serialize | SliceOverrides_Deserialize;
+
+/**  Safe optional overrides that never touch locked machine start/end G-code. */
+export type SliceOverrides_Deserialize = {
+	supportMaterial?: boolean,
+	brimWidthMm?: number | null,
+};
+
+/**  Safe optional overrides that never touch locked machine start/end G-code. */
+export type SliceOverrides_Serialize = {
+	supportMaterial: boolean,
+	brimWidthMm: number | null,
+};
+
+/**  Detection result for the local PrusaSlicer executable. */
+export type SlicerBinaryInfo = SlicerBinaryInfo_Serialize | SlicerBinaryInfo_Deserialize;
+
+/**  Detection result for the local PrusaSlicer executable. */
+export type SlicerBinaryInfo_Deserialize = {
+	available: boolean,
+	path?: string | null,
+	version?: string | null,
+	source: string,
+};
+
+/**  Detection result for the local PrusaSlicer executable. */
+export type SlicerBinaryInfo_Serialize = {
+	available: boolean,
+	path: string | null,
+	version: string | null,
+	source: string,
+};
+
+export type SlicerOverview = SlicerOverview_Serialize | SlicerOverview_Deserialize;
+
+export type SlicerOverview_Deserialize = {
+	printer: PrinterSpecs,
+	binary: SlicerBinaryInfo_Deserialize,
+	rigidityPresets: RigidityPresetInfo[],
+	qualityPresets: QualityPresetInfo[],
+	materials: MaterialPreset_Deserialize[],
+	materialDraft?: MaterialPreset_Deserialize | null,
+	recentJobs: SliceJobRecord_Deserialize[],
+};
+
+export type SlicerOverview_Serialize = {
+	printer: PrinterSpecs,
+	binary: SlicerBinaryInfo_Serialize,
+	rigidityPresets: RigidityPresetInfo[],
+	qualityPresets: QualityPresetInfo[],
+	materials: MaterialPreset_Serialize[],
+	materialDraft: MaterialPreset_Serialize | null,
+	recentJobs: SliceJobRecord_Serialize[],
 };
 
 /**  Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams. */
@@ -631,6 +846,32 @@ export type SolidWorksPreview_Serialize = {
 	thumbnailDataUrl: string | null,
 	metadata: SolidWorksMetadata_Serialize,
 	streamCount: number,
+};
+
+export type StartSliceJobRequest = StartSliceJobRequest_Serialize | StartSliceJobRequest_Deserialize;
+
+export type StartSliceJobRequest_Deserialize = {
+	modelFileName: string,
+	modelBase64: string,
+	outputName?: string | null,
+	bounds?: PlateBoundsMm | null,
+	materialId: string,
+	rigidity: RigidityPreset,
+	quality: QualityPreset,
+	overrides: SliceOverrides_Deserialize,
+	saveToCloudFolder?: string | null,
+};
+
+export type StartSliceJobRequest_Serialize = {
+	modelFileName: string,
+	modelBase64: string,
+	outputName: string | null,
+	bounds: PlateBoundsMm | null,
+	materialId: string,
+	rigidity: RigidityPreset,
+	quality: QualityPreset,
+	overrides: SliceOverrides_Serialize,
+	saveToCloudFolder: string | null,
 };
 
 /**  Feature-detected Nextcloud Talk (`spreed`) server capabilities from `/ocs/v1.php/cloud/capabilities`. */

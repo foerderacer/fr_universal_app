@@ -9,12 +9,14 @@ use fr_mcp::{
 use fr_mod_automation::{AutomationModule, register_automation_tools};
 use fr_mod_files::FilesModule;
 use fr_mod_finance::{FinanceLedger, FinanceModule, register_finance_tools};
+use fr_mod_slicer::{SlicerModule, register_slicer_tools};
 use fr_mod_talk::{TalkModule, register_talk_tools};
 use fr_nextcloud::{
     CredentialStore, KeyringCredentialStore, LoginFlowSession, NextcloudBackend,
     NextcloudConnectionStatus, NextcloudCredentials, UserAccountInfo, build_http_client,
 };
 use fr_preview::MediaProxyServer;
+use fr_slicer::{SliceJobManager, SlicerPresetStore};
 use fr_storage::{CacheStore, CachedStorage, StorageBackend};
 use fr_talk::{TalkCacheStore, TalkCapabilities, TalkClient};
 use fr_workflows::{WorkflowRunner, WorkflowStore};
@@ -44,6 +46,8 @@ pub struct AppState {
     pub talk_cache: Arc<TalkCacheStore>,
     pub talk_capabilities: Mutex<Option<TalkCapabilities>>,
     pub talk_poll_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub slicer_presets: Arc<SlicerPresetStore>,
+    pub slicer_jobs: Arc<SliceJobManager>,
     pub modules: ModuleRegistry,
     pub events: EventBus,
 }
@@ -94,6 +98,7 @@ impl AppState {
         let mut modules = ModuleRegistry::new();
         modules.register(FilesModule);
         modules.register(TalkModule);
+        modules.register(SlicerModule);
         modules.register(FinanceModule);
         modules.register(AutomationModule);
         modules.register(McpModule);
@@ -225,6 +230,23 @@ impl AppState {
             Arc::new(move || creds_for_talk.lock().ok().and_then(|g| g.clone())),
         );
 
+        let slicer_presets = Arc::new(SlicerPresetStore::default_location().unwrap_or_else(|_| {
+            SlicerPresetStore::from_dir(std::env::temp_dir().join("fr-universal-app-slicer"))
+        }));
+        let slicer_jobs = Arc::new(SliceJobManager::new());
+        let config_store_for_slicer = config_store.clone();
+        register_slicer_tools(
+            &mcp_registry,
+            slicer_presets.clone(),
+            storage.clone(),
+            Arc::new(move || {
+                config_store_for_slicer
+                    .load()
+                    .ok()
+                    .and_then(|c| c.prusaslicer_path)
+            }),
+        );
+
         let state = Self {
             config_store,
             config: Mutex::new(config.clone()),
@@ -248,6 +270,8 @@ impl AppState {
             talk_cache,
             talk_capabilities: Mutex::new(None),
             talk_poll_handle: Mutex::new(None),
+            slicer_presets,
+            slicer_jobs,
             modules,
             events,
         };

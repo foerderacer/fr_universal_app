@@ -1,0 +1,17 @@
+[package]
+name = "fr-mod-slicer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+fr-core.workspace = true
+fr-mcp.workspace = true
+fr-slicer.workspace = true
+fr-storage.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

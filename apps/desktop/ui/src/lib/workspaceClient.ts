@@ -28,6 +28,7 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     financeFolder: "/Finance",
     skippedUpdateVersion: null as string | null,
     lastUpdateCheckAt: null as string | null,
+    prusaslicerPath: null as string | null,
     theme: "system",
   };
 

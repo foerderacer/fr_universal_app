@@ -30,8 +30,9 @@ This file defines the architecture rules, development workflow, and quality stan
 │   ├── fr-preview/              # Client-side preview extractors (SolidWorks CFBF, vector/media helpers, loopback Range media proxy)
 │   ├── fr-mcp/                  # Dual MCP Server + MCP Client (rmcp)
 │   ├── fr-talk/                 # Nextcloud Talk OCS chat client, pure file-ID references & SQLite cache
+│   ├── fr-slicer/               # Headless PrusaSlicer CLI runner, MK3S presets, validation & job manager
 │   ├── fr-workflows/            # Automation engine (triggers, steps, MCP tool invocations)
-│   └── modules/                 # Pluggable domain modules (fr-mod-files, fr-mod-talk, fr-mod-finance, fr-mod-automation)
+│   └── modules/                 # Pluggable domain modules (fr-mod-files, fr-mod-talk, fr-mod-slicer, fr-mod-finance, fr-mod-automation)
 └── apps/
     └── desktop/                 # Tauri v2 desktop app (Windows & macOS)
         ├── src-tauri/           # Thin Tauri bridge (commands, media protocol, updater, tray/window)
@@ -59,6 +60,7 @@ This repository may be **public**. Strictly enforce:
   - Require an auto-generated Bearer token.
   - Default to disabled or read-only until explicitly enabled by the user, with UI confirmation/audit logging for destructive or write operations.
 - **SVG & Preview Safety:** Sanitize untrusted `.svg` files before rendering in WebView to prevent embedded script execution.
+- **License Posture:** This repository is licensed under **GNU AGPL-3.0** (`LICENSE`, `Cargo.toml`). The 3D Slicer module runs external prebuilt PrusaSlicer binaries as a separate child process (never linked via FFI or compiled in CI).
 
 ---
 

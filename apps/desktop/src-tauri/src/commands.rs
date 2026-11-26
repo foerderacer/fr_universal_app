@@ -18,6 +18,13 @@ use fr_nextcloud::{
     LoginPollResult, NextcloudConnectionStatus, UserAccountInfo, fetch_user_account_info,
     initiate_login_flow, normalize_server_url, poll_login_flow,
 };
+use fr_slicer::{
+    MAX_MODEL_BYTES, MaterialPreset, PlateBoundsMm, PrinterSpecs, PrusaSlicerEngine, QualityPreset,
+    QualityPresetInfo, RigidityPreset, RigidityPresetInfo, SliceEngineRequest, SliceJobRecord,
+    SliceOverrides, SliceValidationRequest, SlicerBinaryInfo, builtin_materials,
+    detect_prusaslicer_binary, engine::DEFAULT_SLICE_TIMEOUT, quality_presets_info,
+    rigidity_presets_info, sanitize_gcode_filename, validate_slice_request,
+};
 use fr_storage::{CloudPath, Etag};
 use fr_talk::{
     CreateTalkRoomRequest, MAX_ATTACHMENT_UPLOAD_BYTES, SendTalkMessageRequest, TalkCapabilities,
@@ -1873,10 +1880,23 @@ pub async fn get_update_safety_status(
     })
     .await
     .unwrap_or(0);
-    Ok(evaluate_pre_restart_safety(
-        pending_drafts,
-        running_workflows,
-    ))
+    let mut safety = evaluate_pre_restart_safety(pending_drafts, running_workflows);
+    let active_slices = state.slicer_jobs.active_job_count();
+    if active_slices > 0 {
+        safety.safe_to_restart = false;
+        safety.warnings.push(format!(
+            "{active_slices} 3D slicing job{} currently running — wait or cancel before restarting.",
+            if active_slices == 1 { " is" } else { "s are" }
+        ));
+    }
+    if state.slicer_presets.has_material_draft() {
+        safety.pending_drafts_count = safety.pending_drafts_count.saturating_add(1);
+        safety.safe_to_restart = false;
+        safety
+            .warnings
+            .push("You have an unsaved custom 3D filament preset draft in the 3D Slicer.".into());
+    }
+    Ok(safety)
 }
 
 #[tauri::command]
@@ -2592,6 +2612,491 @@ pub async fn start_talk_polling(
 #[specta::specta]
 pub fn stop_talk_polling(state: State<'_, AppState>) {
     state.stop_talk_polling();
+}
+
+// ============================================================================
+// 3D Printing Slicer (Prusa MK3S + headless PrusaSlicer CLI)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SlicerOverview {
+    pub printer: PrinterSpecs,
+    pub binary: SlicerBinaryInfo,
+    pub rigidity_presets: Vec<RigidityPresetInfo>,
+    pub quality_presets: Vec<QualityPresetInfo>,
+    pub materials: Vec<MaterialPreset>,
+    pub material_draft: Option<MaterialPreset>,
+    pub recent_jobs: Vec<SliceJobRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSliceJobRequest {
+    pub model_file_name: String,
+    pub model_base64: String,
+    pub output_name: Option<String>,
+    pub bounds: Option<PlateBoundsMm>,
+    pub material_id: String,
+    pub rigidity: RigidityPreset,
+    pub quality: QualityPreset,
+    pub overrides: SliceOverrides,
+    pub save_to_cloud_folder: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudModelPayload {
+    pub file_name: String,
+    pub data_base64: String,
+    pub size_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceGcodeDownload {
+    pub file_name: String,
+    pub data_base64: String,
+    pub size_bytes: u32,
+}
+
+fn friendly_slicer_error(err: &FrError) -> (String, Option<String>) {
+    let raw = err.to_string();
+    if raw.contains("slicer_cancelled:") {
+        return ("Slicing was cancelled.".into(), None);
+    }
+    if raw.contains("slicer_timeout:") {
+        return (
+            "Slicing took longer than expected and was stopped automatically. Try a simpler model or Fast quality."
+                .into(),
+            Some(raw),
+        );
+    }
+    if raw.contains("slicer_failed:") {
+        return (
+            "We couldn't prepare this model for printing. Check that the STL/3MF mesh is manifold and fits on the Prusa MK3S bed."
+                .into(),
+            Some(raw),
+        );
+    }
+    (
+        "We couldn't prepare this model for printing.".into(),
+        Some(raw),
+    )
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_slicer_overview(
+    state: State<'_, AppState>,
+) -> Result<SlicerOverview, UserFacingError> {
+    let configured_path = state.current_config().prusaslicer_path;
+    let binary = detect_prusaslicer_binary(configured_path.as_deref()).await;
+    let store = state.slicer_presets.clone();
+    let (materials, material_draft) = tokio::task::spawn_blocking(move || {
+        let mats = store
+            .list_all_materials()
+            .unwrap_or_else(|_| builtin_materials());
+        let draft = store.get_material_draft().ok().flatten();
+        (mats, draft)
+    })
+    .await
+    .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?;
+
+    Ok(SlicerOverview {
+        printer: PrinterSpecs::default(),
+        binary,
+        rigidity_presets: rigidity_presets_info(),
+        quality_presets: quality_presets_info(),
+        materials,
+        material_draft,
+        recent_jobs: state.slicer_jobs.list_jobs(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_prusaslicer_path(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<SlicerBinaryInfo, UserFacingError> {
+    let cleaned = path
+        .map(|s| s.trim().trim_matches('"').to_owned())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref p) = cleaned {
+        let pb = PathBuf::from(p);
+        if !pb.is_file() {
+            return Err(UserFacingError {
+                code: "slicer_binary_not_found".into(),
+                title: "PrusaSlicer executable not found".into(),
+                message: "The selected path does not point to a PrusaSlicer program file.".into(),
+                recovery_hint: Some(
+                    "Choose prusa-slicer-console.exe (Windows) or PrusaSlicer.app/Contents/MacOS/PrusaSlicer (macOS), or leave blank for automatic detection."
+                        .into(),
+                ),
+                technical_details: Some(p.clone()),
+            });
+        }
+    }
+
+    let candidate = {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while saving PrusaSlicer path"))?;
+        let mut next = guard.clone();
+        next.prusaslicer_path = cleaned.clone();
+        *guard = next.clone();
+        next
+    };
+    let store = state.config_store.clone();
+    tokio::task::spawn_blocking(move || store.save(&candidate))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)?;
+
+    Ok(detect_prusaslicer_binary(cleaned.as_deref()).await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_custom_material_preset(
+    state: State<'_, AppState>,
+    preset: MaterialPreset,
+) -> Result<MaterialPreset, UserFacingError> {
+    let store = state.slicer_presets.clone();
+    tokio::task::spawn_blocking(move || store.save_custom_material(preset))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_custom_material_preset(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), UserFacingError> {
+    let store = state.slicer_presets.clone();
+    tokio::task::spawn_blocking(move || store.delete_custom_material(&id))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_material_preset_draft(
+    state: State<'_, AppState>,
+    draft: MaterialPreset,
+) -> Result<(), UserFacingError> {
+    let store = state.slicer_presets.clone();
+    tokio::task::spawn_blocking(move || store.save_material_draft(&draft))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_material_preset_draft(
+    state: State<'_, AppState>,
+) -> Result<(), UserFacingError> {
+    let store = state.slicer_presets.clone();
+    tokio::task::spawn_blocking(move || store.clear_material_draft())
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn validate_slicer_plate(
+    state: State<'_, AppState>,
+    file_name: String,
+    model_size_bytes: u32,
+    bounds: Option<PlateBoundsMm>,
+    quality: QualityPreset,
+    material_id: String,
+) -> Result<(), UserFacingError> {
+    let material = state
+        .slicer_presets
+        .find_material(&material_id)
+        .map_err(UserFacingError::from)?;
+    validate_slice_request(&SliceValidationRequest {
+        file_name,
+        model_size_bytes,
+        bounds,
+        quality,
+        material,
+    })
+    .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn load_cloud_model_base64(
+    state: State<'_, AppState>,
+    cloud_path: String,
+) -> Result<CloudModelPayload, UserFacingError> {
+    let lower = cloud_path.trim().to_ascii_lowercase();
+    if !(lower.ends_with(".stl") || lower.ends_with(".3mf")) {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "Select an STL (.stl) or 3MF (.3mf) file to load onto the build plate.".into(),
+        )));
+    }
+    let storage = state.current_storage().ok_or_else(|| {
+        UserFacingError::from(FrError::AuthRequired("Nextcloud is not signed in.".into()))
+    })?;
+    let path = CloudPath::parse(&cloud_path).map_err(UserFacingError::from)?;
+    let (bytes, _etag) = storage.read(&path).await.map_err(UserFacingError::from)?;
+    if bytes.len() > MAX_MODEL_BYTES {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "This 3D model exceeds the 100 MiB size limit.".into(),
+        )));
+    }
+    let file_name = path.file_name().unwrap_or("model.stl").to_owned();
+    let size_bytes = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let data_base64 = BASE64.encode(&bytes);
+    Ok(CloudModelPayload {
+        file_name,
+        data_base64,
+        size_bytes,
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn start_slice_job(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: StartSliceJobRequest,
+) -> Result<SliceJobRecord, UserFacingError> {
+    // Guard against huge payloads before base64 decoding.
+    let max_b64_len = (MAX_MODEL_BYTES / 3 + 1) * 4 + 4;
+    if request.model_base64.len() > max_b64_len {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "The combined 3D model exceeds the 100 MiB slicing limit.".into(),
+        )));
+    }
+    let model_raw = BASE64
+        .decode(request.model_base64.as_bytes())
+        .map_err(|_| {
+            UserFacingError::from(FrError::InvalidInput(
+                "The 3D model data could not be decoded.".into(),
+            ))
+        })?;
+    let material = state
+        .slicer_presets
+        .find_material(&request.material_id)
+        .map_err(UserFacingError::from)?;
+
+    let model_size_bytes = u32::try_from(model_raw.len()).map_err(|_| {
+        UserFacingError::from(FrError::InvalidInput(
+            "The combined 3D model exceeds the 100 MiB slicing limit.".into(),
+        ))
+    })?;
+    validate_slice_request(&SliceValidationRequest {
+        file_name: request.model_file_name.clone(),
+        model_size_bytes,
+        bounds: request.bounds.clone(),
+        quality: request.quality,
+        material: material.clone(),
+    })
+    .map_err(UserFacingError::from)?;
+
+    let configured_path = state.current_config().prusaslicer_path;
+    let binary = detect_prusaslicer_binary(configured_path.as_deref()).await;
+    let bin_path = binary.path.filter(|_| binary.available).ok_or_else(|| {
+        UserFacingError {
+            code: "slicer_not_installed".into(),
+            title: "PrusaSlicer is required to slice models".into(),
+            message:
+                "FR Universal App uses the official PrusaSlicer CLI to generate safe Prusa MK3S G-code, but it wasn't found on this computer."
+                    .into(),
+            recovery_hint: Some(
+                "Install PrusaSlicer from prusa3d.com or point to an existing prusa-slicer executable in the engine setup bar above."
+                    .into(),
+            ),
+            technical_details: None,
+        }
+    })?;
+
+    let output_file_name = sanitize_gcode_filename(
+        request
+            .output_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&request.model_file_name),
+    );
+    let (record, cancel_rx) = state.slicer_jobs.create_job(
+        output_file_name.clone(),
+        material.name.clone(),
+        request.rigidity,
+        request.quality,
+    );
+
+    let job_id = record.id.clone();
+    let jobs = state.slicer_jobs.clone();
+    let storage = state.current_storage();
+    let cloud_folder = request
+        .save_to_cloud_folder
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+
+    tauri::async_runtime::spawn(async move {
+        let engine = PrusaSlicerEngine::new(bin_path);
+        let jobs_prog = jobs.clone();
+        let app_prog = app.clone();
+
+        let res = engine
+            .run_slice(
+                SliceEngineRequest {
+                    job_id: job_id.clone(),
+                    model_file_name: request.model_file_name,
+                    model_bytes: Bytes::from(model_raw),
+                    bounds: request.bounds,
+                    quality: request.quality,
+                    rigidity: request.rigidity,
+                    material,
+                    overrides: request.overrides,
+                    timeout: DEFAULT_SLICE_TIMEOUT,
+                },
+                cancel_rx,
+                move |ev| {
+                    jobs_prog.update_progress(&ev.job_id, ev.percent, ev.stage.clone());
+                    let _ = app_prog.emit("slicer://progress", &ev);
+                },
+            )
+            .await;
+
+        match res {
+            Ok(out) => {
+                let mut saved_cloud_path: Option<String> = None;
+                if let (Some(folder_raw), Some(backend)) = (cloud_folder, storage)
+                    && let Ok(folder_path) = CloudPath::parse(&folder_raw)
+                    && let Ok(dest) = folder_path.join(&output_file_name)
+                {
+                    let _ = backend.mkdir(&folder_path).await;
+                    if backend
+                        .write(&dest, out.gcode_bytes.clone(), None)
+                        .await
+                        .is_ok()
+                    {
+                        saved_cloud_path = Some(dest.as_str().to_owned());
+                    }
+                }
+                if let Some(done) = jobs.mark_completed(
+                    &job_id,
+                    out.gcode_bytes,
+                    out.estimated_time,
+                    out.filament_grams,
+                    out.filament_mm,
+                    saved_cloud_path,
+                    out.engine_log,
+                ) {
+                    let _ = app.emit("slicer://job-updated", &done);
+                }
+            }
+            Err(err) => {
+                if err.to_string().contains("slicer_cancelled:") {
+                    if let Some(cancelled) = jobs.mark_cancelled(&job_id) {
+                        let _ = app.emit("slicer://job-updated", &cancelled);
+                    }
+                } else {
+                    let (friendly, tech) = friendly_slicer_error(&err);
+                    if let Some(failed) = jobs.mark_failed(&job_id, friendly, tech) {
+                        let _ = app.emit("slicer://job-updated", &failed);
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(record)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn cancel_slice_job(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<SliceJobRecord, UserFacingError> {
+    let updated = state
+        .slicer_jobs
+        .cancel_job(&job_id)
+        .map_err(UserFacingError::from)?;
+    let _ = app.emit("slicer://job-updated", &updated);
+    Ok(updated)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_slice_job_status(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<SliceJobRecord, UserFacingError> {
+    state.slicer_jobs.get_job(&job_id).ok_or_else(|| {
+        UserFacingError::from(FrError::NotFound(format!(
+            "Slice job '{job_id}' was not found."
+        )))
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn read_slice_job_gcode_base64(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<SliceGcodeDownload, UserFacingError> {
+    let (file_name, bytes) = state.slicer_jobs.get_gcode(&job_id).ok_or_else(|| {
+        UserFacingError::from(FrError::NotFound(
+            "G-code for this slicing job is no longer in memory. Slice the plate again to regenerate it."
+                .into(),
+        ))
+    })?;
+    Ok(SliceGcodeDownload {
+        file_name,
+        size_bytes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        data_base64: BASE64.encode(&bytes),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_slice_job_to_nextcloud(
+    state: State<'_, AppState>,
+    job_id: String,
+    folder_path: String,
+) -> Result<SliceJobRecord, UserFacingError> {
+    let storage = state.current_storage().ok_or_else(|| {
+        UserFacingError::from(FrError::AuthRequired("Nextcloud is not signed in.".into()))
+    })?;
+    let (file_name, bytes) = state.slicer_jobs.get_gcode(&job_id).ok_or_else(|| {
+        UserFacingError::from(FrError::NotFound(
+            "G-code for this slicing job is no longer available.".into(),
+        ))
+    })?;
+    let folder = CloudPath::parse(&folder_path).map_err(UserFacingError::from)?;
+    let dest = folder.join(&file_name).map_err(UserFacingError::from)?;
+    match storage.mkdir(&folder).await {
+        Ok(()) | Err(FrError::AlreadyExists(_)) => {}
+        Err(err) => return Err(UserFacingError::from(err)),
+    }
+    storage
+        .write(&dest, bytes, None)
+        .await
+        .map_err(UserFacingError::from)?;
+    state
+        .slicer_jobs
+        .set_cloud_saved_path(&job_id, dest.as_str().to_owned())
+        .ok_or_else(|| {
+            UserFacingError::from(FrError::NotFound(format!(
+                "Slice job '{job_id}' was not found."
+            )))
+        })
 }
 
 #[cfg(test)]
