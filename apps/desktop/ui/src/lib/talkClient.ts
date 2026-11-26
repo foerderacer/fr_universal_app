@@ -128,10 +128,9 @@ export async function toggleTalkReaction(
 export async function shareTalkFileReference(
   token: string,
   fileId: string,
-  caption: string | null = null,
 ): Promise<TalkMessage_Serialize> {
   if (!isTauri()) requireDesktop("Referencing Nextcloud files in Talk");
-  return commands.shareTalkFileReference(token, fileId, caption);
+  return commands.shareTalkFileReference(token, fileId);
 }
 
 export async function uploadTalkAttachmentBytes(

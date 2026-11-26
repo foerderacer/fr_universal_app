@@ -75,12 +75,12 @@ export const commands = {
 	deleteTalkMessage: (token: string, messageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("delete_talk_message", { token, messageId }, options),
 	markTalkRead: (token: string, lastReadMessageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("mark_talk_read", { token, lastReadMessageId }, options),
 	toggleTalkReaction: (token: string, messageId: number | null, reaction: string, add: boolean, options?: InvokeOptions) => __TAURI_INVOKE<null>("toggle_talk_reaction", { token, messageId, reaction, add }, options),
-	shareTalkFileReference: (token: string, fileId: string, caption: string | null, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("share_talk_file_reference", { token, fileId, caption }, options),
+	shareTalkFileReference: (token: string, fileId: string, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("share_talk_file_reference", { token, fileId }, options),
 	uploadTalkAttachmentBase64: (token: string, roomDisplayName: string, fileName: string, dataBase64: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("upload_talk_attachment_base64", { token, roomDisplayName, fileName, dataBase64 }, options),
 	getTalkDraft: (token: string, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_talk_draft", { token }, options),
 	saveTalkDraft: (token: string, text: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_talk_draft", { token, text }, options),
 	/**
-	 *  Starts a single Rust-owned long-poll loop (`lookIntoFuture=1&timeout=60`) for ONLY the
+	 *  Starts a single Rust-owned long-poll loop (`lookIntoFuture=1&timeout=30`) for ONLY the
 	 *  currently open conversation, automatically cancelling any previous conversation's loop.
 	 */
 	startTalkPolling: (token: string, lastKnownMessageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("start_talk_polling", { token, lastKnownMessageId }, options),

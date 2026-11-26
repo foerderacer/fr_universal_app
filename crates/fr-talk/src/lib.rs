@@ -12,7 +12,7 @@ pub mod client;
 pub mod models;
 
 pub use cache::TalkCacheStore;
-pub use client::{TalkClient, validate_room_token};
+pub use client::{MAX_ATTACHMENT_UPLOAD_BYTES, TalkClient, validate_room_token};
 pub use models::{
     CreateTalkRoomRequest, SendTalkMessageRequest, TalkCapabilities, TalkFileReference,
     TalkMessage, TalkMessagesPage, TalkParentMessage, TalkRoom, TalkRoomType, TalkRoomsPage,

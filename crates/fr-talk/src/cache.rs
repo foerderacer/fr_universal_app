@@ -275,6 +275,11 @@ impl TalkCacheStore {
             params![account_scope],
         )
         .map_err(sqlite_err)?;
+        conn.execute(
+            "DELETE FROM talk_drafts WHERE account_scope = ?1",
+            params![account_scope],
+        )
+        .map_err(sqlite_err)?;
         Ok(())
     }
 }

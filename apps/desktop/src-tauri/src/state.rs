@@ -335,8 +335,14 @@ impl AppState {
                 })
             })
             .unwrap_or(false);
-        if switched_account && let Some(ref cache) = self.cache {
-            let _ = cache.clear_cached_data();
+        if switched_account {
+            self.stop_talk_polling();
+            if let Ok(mut guard) = self.talk_capabilities.lock() {
+                *guard = None;
+            }
+            if let Some(ref cache) = self.cache {
+                let _ = cache.clear_cached_data();
+            }
         }
 
         let nc = NextcloudBackend::with_client(self.http_client.clone(), creds.clone())?;

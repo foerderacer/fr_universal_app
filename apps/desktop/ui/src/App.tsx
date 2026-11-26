@@ -427,10 +427,11 @@ export function App() {
               isNextcloudConnected={
                 overview.connectionStatus.state === "connected"
               }
-              currentLoginName={
-                overview.connectionStatus.state === "connected"
+              currentActorId={
+                overview.accountInfo?.id ??
+                (overview.connectionStatus.state === "connected"
                   ? overview.connectionStatus.loginName
-                  : null
+                  : null)
               }
             />
           ) : activeModule?.id === "mcp" ? (

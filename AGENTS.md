@@ -29,8 +29,9 @@ This file defines the architecture rules, development workflow, and quality stan
 │   ├── fr-nextcloud/            # Nextcloud Login Flow v2, WebDAV/OCS client, Range streaming
 │   ├── fr-preview/              # Client-side preview extractors (SolidWorks CFBF, vector/media helpers, loopback Range media proxy)
 │   ├── fr-mcp/                  # Dual MCP Server + MCP Client (rmcp)
+│   ├── fr-talk/                 # Nextcloud Talk OCS chat client, pure file-ID references & SQLite cache
 │   ├── fr-workflows/            # Automation engine (triggers, steps, MCP tool invocations)
-│   └── modules/                 # Pluggable domain modules (fr-mod-files, fr-mod-finance, fr-mod-automation)
+│   └── modules/                 # Pluggable domain modules (fr-mod-files, fr-mod-talk, fr-mod-finance, fr-mod-automation)
 └── apps/
     └── desktop/                 # Tauri v2 desktop app (Windows & macOS)
         ├── src-tauri/           # Thin Tauri bridge (commands, media protocol, updater, tray/window)

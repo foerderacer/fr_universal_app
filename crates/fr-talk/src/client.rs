@@ -15,7 +15,7 @@ use crate::models::{
     TalkParentMessage, TalkRoom, TalkRoomType, TalkRoomsPage,
 };
 
-const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
+pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
 
 /// Pure-Rust Nextcloud Talk OCS REST client (chat only — calls are out of scope).
 #[derive(Clone)]
@@ -49,7 +49,7 @@ pub fn validate_room_token(token: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-fn sanitize_path_segment(raw: &str) -> String {
+pub(crate) fn sanitize_path_segment(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
@@ -73,10 +73,70 @@ fn sanitize_path_segment(raw: &str) -> String {
         .collect();
     let trimmed = cleaned.trim().trim_matches('.');
     if trimmed.is_empty() {
-        "attachment".to_owned()
-    } else {
-        trimmed.chars().take(120).collect()
+        return "attachment".to_owned();
     }
+
+    // Preserve extension when truncating to 120 chars.
+    let mut candidate = if trimmed.chars().count() > 120 {
+        if let Some((stem, ext)) = trimmed.rsplit_once('.') {
+            let ext_chars = ext.chars().count();
+            if !stem.is_empty() && ext_chars > 0 && ext_chars <= 20 {
+                let keep = 120usize.saturating_sub(ext_chars + 1);
+                let short_stem: String = stem.chars().take(keep).collect();
+                format!("{short_stem}.{ext}")
+            } else {
+                trimmed.chars().take(120).collect()
+            }
+        } else {
+            trimmed.chars().take(120).collect()
+        }
+    } else {
+        trimmed.to_owned()
+    };
+
+    // Guard against Windows reserved device filenames (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+    let stem_upper = candidate
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let is_windows_reserved = matches!(
+        stem_upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if is_windows_reserved {
+        candidate.insert(0, '_');
+    }
+    candidate
+}
+
+fn extract_ocs_message(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["ocs"]["meta"]["message"].as_str().map(ToOwned::to_owned))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 impl TalkClient {
@@ -97,33 +157,38 @@ impl TalkClient {
             || status == StatusCode::SERVICE_UNAVAILABLE
         {
             return FrError::Network(
-                "Nextcloud is currently in maintenance mode. Try again shortly.".into(),
+                "talk_maintenance: Nextcloud is currently in maintenance mode. Try again shortly."
+                    .into(),
             );
         }
+        let server_hint = extract_ocs_message(body);
         match status {
             StatusCode::UNAUTHORIZED => FrError::AuthRequired(
                 "Your Nextcloud session expired. Please sign in again.".into(),
             ),
-            StatusCode::FORBIDDEN => FrError::AuthRequired(
-                "You don't have permission to perform this action in Nextcloud Talk.".into(),
+            StatusCode::FORBIDDEN => FrError::PermissionDenied(server_hint.unwrap_or_else(|| {
+                "You don't have permission to perform this action in Nextcloud Talk.".into()
+            })),
+            StatusCode::BAD_REQUEST => FrError::InvalidInput(
+                server_hint
+                    .unwrap_or_else(|| "Nextcloud Talk could not process that request.".into()),
             ),
             StatusCode::NOT_FOUND => {
                 FrError::NotFound("This conversation or message was not found on Nextcloud.".into())
             }
-            StatusCode::PRECONDITION_FAILED => FrError::Conflict {
-                path: "talk".into(),
-                expected: "open".into(),
-                actual: "lobby_or_precondition".into(),
-            },
+            StatusCode::PRECONDITION_FAILED => {
+                FrError::PermissionDenied(server_hint.unwrap_or_else(|| {
+                    "This conversation is currently waiting in a lobby or locked.".into()
+                }))
+            }
             StatusCode::TOO_MANY_REQUESTS => FrError::Network(
-                "Nextcloud Talk rate limit reached. Slowing down automatically.".into(),
+                "talk_rate_limit: Nextcloud Talk rate limit reached. Slowing down automatically."
+                    .into(),
             ),
             StatusCode::UPGRADE_REQUIRED => {
-                let server_hint = serde_json::from_str::<Value>(body)
-                    .ok()
-                    .and_then(|v| v["ocs"]["meta"]["message"].as_str().map(ToOwned::to_owned))
+                let hint = server_hint
                     .unwrap_or_else(|| "Server requires a newer Talk API version.".into());
-                FrError::Other(format!("Talk client upgrade required: {server_hint}"))
+                FrError::Other(format!("talk_upgrade_required: {hint}"))
             }
             _ => FrError::Network(format!("Nextcloud Talk returned HTTP {}", status.as_u16())),
         }
@@ -187,7 +252,7 @@ impl TalkClient {
             .unwrap_or(32_000);
 
         let attachments = &config["attachments"];
-        let attachments_allowed = attachments["allowed"].as_bool().unwrap_or(true);
+        let attachments_allowed = attachments["allowed"].as_bool().unwrap_or(false);
         let raw_folder = attachments["folder"]
             .as_str()
             .map(str::trim)
@@ -513,6 +578,11 @@ impl TalkClient {
         if text.is_empty() {
             return Err(FrError::InvalidInput("Message cannot be empty.".into()));
         }
+        if text.chars().count() > 32_000 {
+            return Err(FrError::InvalidInput(
+                "Message exceeds Nextcloud Talk's 32,000 character limit.".into(),
+            ));
+        }
         let url = format!(
             "{}/ocs/v2.php/apps/spreed/api/v1/chat/{token}/{message_id}?format=json",
             self.creds.server_url
@@ -614,14 +684,14 @@ impl TalkClient {
         &self,
         token: &str,
         file_id: &str,
-        caption: Option<&str>,
         reference_id: Option<&str>,
     ) -> Result<TalkMessage> {
         let token = validate_room_token(token)?;
         let clean_id = file_id.trim();
-        if clean_id.is_empty() {
+        if clean_id.is_empty() || !clean_id.chars().all(|c| c.is_ascii_digit()) {
             return Err(FrError::InvalidInput(
-                "Missing Nextcloud file ID for file reference.".into(),
+                "This file does not have a numeric Nextcloud file ID and cannot be referenced directly."
+                    .into(),
             ));
         }
 
@@ -635,15 +705,11 @@ impl TalkClient {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let mut meta = json!({ "referenceId": ref_id });
-        if let Some(msg) = caption.map(str::trim).filter(|s| !s.is_empty()) {
-            meta["caption"] = Value::String(msg.to_owned());
-        }
-
         let body = json!({
             "objectType": "file",
             "objectId": clean_id,
-            "metaData": meta.to_string(),
+            "referenceId": ref_id,
+            "metaData": "{}",
         });
 
         let resp = self
@@ -686,17 +752,25 @@ impl TalkClient {
         }
         if bytes.len() > MAX_ATTACHMENT_UPLOAD_BYTES {
             return Err(FrError::InvalidInput(
-                "Attachment exceeds the 50 MB upload limit.".into(),
+                "Attachment exceeds the 50 MiB upload limit.".into(),
             ));
         }
 
         let base_dir = CloudPath::parse(&caps.attachments_folder)?;
-        let _ = storage.mkdir(&base_dir).await;
+        if let Err(err) = storage.mkdir(&base_dir).await
+            && !matches!(err, FrError::AlreadyExists(_))
+        {
+            return Err(err);
+        }
 
         let target_dir = if caps.conversation_subfolders {
             let conv_seg = format!("{}-{token}", sanitize_path_segment(room_display_name));
             let conv_dir = base_dir.join(&conv_seg)?;
-            let _ = storage.mkdir(&conv_dir).await;
+            if let Err(err) = storage.mkdir(&conv_dir).await
+                && !matches!(err, FrError::AlreadyExists(_))
+            {
+                return Err(err);
+            }
             conv_dir
         } else {
             base_dir
@@ -704,10 +778,14 @@ impl TalkClient {
 
         let safe_name = sanitize_path_segment(file_name);
         let mut target_path = target_dir.join(&safe_name)?;
-        // Avoid silently overwriting an existing attachment with the same name.
+        // Avoid overwriting an existing attachment with the same name (UUID suffix prevents same-second collisions).
         if storage.stat(&target_path).await.is_ok() {
-            let stamped = format!("{}-{safe_name}", chrono::Utc::now().timestamp());
-            target_path = target_dir.join(&stamped)?;
+            let short_id = &Uuid::new_v4().simple().to_string()[..8];
+            let unique = match safe_name.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}-{short_id}.{ext}"),
+                None => format!("{safe_name}-{short_id}"),
+            };
+            target_path = target_dir.join(&unique)?;
         }
 
         storage.write(&target_path, bytes, None).await?;
@@ -1052,7 +1130,7 @@ mod tests {
         assert_eq!(poll.last_given, Some(105));
 
         let shared = client
-            .share_file_reference("team-eng", "9981", Some("Check this part"), None)
+            .share_file_reference("team-eng", "9981", None)
             .await
             .unwrap();
         assert_eq!(shared.id, 106);
@@ -1060,6 +1138,14 @@ mod tests {
         let file_ref = shared.file_reference.unwrap();
         assert_eq!(file_ref.file_id, "9981");
         assert_eq!(file_ref.path.as_deref(), Some("/CAD/wing_mount.sldprt"));
+
+        // Non-numeric file ID (such as a fallback path) must be rejected.
+        assert!(
+            client
+                .share_file_reference("team-eng", "/CAD/wing_mount.sldprt", None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1067,6 +1153,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ocs/v2.php/apps/files_sharing/api/v1/shares"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "shareType": 10,
+                "shareWith": "team-eng",
+                "path": "/Talk/Engineering-team-eng/sketch.png"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ocs": { "data": { "id": 77 } }
             })))
@@ -1098,12 +1189,31 @@ mod tests {
         assert_eq!(uploaded.as_str(), "/Talk/Engineering-team-eng/sketch.png");
         let (stored, _) = storage.read(&uploaded).await.unwrap();
         assert_eq!(stored.as_ref(), b"png-bytes");
+
+        // Oversized upload rejected before storage write.
+        let oversized = Bytes::from(vec![0u8; MAX_ATTACHMENT_UPLOAD_BYTES + 1]);
+        assert!(matches!(
+            client
+                .upload_and_attach_file(
+                    &storage,
+                    &caps,
+                    "team-eng",
+                    "Engineering",
+                    "huge.bin",
+                    oversized
+                )
+                .await,
+            Err(FrError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
-    async fn maps_rate_limit_maintenance_and_rejects_bad_tokens() {
+    async fn maps_http_statuses_and_sanitizes_segments_and_tokens() {
         assert!(validate_room_token("../etc/passwd").is_err());
         assert!(validate_room_token("valid_room-123").is_ok());
+        assert_eq!(sanitize_path_segment("CON.txt"), "_CON.txt");
+        assert!(sanitize_path_segment(&format!("{}.pdf", "a".repeat(200))).ends_with(".pdf"));
+        assert!(!sanitize_path_segment("../../evil.png").contains('/'));
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1111,8 +1221,50 @@ mod tests {
             .respond_with(ResponseTemplate::new(429))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/locked"))
+            .respond_with(ResponseTemplate::new(412).set_body_json(json!({
+                "ocs": { "meta": { "message": "Lobby is active" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/forbidden"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "ocs": { "meta": { "message": "Read-only conversation" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/outdated"))
+            .respond_with(ResponseTemplate::new(426).set_body_json(json!({
+                "ocs": { "meta": { "message": "Talk API v2 required" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/maint"))
+            .respond_with(
+                ResponseTemplate::new(503).insert_header("X-Nextcloud-Maintenance-Mode", "1"),
+            )
+            .mount(&server)
+            .await;
+
         let client = test_client(server.uri());
-        let err = client.list_rooms(None).await.unwrap_err();
-        assert!(matches!(err, FrError::Network(_)));
+        assert!(
+            matches!(client.list_rooms(None).await, Err(FrError::Network(m)) if m.contains("talk_rate_limit"))
+        );
+        assert!(
+            matches!(client.send_message("locked", "hi", None, None).await, Err(FrError::PermissionDenied(m)) if m.contains("Lobby"))
+        );
+        assert!(
+            matches!(client.send_message("forbidden", "hi", None, None).await, Err(FrError::PermissionDenied(m)) if m.contains("Read-only"))
+        );
+        assert!(
+            matches!(client.send_message("outdated", "hi", None, None).await, Err(FrError::Other(m)) if m.contains("talk_upgrade_required"))
+        );
+        assert!(
+            matches!(client.send_message("maint", "hi", None, None).await, Err(FrError::Network(m)) if m.contains("talk_maintenance"))
+        );
     }
 }

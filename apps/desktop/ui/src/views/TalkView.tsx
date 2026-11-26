@@ -64,7 +64,7 @@ import {
 
 interface TalkViewProps {
   isNextcloudConnected: boolean;
-  currentLoginName: string | null;
+  currentActorId: string | null;
 }
 
 interface TalkMessagesEventPayload {
@@ -74,6 +74,7 @@ interface TalkMessagesEventPayload {
 }
 
 const QUICK_REACTIONS = ["👍", "❤️", "🎉", "👀"];
+const MAX_TALK_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 function inferPreviewKind(name: string): PreviewKind {
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
@@ -118,7 +119,7 @@ function formatMessageTime(ts: number | null): string {
 
 export function TalkView({
   isNextcloudConnected,
-  currentLoginName,
+  currentActorId,
 }: TalkViewProps) {
   const [capabilities, setCapabilities] = useState<TalkCapabilities | null>(
     null,
@@ -163,6 +164,8 @@ export function TalkView({
   const [previewItem, setPreviewItem] = useState<FileItemView_Serialize | null>(
     null,
   );
+  const [previewFileRef, setPreviewFileRef] =
+    useState<TalkFileReference_Serialize | null>(null);
   const [previewExpanded, setPreviewExpanded] = useState(false);
   const [accessDeniedFile, setAccessDeniedFile] =
     useState<TalkFileReference_Serialize | null>(null);
@@ -172,7 +175,11 @@ export function TalkView({
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
-  const draftTimerRef = useRef<number | null>(null);
+  const draftTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingDraftsRef = useRef<Map<string, string>>(new Map());
+  const userTypedInRoomRef = useRef<Set<string>>(new Set());
+  const lastScrolledTokenRef = useRef<string | null>(null);
+  const lastMessageIdRef = useRef<number>(0);
   const selectedTokenRef = useRef<string | null>(null);
   selectedTokenRef.current = selectedToken;
 
@@ -188,11 +195,61 @@ export function TalkView({
     }, 4500);
   }
 
+  const flushDraft = useCallback((token: string) => {
+    const timer = draftTimersRef.current.get(token);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      draftTimersRef.current.delete(token);
+    }
+    if (!pendingDraftsRef.current.has(token)) return;
+    const text = pendingDraftsRef.current.get(token) ?? "";
+    pendingDraftsRef.current.delete(token);
+    void saveTalkDraft(token, text).catch((err) => {
+      setError(toUserFacingError(err));
+    });
+  }, []);
+
+  const cancelPendingDraft = useCallback((token: string) => {
+    const timer = draftTimersRef.current.get(token);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      draftTimersRef.current.delete(token);
+    }
+    pendingDraftsRef.current.delete(token);
+  }, []);
+
+  // Flush any queued drafts on unmount so edits are never silently lost.
+  useEffect(() => {
+    const pendingDrafts = pendingDraftsRef.current;
+    return () => {
+      for (const token of Array.from(pendingDrafts.keys())) {
+        flushDraft(token);
+      }
+    };
+  }, [flushDraft]);
+
+  // Dismiss modals with Escape key.
+  useEffect(() => {
+    if (!showFilePicker && !showNewRoomModal) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setShowFilePicker(false);
+        setShowNewRoomModal(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showFilePicker, showNewRoomModal]);
+
   const loadRoomsAndCaps = useCallback(async () => {
     if (!isNextcloudConnected) {
       setCapabilities(null);
       setRooms([]);
       setSelectedToken(null);
+      setMessages([]);
+      setPreviewItem(null);
+      setPreviewFileRef(null);
+      setAccessDeniedFile(null);
       setLoadingRooms(false);
       return;
     }
@@ -203,6 +260,7 @@ export function TalkView({
       setCapabilities(caps);
       if (!caps.enabled) {
         setRooms([]);
+        setSelectedToken(null);
         return;
       }
       const page = await listTalkRooms(null);
@@ -214,6 +272,8 @@ export function TalkView({
           !page.rooms.some((r) => r.token === selectedTokenRef.current))
       ) {
         setSelectedToken(page.rooms[0].token);
+      } else if (page.rooms.length === 0) {
+        setSelectedToken(null);
       }
     } catch (err) {
       setError(toUserFacingError(err));
@@ -223,8 +283,12 @@ export function TalkView({
   }, [isNextcloudConnected]);
 
   useEffect(() => {
+    // Re-sync rooms whenever connection state or the signed-in Nextcloud account changes.
+    if (currentActorId === null && !isNextcloudConnected) {
+      setSelectedToken(null);
+    }
     void loadRoomsAndCaps();
-  }, [loadRoomsAndCaps]);
+  }, [loadRoomsAndCaps, currentActorId, isNextcloudConnected]);
 
   // Listen to Rust long-poll message push events.
   useEffect(() => {
@@ -262,22 +326,32 @@ export function TalkView({
     }
     let cancelled = false;
     const token = selectedToken;
+    userTypedInRoomRef.current.delete(token);
     setLoadingMessages(true);
+    setMessages([]);
+    setMessagesFromCache(false);
+    setPreviewItem(null);
+    setPreviewFileRef(null);
+    setPreviewExpanded(false);
+    setAccessDeniedFile(null);
     setReplyTo(null);
     setEditingMsg(null);
     setAttachMenuOpen(false);
     setHasOlder(true);
+    setComposerText(pendingDraftsRef.current.get(token) ?? "");
 
     void Promise.all([
       getTalkMessages(token, null, 50),
       getTalkDraft(token).catch(() => null),
     ])
       .then(async ([page, draft]) => {
-        if (cancelled) return;
+        if (cancelled || selectedTokenRef.current !== token) return;
         setMessages(page.messages);
         setMessagesFromCache(page.fromCache);
         setHasOlder(page.messages.length >= 50);
-        setComposerText(draft ?? "");
+        if (!userTypedInRoomRef.current.has(token)) {
+          setComposerText(pendingDraftsRef.current.get(token) ?? draft ?? "");
+        }
 
         const maxId = page.messages.reduce(
           (acc, m) => Math.max(acc, m.id ?? 0),
@@ -293,49 +367,82 @@ export function TalkView({
             ),
           );
         }
-        if (!page.fromCache) {
+        if (!page.fromCache && !cancelled && selectedTokenRef.current === token) {
           await startTalkPolling(token, maxId > 0 ? maxId : null).catch(
             () => {},
           );
         }
       })
       .catch((err) => {
-        if (!cancelled) setError(toUserFacingError(err));
+        if (!cancelled && selectedTokenRef.current === token) {
+          setError(toUserFacingError(err));
+        }
       })
       .finally(() => {
-        if (!cancelled) setLoadingMessages(false);
+        if (!cancelled && selectedTokenRef.current === token) {
+          setLoadingMessages(false);
+        }
       });
 
     return () => {
       cancelled = true;
+      flushDraft(token);
       void stopTalkPolling().catch(() => {});
     };
-  }, [isNextcloudConnected, selectedToken]);
+  }, [isNextcloudConnected, selectedToken, flushDraft]);
 
+  // Auto-scroll to bottom only on initial room load or when newer messages arrive,
+  // never when prepending older history via "Load older messages".
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, selectedToken]);
+    const newestId =
+      messages.length > 0 ? (messages[messages.length - 1]?.id ?? 0) : 0;
+    const switchedRoom = lastScrolledTokenRef.current !== selectedToken;
+    if (switchedRoom) {
+      lastScrolledTokenRef.current = selectedToken;
+      lastMessageIdRef.current = newestId;
+      if (messages.length > 0) {
+        messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+      }
+      return;
+    }
+    if (newestId > lastMessageIdRef.current) {
+      lastMessageIdRef.current = newestId;
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, selectedToken]);
 
-  // Debounced local draft save per conversation.
+  // Per-room debounced local draft save so switching rooms never cancels or loses edits.
   function handleComposerChange(next: string) {
     setComposerText(next);
-    if (!selectedToken || editingMsg) return;
-    if (draftTimerRef.current) {
-      window.clearTimeout(draftTimerRef.current);
-    }
     const token = selectedToken;
-    draftTimerRef.current = window.setTimeout(() => {
-      void saveTalkDraft(token, next).catch(() => {});
+    if (!token || editingMsg) return;
+    userTypedInRoomRef.current.add(token);
+    pendingDraftsRef.current.set(token, next);
+    const existingTimer = draftTimersRef.current.get(token);
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+    }
+    const timer = window.setTimeout(() => {
+      draftTimersRef.current.delete(token);
+      const latestText = pendingDraftsRef.current.get(token);
+      pendingDraftsRef.current.delete(token);
+      if (latestText === undefined) return;
+      void saveTalkDraft(token, latestText).catch((err) => {
+        setError(toUserFacingError(err));
+      });
     }, 400);
+    draftTimersRef.current.set(token, timer);
   }
 
   async function handleLoadOlder() {
-    if (!selectedToken || loadingOlder || messages.length === 0) return;
+    const token = selectedToken;
+    if (!token || loadingOlder || messages.length === 0) return;
     const oldestId = messages[0]?.id;
     if (oldestId === null || oldestId === undefined) return;
     setLoadingOlder(true);
     try {
-      const page = await getTalkMessages(selectedToken, oldestId, 50);
+      const page = await getTalkMessages(token, oldestId, 50);
+      if (selectedTokenRef.current !== token) return;
       if (page.messages.length === 0) {
         setHasOlder(false);
       } else {
@@ -343,53 +450,68 @@ export function TalkView({
         if (page.messages.length < 50) setHasOlder(false);
       }
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     } finally {
-      setLoadingOlder(false);
+      if (selectedTokenRef.current === token) {
+        setLoadingOlder(false);
+      }
     }
   }
 
   async function handleSendSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedToken || !composerText.trim() || sending) return;
+    const token = selectedToken;
+    const trimmed = composerText.trim();
+    if (!token || !trimmed || sending) return;
     setError(null);
     setSending(true);
+    const currentEditing = editingMsg;
+    const currentReplyTo = replyTo;
+    if (!currentEditing) {
+      cancelPendingDraft(token);
+    }
     try {
-      if (editingMsg && editingMsg.id !== null) {
-        const edited = await editTalkMessage(
-          selectedToken,
-          editingMsg.id,
-          composerText.trim(),
-        );
+      if (currentEditing && currentEditing.id !== null) {
+        const edited = await editTalkMessage(token, currentEditing.id, trimmed);
+        if (selectedTokenRef.current !== token) return;
         setMessages((prev) => mergeMessages(prev, [edited]));
         setEditingMsg(null);
         setComposerText("");
       } else {
         const sent = await sendTalkMessage({
-          token: selectedToken,
-          message: composerText.trim(),
-          replyTo: replyTo?.id ?? null,
+          token,
+          message: trimmed,
+          replyTo: currentReplyTo?.id ?? null,
           referenceId: null,
         });
+        if (selectedTokenRef.current !== token) return;
         setMessages((prev) => mergeMessages(prev, [sent]));
         setReplyTo(null);
         setComposerText("");
       }
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     } finally {
       setSending(false);
     }
   }
 
   async function handleDeleteMessage(msg: TalkMessage_Serialize) {
-    if (!selectedToken || msg.id === null) return;
+    const token = selectedToken;
+    if (!token || msg.id === null) return;
     setError(null);
     try {
-      const deleted = await deleteTalkMessage(selectedToken, msg.id);
+      const deleted = await deleteTalkMessage(token, msg.id);
+      if (selectedTokenRef.current !== token) return;
       setMessages((prev) => mergeMessages(prev, [deleted]));
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     }
   }
 
@@ -397,11 +519,13 @@ export function TalkView({
     msg: TalkMessage_Serialize,
     emoji: string,
   ) {
-    if (!selectedToken || msg.id === null) return;
+    const token = selectedToken;
+    if (!token || msg.id === null) return;
     const alreadyReacted = msg.reactionsSelf.includes(emoji);
     setError(null);
     try {
-      await toggleTalkReaction(selectedToken, msg.id, emoji, !alreadyReacted);
+      await toggleTalkReaction(token, msg.id, emoji, !alreadyReacted);
+      if (selectedTokenRef.current !== token) return;
       setMessages((prev) =>
         prev.map((m) => {
           if (m.id !== msg.id) return m;
@@ -420,7 +544,9 @@ export function TalkView({
         }),
       );
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     }
   }
 
@@ -485,25 +611,20 @@ export function TalkView({
   }
 
   async function handleReferenceCloudFile(item: FileItemView_Serialize) {
-    if (!selectedToken) return;
+    const token = selectedToken;
+    if (!token) return;
     setReferencingFileId(item.entry.id);
     setError(null);
     try {
-      const caption = composerText.trim() || null;
-      const shared = await shareTalkFileReference(
-        selectedToken,
-        item.entry.id,
-        caption,
-      );
+      const shared = await shareTalkFileReference(token, item.entry.id);
+      if (selectedTokenRef.current !== token) return;
       setMessages((prev) => mergeMessages(prev, [shared]));
-      if (caption) {
-        setComposerText("");
-        void saveTalkDraft(selectedToken, "").catch(() => {});
-      }
       setShowFilePicker(false);
       flashNotice(`Referenced "${item.entry.name}" in chat (zero file copies).`);
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     } finally {
       setReferencingFileId(null);
     }
@@ -515,23 +636,40 @@ export function TalkView({
   ) {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !selectedRoom) return;
+    const room = selectedRoom;
+    if (!file || !room) return;
+    const token = room.token;
     setAttachMenuOpen(false);
+    if (file.size > MAX_TALK_UPLOAD_BYTES) {
+      setError({
+        code: "invalid_input",
+        title: "File is too large for Talk chat",
+        message: `"${file.name}" is ${formatBytes(file.size)}, which exceeds the 50 MB chat attachment limit.`,
+        recoveryHint:
+          "Upload larger files in Nextcloud Files first, then use 'Reference from Nextcloud Files' to link them with zero copies.",
+        technicalDetails: null,
+      });
+      return;
+    }
     setUploadingAttachment(true);
     setError(null);
     try {
       const buf = await file.arrayBuffer();
       const cloudPath = await uploadTalkAttachmentBytes(
-        selectedRoom.token,
-        selectedRoom.displayName,
+        token,
+        room.displayName,
         file.name,
         new Uint8Array(buf),
       );
+      if (selectedTokenRef.current !== token) return;
       flashNotice(`Uploaded & attached "${file.name}" (${cloudPath}).`);
-      const refreshed = await getTalkMessages(selectedRoom.token, null, 50);
+      const refreshed = await getTalkMessages(token, null, 50);
+      if (selectedTokenRef.current !== token) return;
       setMessages((prev) => mergeMessages(prev, refreshed.messages));
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (selectedTokenRef.current === token) {
+        setError(toUserFacingError(err));
+      }
     } finally {
       setUploadingAttachment(false);
     }
@@ -545,6 +683,7 @@ export function TalkView({
       return;
     }
     const kind = inferPreviewKind(fileRef.name);
+    setPreviewFileRef(fileRef);
     setPreviewItem({
       entry: {
         id: fileRef.fileId,
@@ -862,8 +1001,8 @@ export function TalkView({
                 ) : (
                   messages.map((msg) => {
                     const isMine =
-                      Boolean(currentLoginName) &&
-                      msg.actorId === currentLoginName;
+                      Boolean(currentActorId) &&
+                      msg.actorId === currentActorId;
                     const isSystem = msg.messageType === "system";
                     if (isSystem) {
                       return (
@@ -1188,9 +1327,23 @@ export function TalkView({
               onToggleExpand={() => setPreviewExpanded((prev) => !prev)}
               onClose={() => {
                 setPreviewItem(null);
+                setPreviewFileRef(null);
                 setPreviewExpanded(false);
               }}
               onRefreshFolder={() => {}}
+              onPreviewError={(previewErr) => {
+                if (
+                  previewFileRef &&
+                  (previewErr.code === "auth_required" ||
+                    previewErr.code === "not_found" ||
+                    previewErr.code === "permission_denied")
+                ) {
+                  setAccessDeniedFile(previewFileRef);
+                  setPreviewItem(null);
+                  setPreviewFileRef(null);
+                  setPreviewExpanded(false);
+                }
+              }}
             />
           </div>
         )}
@@ -1198,7 +1351,12 @@ export function TalkView({
 
       {/* Modal: Reference an Existing Nextcloud File (Flow A2 — Zero Copies) */}
       {showFilePicker && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Reference a Nextcloud File"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs"
+        >
           <div className="flex max-h-[82vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900">
             <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3.5 dark:border-slate-800">
               <div>
@@ -1219,6 +1377,12 @@ export function TalkView({
                 <X className="h-4 w-4" />
               </button>
             </div>
+
+            {error && (
+              <div className="border-b border-slate-100 px-4 py-2.5 dark:border-slate-800">
+                <ErrorBanner error={error} onDismiss={() => setError(null)} />
+              </div>
+            )}
 
             {/* Breadcrumbs */}
             <div className="flex flex-wrap items-center gap-1 border-b border-slate-100 bg-slate-50 px-4 py-2 text-xs dark:border-slate-800 dark:bg-slate-950/60">
@@ -1321,7 +1485,12 @@ export function TalkView({
 
       {/* Modal: New Conversation */}
       {showNewRoomModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="New Talk Conversation"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs"
+        >
           <form
             onSubmit={handleCreateRoom}
             className="w-full max-w-md overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900"

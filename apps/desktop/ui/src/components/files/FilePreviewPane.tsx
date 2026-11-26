@@ -32,6 +32,7 @@ interface FilePreviewPaneProps {
   onClose: () => void;
   onRefreshFolder: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onPreviewError?: (error: UserFacingError) => void;
 }
 
 export function FilePreviewPane({
@@ -41,6 +42,7 @@ export function FilePreviewPane({
   onClose,
   onRefreshFolder,
   onDirtyChange,
+  onPreviewError,
 }: FilePreviewPaneProps) {
   const [payload, setPayload] = useState<FilePreviewPayload_Serialize | null>(
     null,
@@ -79,7 +81,11 @@ export function FilePreviewPane({
         if (!cancelled) setPayload(res);
       })
       .catch((err) => {
-        if (!cancelled) setError(toUserFacingError(err));
+        if (!cancelled) {
+          const uf = toUserFacingError(err);
+          setError(uf);
+          onPreviewError?.(uf);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -88,7 +94,7 @@ export function FilePreviewPane({
     return () => {
       cancelled = true;
     };
-  }, [item.entry.path, isMarkdown, onDirtyChange]);
+  }, [item.entry.path, isMarkdown, onDirtyChange, onPreviewError]);
 
   async function handleOpenNative(allowExecutable = false) {
     setOpeningNative(true);
