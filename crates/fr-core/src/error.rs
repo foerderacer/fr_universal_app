@@ -26,6 +26,9 @@ pub enum FrError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("authentication required: {0}")]
     AuthRequired(String),
 
@@ -97,6 +100,13 @@ impl From<FrError> for UserFacingError {
                 message: "One of your workspace settings isn't valid yet.".into(),
                 recovery_hint: Some("Check the value in Settings and try saving again.".into()),
                 technical_details: Some(err.to_string()),
+            },
+            FrError::InvalidInput(msg) => Self {
+                code: "invalid_input".into(),
+                title: "Please check your input".into(),
+                message: msg.clone(),
+                recovery_hint: Some("Adjust the fields and try again.".into()),
+                technical_details: None,
             },
             FrError::AuthRequired(_) => Self {
                 code: "auth_required".into(),

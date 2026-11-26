@@ -1,0 +1,85 @@
+name: Release (Windows & macOS)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-release:
+    name: Build & Publish (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify updater signing configuration
+        shell: bash
+        env:
+          HAS_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAS_PUBLIC_KEY: ${{ vars.FR_UPDATER_PUBKEY != '' }}
+        run: |
+          if [ "$HAS_PRIVATE_KEY" != "$HAS_PUBLIC_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY (secret) and FR_UPDATER_PUBKEY (repo variable) must either BOTH be configured or BOTH be empty."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop/ui
+        run: npm ci
+
+      - name: Verify Rust tests before packaging
+        run: cargo test --workspace
+
+      # Publishes a draft GitHub Release; publish the draft once Windows & macOS
+      # artifacts have both uploaded so releases/latest/download/latest.json goes live.
+      - name: Build & release Tauri installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FR_DEFAULT_NEXTCLOUD_URL: ${{ vars.FR_DEFAULT_NEXTCLOUD_URL }}
+          FR_UPDATER_PUBKEY: ${{ vars.FR_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Optional Apple Developer ID signing & notarization secrets (macOS)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: apps/desktop/src-tauri
+          tagName: v__VERSION__
+          releaseName: "FR Universal App v__VERSION__"
+          releaseBody: "Cross-platform Windows (.msi / .exe) and macOS universal (.dmg) release."
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          args: ${{ matrix.args }} ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config tauri.updater.conf.json' || '' }}

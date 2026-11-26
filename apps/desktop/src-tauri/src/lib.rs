@@ -52,6 +52,21 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::sync_team_mcp_servers,
         commands::discover_external_mcp_tools,
         commands::test_external_mcp_tool,
+        commands::list_workflows,
+        commands::upsert_workflow,
+        commands::delete_workflow,
+        commands::run_workflow_now,
+        commands::list_workflow_runs,
+        commands::sync_workflows_from_nextcloud,
+        commands::push_workflow_to_nextcloud,
+        commands::list_finance_entries,
+        commands::upsert_finance_entry,
+        commands::delete_finance_entry,
+        commands::get_finance_summary,
+        commands::export_finance_csv,
+        commands::set_finance_folder,
+        commands::check_for_app_update,
+        commands::install_app_update,
     ])
 }
 
@@ -92,6 +107,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(nav_guard)
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
@@ -121,6 +137,26 @@ pub fn run() {
                         Err(err) => {
                             tracing::error!("Failed to start local MCP Server: {err}");
                         }
+                    }
+                }
+            });
+
+            // Background workflow trigger loop (evaluates Schedule & FolderWatch triggers every 60s).
+            let wf_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await; // skip immediate boot tick
+                loop {
+                    ticker.tick().await;
+                    let state = wf_handle.state::<AppState>();
+                    if let Some(storage) = state.current_storage()
+                        && let Err(err) = state
+                            .workflow_runner
+                            .evaluate_triggers(storage.as_ref())
+                            .await
+                    {
+                        tracing::warn!("Background workflow trigger tick failed: {err}");
                     }
                 }
             });

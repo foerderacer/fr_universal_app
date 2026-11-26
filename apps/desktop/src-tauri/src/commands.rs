@@ -13,15 +13,18 @@ use fr_mcp::{
     McpServerStatus, McpToolCallOutput, PendingWriteApproval, build_client_config_snippet,
 };
 use fr_mod_files::{FileItemView, FilePreviewPayload, FilesService, MarkdownDocument};
+use fr_mod_finance::{FinanceCurrencySummary, FinanceEntry, UpsertFinanceEntryRequest};
 use fr_nextcloud::{
     LoginPollResult, NextcloudConnectionStatus, UserAccountInfo, fetch_user_account_info,
     initiate_login_flow, normalize_server_url, poll_login_flow,
 };
 use fr_storage::{CloudPath, Etag};
+use fr_workflows::{WorkflowDefinition, WorkflowRunRecord, WorkflowSyncReport};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 
 use crate::state::AppState;
 
@@ -1352,6 +1355,396 @@ pub async fn test_external_mcp_tool(
         .call_tool(&server_id, &tool_name, args)
         .await
         .map_err(mcp_error_to_user_facing)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Automation Workflows & Finance Ledger commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_workflows(
+    state: State<'_, AppState>,
+) -> Result<Vec<WorkflowDefinition>, UserFacingError> {
+    let store = state.workflow_runner.store().clone();
+    tokio::task::spawn_blocking(move || store.list_workflows())
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn upsert_workflow(
+    state: State<'_, AppState>,
+    workflow: WorkflowDefinition,
+) -> Result<Vec<WorkflowDefinition>, UserFacingError> {
+    let store = state.workflow_runner.store().clone();
+    tokio::task::spawn_blocking(move || {
+        store.upsert_workflow(workflow)?;
+        store.list_workflows()
+    })
+    .await
+    .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+    .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_workflow(
+    state: State<'_, AppState>,
+    workflow_id: String,
+) -> Result<Vec<WorkflowDefinition>, UserFacingError> {
+    let store = state.workflow_runner.store().clone();
+    tokio::task::spawn_blocking(move || {
+        store.delete_workflow(&workflow_id)?;
+        store.list_workflows()
+    })
+    .await
+    .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+    .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn run_workflow_now(
+    state: State<'_, AppState>,
+    workflow_id: String,
+) -> Result<WorkflowRunRecord, UserFacingError> {
+    let service = require_files_service(&state)?;
+    state
+        .workflow_runner
+        .run_workflow(&workflow_id, "manual", service.storage().as_ref())
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_workflow_runs(
+    state: State<'_, AppState>,
+    workflow_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<WorkflowRunRecord>, UserFacingError> {
+    let store = state.workflow_runner.store().clone();
+    tokio::task::spawn_blocking(move || store.list_runs(workflow_id.as_deref(), limit as usize))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn sync_workflows_from_nextcloud(
+    state: State<'_, AppState>,
+) -> Result<WorkflowSyncReport, UserFacingError> {
+    let service = require_files_service(&state)?;
+    state
+        .workflow_runner
+        .sync_from_nextcloud(service.storage().as_ref())
+        .await
+        .map_err(|err| match err {
+            FrError::NotFound(_) => UserFacingError {
+                code: "team_workflows_missing".into(),
+                title: "No shared team workflows folder found".into(),
+                message: "Your Nextcloud workspace doesn't have a /_FR_App/workflows/ folder yet."
+                    .into(),
+                recovery_hint: Some(
+                    "Click Share to Nextcloud on any workflow to create the shared folder automatically."
+                        .into(),
+                ),
+                technical_details: None,
+            },
+            other => UserFacingError::from(other),
+        })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn push_workflow_to_nextcloud(
+    state: State<'_, AppState>,
+    workflow_id: String,
+) -> Result<String, UserFacingError> {
+    let service = require_files_service(&state)?;
+    let path = state
+        .workflow_runner
+        .push_to_nextcloud(&workflow_id, service.storage().as_ref())
+        .await
+        .map_err(|err| match err {
+            FrError::Conflict { .. } => UserFacingError {
+                code: "workflow_conflict".into(),
+                title: "A teammate updated this workflow on Nextcloud".into(),
+                message:
+                    "Another version of this workflow already exists in /_FR_App/workflows/."
+                        .into(),
+                recovery_hint: Some(
+                    "Click Sync from Nextcloud first to pull the latest version before sharing changes."
+                        .into(),
+                ),
+                technical_details: Some(err.to_string()),
+            },
+            other => UserFacingError::from(other),
+        })?;
+    Ok(path.as_str().to_owned())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_finance_entries(
+    state: State<'_, AppState>,
+) -> Result<Vec<FinanceEntry>, UserFacingError> {
+    let ledger = state.finance_ledger.clone();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    tokio::task::spawn_blocking(move || ledger.list_entries(&scope))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn upsert_finance_entry(
+    state: State<'_, AppState>,
+    input: UpsertFinanceEntryRequest,
+) -> Result<FinanceEntry, UserFacingError> {
+    let ledger = state.finance_ledger.clone();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let entry = tokio::task::spawn_blocking(move || ledger.upsert_entry(&scope, input))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)?;
+    state.events.publish(AppEvent::FinanceEntryChanged {
+        entry_id: entry.id.clone(),
+        timestamp: Utc::now(),
+    });
+    Ok(entry)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_finance_entry(
+    state: State<'_, AppState>,
+    entry_id: String,
+) -> Result<(), UserFacingError> {
+    let ledger = state.finance_ledger.clone();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let id_clone = entry_id.clone();
+    tokio::task::spawn_blocking(move || ledger.delete_entry(&scope, &id_clone))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)?;
+    state.events.publish(AppEvent::FinanceEntryChanged {
+        entry_id,
+        timestamp: Utc::now(),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_finance_summary(
+    state: State<'_, AppState>,
+) -> Result<Vec<FinanceCurrencySummary>, UserFacingError> {
+    let ledger = state.finance_ledger.clone();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    tokio::task::spawn_blocking(move || ledger.summarize(&scope))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn export_finance_csv(state: State<'_, AppState>) -> Result<String, UserFacingError> {
+    let ledger = state.finance_ledger.clone();
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    tokio::task::spawn_blocking(move || ledger.export_csv(&scope))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_finance_folder(
+    state: State<'_, AppState>,
+    folder_path: String,
+) -> Result<WorkspaceOverview, UserFacingError> {
+    let parsed = CloudPath::parse(&folder_path).map_err(UserFacingError::from)?;
+    {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| lock_error("Mutex poisoned while saving finance folder"))?;
+        let mut candidate = guard.clone();
+        candidate.finance_folder = parsed.as_str().to_owned();
+        state
+            .config_store
+            .save(&candidate)
+            .map_err(UserFacingError::from)?;
+        *guard = candidate;
+    }
+    state.events.publish(AppEvent::ConfigUpdated {
+        timestamp: Utc::now(),
+    });
+    Ok(build_overview(&state))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Signed Auto-Updater commands
+// ---------------------------------------------------------------------------
+
+const DEFAULT_UPDATER_ENDPOINT: &str =
+    "https://github.com/foerderacer/fr_universal_app/releases/latest/download/latest.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateCheckResult {
+    pub configured: bool,
+    pub available: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub notes: Option<String>,
+    pub message: String,
+}
+
+fn build_configured_updater(
+    app: &tauri::AppHandle,
+) -> Option<Result<tauri_plugin_updater::Updater, UserFacingError>> {
+    let pubkey = option_env!("FR_UPDATER_PUBKEY")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let endpoint_str = option_env!("FR_UPDATER_ENDPOINT")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_UPDATER_ENDPOINT);
+    let url = match tauri::Url::parse(endpoint_str) {
+        Ok(u) if u.scheme() == "https" => u,
+        Ok(_) => {
+            return Some(Err(UserFacingError {
+                code: "updater_invalid_endpoint".into(),
+                title: "Updater configuration error".into(),
+                message: "The built-in update server address must use HTTPS.".into(),
+                recovery_hint: None,
+                technical_details: Some(endpoint_str.to_owned()),
+            }));
+        }
+        Err(err) => {
+            return Some(Err(UserFacingError {
+                code: "updater_invalid_endpoint".into(),
+                title: "Updater configuration error".into(),
+                message: "The built-in update server address is invalid.".into(),
+                recovery_hint: None,
+                technical_details: Some(err.to_string()),
+            }));
+        }
+    };
+    let built = app
+        .updater_builder()
+        .pubkey(pubkey)
+        .endpoints(vec![url])
+        .and_then(|b| b.build())
+        .map_err(|err| UserFacingError {
+            code: "updater_init_failed".into(),
+            title: "Couldn't initialize updater".into(),
+            message: "Automatic update checking isn't available in this build.".into(),
+            recovery_hint: None,
+            technical_details: Some(err.to_string()),
+        });
+    Some(built)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn check_for_app_update(
+    app: tauri::AppHandle,
+) -> Result<AppUpdateCheckResult, UserFacingError> {
+    let current_version = env!("CARGO_PKG_VERSION").to_owned();
+    let Some(updater_res) = build_configured_updater(&app) else {
+        return Ok(AppUpdateCheckResult {
+            configured: false,
+            available: false,
+            current_version,
+            latest_version: None,
+            notes: None,
+            message: "Automatic updates aren't enabled in this build (no updater signing key was embedded at build time). Check GitHub Releases manually for newer installers.".into(),
+        });
+    };
+    let updater = updater_res?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(AppUpdateCheckResult {
+            configured: true,
+            available: true,
+            current_version,
+            latest_version: Some(update.version.clone()),
+            notes: update.body.clone(),
+            message: format!("Version {} is ready to install.", update.version),
+        }),
+        Ok(None) => Ok(AppUpdateCheckResult {
+            configured: true,
+            available: false,
+            current_version: current_version.clone(),
+            latest_version: Some(current_version),
+            notes: None,
+            message: "You're already running the latest version of FR Universal App.".into(),
+        }),
+        Err(err) => Err(UserFacingError {
+            code: "updater_check_failed".into(),
+            title: "Couldn't check for updates".into(),
+            message: "We couldn't reach the update server right now.".into(),
+            recovery_hint: Some("Check your internet connection and try again later.".into()),
+            technical_details: Some(err.to_string()),
+        }),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn install_app_update(app: tauri::AppHandle) -> Result<(), UserFacingError> {
+    let Some(updater_res) = build_configured_updater(&app) else {
+        return Err(UserFacingError {
+            code: "updater_not_configured".into(),
+            title: "Auto-updates not enabled in this build".into(),
+            message: "Install official releases from GitHub Releases to receive signed one-click updates.".into(),
+            recovery_hint: None,
+            technical_details: None,
+        });
+    };
+    let updater = updater_res?;
+    let Some(update) = updater.check().await.map_err(|err| UserFacingError {
+        code: "updater_check_failed".into(),
+        title: "Couldn't download update".into(),
+        message: "We couldn't check for the latest release right now.".into(),
+        recovery_hint: Some("Try again in a moment.".into()),
+        technical_details: Some(err.to_string()),
+    })?
+    else {
+        return Ok(());
+    };
+
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|err| UserFacingError {
+            code: "updater_install_failed".into(),
+            title: "Update installation failed".into(),
+            message: "The signed update couldn't be installed right now.".into(),
+            recovery_hint: Some(
+                "Try again or download the latest installer from GitHub Releases.".into(),
+            ),
+            technical_details: Some(err.to_string()),
+        })?;
+    app.restart();
 }
 
 #[cfg(test)]

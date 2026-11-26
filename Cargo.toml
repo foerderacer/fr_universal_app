@@ -8,6 +8,8 @@ members = [
   "crates/fr-mcp",
   "crates/fr-workflows",
   "crates/modules/fr-mod-files",
+  "crates/modules/fr-mod-finance",
+  "crates/modules/fr-mod-automation",
   "apps/desktop/src-tauri",
 ]
 
@@ -40,6 +42,7 @@ subtle = "2.6"
 tauri = { version = "2", default-features = false, features = ["wry", "compression", "dynamic-acl", "x11", "dbus"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
 tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
 tempfile = "3"
 thiserror = "2"
@@ -57,7 +60,10 @@ fr-storage = { path = "crates/fr-storage" }
 fr-nextcloud = { path = "crates/fr-nextcloud" }
 fr-preview = { path = "crates/fr-preview" }
 fr-mcp = { path = "crates/fr-mcp" }
+fr-workflows = { path = "crates/fr-workflows" }
 fr-mod-files = { path = "crates/modules/fr-mod-files" }
+fr-mod-finance = { path = "crates/modules/fr-mod-finance" }
+fr-mod-automation = { path = "crates/modules/fr-mod-automation" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

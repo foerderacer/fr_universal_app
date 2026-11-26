@@ -43,6 +43,9 @@ pub struct AppConfig {
     /// Whether mutating MCP Server tool calls require explicit user approval in the UI.
     #[serde(default = "default_mcp_require_write_approval")]
     pub mcp_require_write_approval: bool,
+    /// Nextcloud folder scoped for the Finance module (default `"/Finance"`).
+    #[serde(default = "default_finance_folder")]
+    pub finance_folder: String,
     /// Preferred UI color theme (`"system"`, `"light"`, or `"dark"`).
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -60,6 +63,10 @@ fn default_mcp_require_write_approval() -> bool {
     true
 }
 
+fn default_finance_folder() -> String {
+    "/Finance".to_owned()
+}
+
 fn default_theme() -> String {
     "system".to_owned()
 }
@@ -74,6 +81,7 @@ impl Default for AppConfig {
             mcp_server_enabled: false,
             mcp_server_port: default_mcp_server_port(),
             mcp_require_write_approval: default_mcp_require_write_approval(),
+            finance_folder: default_finance_folder(),
             theme: default_theme(),
         }
     }
@@ -171,6 +179,7 @@ mod tests {
             mcp_server_enabled: false,
             mcp_server_port: 38420,
             mcp_require_write_approval: true,
+            finance_folder: "/Finance".into(),
             theme: "dark".into(),
         };
 

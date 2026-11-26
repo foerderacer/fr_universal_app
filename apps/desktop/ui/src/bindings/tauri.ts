@@ -46,6 +46,21 @@ export const commands = {
 	syncTeamMcpServers: (options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpServerView[]>("sync_team_mcp_servers", undefined, options),
 	discoverExternalMcpTools: (serverId: string, options?: InvokeOptions) => __TAURI_INVOKE<ExternalMcpTool_Serialize[]>("discover_external_mcp_tools", { serverId }, options),
 	testExternalMcpTool: (serverId: string, toolName: string, argumentsJson: string, options?: InvokeOptions) => __TAURI_INVOKE<McpToolCallOutput>("test_external_mcp_tool", { serverId, toolName, argumentsJson }, options),
+	listWorkflows: (options?: InvokeOptions) => __TAURI_INVOKE<WorkflowDefinition_Serialize[]>("list_workflows", undefined, options),
+	upsertWorkflow: (workflow: WorkflowDefinition_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowDefinition_Serialize[]>("upsert_workflow", { workflow }, options),
+	deleteWorkflow: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowDefinition_Serialize[]>("delete_workflow", { workflowId }, options),
+	runWorkflowNow: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowRunRecord>("run_workflow_now", { workflowId }, options),
+	listWorkflowRuns: (workflowId: string | null, limit: number, options?: InvokeOptions) => __TAURI_INVOKE<WorkflowRunRecord[]>("list_workflow_runs", { workflowId, limit }, options),
+	syncWorkflowsFromNextcloud: (options?: InvokeOptions) => __TAURI_INVOKE<WorkflowSyncReport_Serialize>("sync_workflows_from_nextcloud", undefined, options),
+	pushWorkflowToNextcloud: (workflowId: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("push_workflow_to_nextcloud", { workflowId }, options),
+	listFinanceEntries: (options?: InvokeOptions) => __TAURI_INVOKE<FinanceEntry_Serialize[]>("list_finance_entries", undefined, options),
+	upsertFinanceEntry: (input: UpsertFinanceEntryRequest_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<FinanceEntry_Serialize>("upsert_finance_entry", { input }, options),
+	deleteFinanceEntry: (entryId: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("delete_finance_entry", { entryId }, options),
+	getFinanceSummary: (options?: InvokeOptions) => __TAURI_INVOKE<FinanceCurrencySummary[]>("get_finance_summary", undefined, options),
+	exportFinanceCsv: (options?: InvokeOptions) => __TAURI_INVOKE<string>("export_finance_csv", undefined, options),
+	setFinanceFolder: (folderPath: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("set_finance_folder", { folderPath }, options),
+	checkForAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<AppUpdateCheckResult_Serialize>("check_for_app_update", undefined, options),
+	installAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<null>("install_app_update", undefined, options),
 };
 
 /* Types */
@@ -68,6 +83,8 @@ export type AppConfig_Deserialize = {
 	mcpServerPort?: number,
 	/**  Whether mutating MCP Server tool calls require explicit user approval in the UI. */
 	mcpRequireWriteApproval?: boolean,
+	/**  Nextcloud folder scoped for the Finance module (default `"/Finance"`). */
+	financeFolder?: string,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme?: string,
 };
@@ -88,8 +105,30 @@ export type AppConfig_Serialize = {
 	mcpServerPort: number,
 	/**  Whether mutating MCP Server tool calls require explicit user approval in the UI. */
 	mcpRequireWriteApproval: boolean,
+	/**  Nextcloud folder scoped for the Finance module (default `"/Finance"`). */
+	financeFolder: string,
 	/**  Preferred UI color theme (`"system"`, `"light"`, or `"dark"`). */
 	theme: string,
+};
+
+export type AppUpdateCheckResult = AppUpdateCheckResult_Serialize | AppUpdateCheckResult_Deserialize;
+
+export type AppUpdateCheckResult_Deserialize = {
+	configured: boolean,
+	available: boolean,
+	currentVersion: string,
+	latestVersion?: string | null,
+	notes?: string | null,
+	message: string,
+};
+
+export type AppUpdateCheckResult_Serialize = {
+	configured: boolean,
+	available: boolean,
+	currentVersion: string,
+	latestVersion: string | null,
+	notes: string | null,
+	message: string,
 };
 
 /**
@@ -233,6 +272,59 @@ export type FilePreviewPayload_Serialize = {
 	solidworks: SolidWorksPreview_Serialize | null,
 	thumbnailDataUrl: string | null,
 	note: string | null,
+};
+
+/**  Aggregated ledger totals for one currency. */
+export type FinanceCurrencySummary = {
+	currency: string,
+	totalInvoicesCents: number | null,
+	totalReceiptsCents: number | null,
+	totalBudgetsCents: number | null,
+	pendingCount: number,
+	entryCount: number,
+};
+
+/**  Structured financial record linked optionally to a Nextcloud invoice/receipt file. */
+export type FinanceEntry = FinanceEntry_Serialize | FinanceEntry_Deserialize;
+
+export type FinanceEntryKind = "invoice" | "receipt" | "budget";
+
+export type FinanceEntryStatus = "pending" | "approved" | "paid";
+
+/**  Structured financial record linked optionally to a Nextcloud invoice/receipt file. */
+export type FinanceEntry_Deserialize = {
+	id: string,
+	kind: FinanceEntryKind,
+	vendor: string,
+	description: string,
+	category: string,
+	/**  Exact monetary amount in minor units (cents) to avoid floating-point rounding drift. */
+	amountCents: number | null,
+	currency: string,
+	/**  ISO calendar date (`YYYY-MM-DD`). */
+	entryDate: string,
+	status: FinanceEntryStatus,
+	cloudFilePath?: CloudPath | null,
+	createdAt: string,
+	updatedAt: string,
+};
+
+/**  Structured financial record linked optionally to a Nextcloud invoice/receipt file. */
+export type FinanceEntry_Serialize = {
+	id: string,
+	kind: FinanceEntryKind,
+	vendor: string,
+	description: string,
+	category: string,
+	/**  Exact monetary amount in minor units (cents) to avoid floating-point rounding drift. */
+	amountCents: number | null,
+	currency: string,
+	/**  ISO calendar date (`YYYY-MM-DD`). */
+	entryDate: string,
+	status: FinanceEntryStatus,
+	cloudFilePath: CloudPath | null,
+	createdAt: string,
+	updatedAt: string,
 };
 
 export type ImageDimensions = {
@@ -475,6 +567,37 @@ export type UpdateSettingsRequest = {
 	theme: string,
 };
 
+/**  Request payload for creating or updating a [`FinanceEntry`]. */
+export type UpsertFinanceEntryRequest = UpsertFinanceEntryRequest_Serialize | UpsertFinanceEntryRequest_Deserialize;
+
+/**  Request payload for creating or updating a [`FinanceEntry`]. */
+export type UpsertFinanceEntryRequest_Deserialize = {
+	id?: string | null,
+	kind: FinanceEntryKind,
+	vendor: string,
+	description: string,
+	category: string,
+	amountCents: number | null,
+	currency: string,
+	entryDate: string,
+	status: FinanceEntryStatus,
+	cloudFilePath?: string | null,
+};
+
+/**  Request payload for creating or updating a [`FinanceEntry`]. */
+export type UpsertFinanceEntryRequest_Serialize = {
+	id: string | null,
+	kind: FinanceEntryKind,
+	vendor: string,
+	description: string,
+	category: string,
+	amountCents: number | null,
+	currency: string,
+	entryDate: string,
+	status: FinanceEntryStatus,
+	cloudFilePath: string | null,
+};
+
 /**  Account profile and storage quota fetched from Nextcloud OCS `/ocs/v2.php/cloud/user`. */
 export type UserAccountInfo = UserAccountInfo_Serialize | UserAccountInfo_Deserialize;
 
@@ -527,6 +650,77 @@ export type UserFacingError_Serialize = {
 	recoveryHint: string | null,
 	technicalDetails: string | null,
 };
+
+export type WorkflowDefinition = WorkflowDefinition_Serialize | WorkflowDefinition_Deserialize;
+
+export type WorkflowDefinition_Deserialize = {
+	id: string,
+	name: string,
+	description: string,
+	enabled: boolean,
+	trigger: WorkflowTrigger,
+	steps: WorkflowStep_Deserialize[],
+	fromTeamSync?: boolean,
+	/**  Last known Nextcloud ETag for `/_FR_App/workflows/<id>.json` (used for `If-Match` safety). */
+	remoteEtag?: string | null,
+};
+
+export type WorkflowDefinition_Serialize = {
+	id: string,
+	name: string,
+	description: string,
+	enabled: boolean,
+	trigger: WorkflowTrigger,
+	steps: WorkflowStep_Serialize[],
+	fromTeamSync: boolean,
+	/**  Last known Nextcloud ETag for `/_FR_App/workflows/<id>.json` (used for `If-Match` safety). */
+	remoteEtag: string | null,
+};
+
+export type WorkflowRunRecord = {
+	runId: string,
+	workflowId: string,
+	workflowName: string,
+	triggerSource: string,
+	startedAt: string,
+	finishedAt: string,
+	succeeded: boolean,
+	stepLogs: WorkflowStepLog[],
+};
+
+export type WorkflowStep = WorkflowStep_Serialize | WorkflowStep_Deserialize;
+
+export type WorkflowStepLog = {
+	stepIndex: number,
+	label: string,
+	succeeded: boolean,
+	output: string,
+	durationMs: number,
+};
+
+export type WorkflowStep_Deserialize = { type: "createFolder"; path: string } | { type: "copyFile"; from: string; to: string } | { type: "moveFile"; from: string; to: string } | { type: "writeMarkdown"; path: string; content: string; createOnly?: boolean } | { type: "callMcpTool"; serverId: string; toolName: string; argumentsJson?: string };
+
+export type WorkflowStep_Serialize = { type: "createFolder"; path: string } | { type: "copyFile"; from: string; to: string } | { type: "moveFile"; from: string; to: string } | { type: "writeMarkdown"; path: string; content: string; createOnly: boolean } | { type: "callMcpTool"; serverId: string; toolName: string; argumentsJson: string };
+
+export type WorkflowSyncReport = WorkflowSyncReport_Serialize | WorkflowSyncReport_Deserialize;
+
+export type WorkflowSyncReport_Deserialize = {
+	workflows: WorkflowDefinition_Deserialize[],
+	importedCount: number,
+	skippedCount: number,
+	skippedNotes: string[],
+};
+
+export type WorkflowSyncReport_Serialize = {
+	workflows: WorkflowDefinition_Serialize[],
+	importedCount: number,
+	skippedCount: number,
+	skippedNotes: string[],
+};
+
+export type WorkflowTrigger = { type: "manual" } | { type: "folderWatch"; path: string } | { type: "schedule"; 
+/**  Polling interval in minutes (clamped to 1..=1440). */
+intervalMinutes: number };
 
 /**  Initial snapshot loaded by the React workspace shell on startup. */
 export type WorkspaceOverview = WorkspaceOverview_Serialize | WorkspaceOverview_Deserialize;

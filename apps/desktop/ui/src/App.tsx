@@ -21,7 +21,9 @@ import {
   startNextcloudLogin,
   toUserFacingError,
 } from "./lib/workspaceClient";
+import { AutomationsView } from "./views/AutomationsView";
 import { FilesView } from "./views/FilesView";
+import { FinanceView } from "./views/FinanceView";
 import { McpView } from "./views/McpView";
 import { ModuleComingSoonView } from "./views/ModuleComingSoonView";
 import { SettingsView } from "./views/SettingsView";
@@ -361,6 +363,16 @@ export function App() {
               pendingApprovals={pendingMcpApprovals}
               onRefreshApprovals={refreshPendingApprovals}
               onOverviewUpdated={setOverview}
+            />
+          ) : activeModule?.id === "finance" ? (
+            <FinanceView
+              financeFolder={overview.config.financeFolder}
+              isNextcloudConnected={overview.connectionStatus.state === "connected"}
+              onOverviewUpdated={setOverview}
+            />
+          ) : activeModule?.id === "automation" ? (
+            <AutomationsView
+              isNextcloudConnected={overview.connectionStatus.state === "connected"}
             />
           ) : activeModule ? (
             <ModuleComingSoonView module={activeModule} />
