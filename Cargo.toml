@@ -7,9 +7,11 @@ members = [
   "crates/fr-preview",
   "crates/fr-mcp",
   "crates/fr-workflows",
+  "crates/fr-talk",
   "crates/modules/fr-mod-files",
   "crates/modules/fr-mod-finance",
   "crates/modules/fr-mod-automation",
+  "crates/modules/fr-mod-talk",
   "apps/desktop/src-tauri",
 ]
 
@@ -61,9 +63,11 @@ fr-nextcloud = { path = "crates/fr-nextcloud" }
 fr-preview = { path = "crates/fr-preview" }
 fr-mcp = { path = "crates/fr-mcp" }
 fr-workflows = { path = "crates/fr-workflows" }
+fr-talk = { path = "crates/fr-talk" }
 fr-mod-files = { path = "crates/modules/fr-mod-files" }
 fr-mod-finance = { path = "crates/modules/fr-mod-finance" }
 fr-mod-automation = { path = "crates/modules/fr-mod-automation" }
+fr-mod-talk = { path = "crates/modules/fr-mod-talk" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

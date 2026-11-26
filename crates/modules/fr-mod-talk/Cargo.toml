@@ -1,0 +1,17 @@
+[package]
+name = "fr-mod-talk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+fr-core.workspace = true
+fr-mcp.workspace = true
+fr-nextcloud.workspace = true
+fr-talk.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

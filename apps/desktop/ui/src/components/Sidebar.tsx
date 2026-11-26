@@ -2,6 +2,7 @@ import {
   Blocks,
   Cpu,
   Folder,
+  MessageSquare,
   Settings,
   Wallet,
   Workflow,
@@ -22,6 +23,8 @@ function ModuleIcon({ icon }: { icon: string }) {
   switch (icon) {
     case "folder":
       return <Folder className="h-4 w-4 shrink-0" />;
+    case "message":
+      return <MessageSquare className="h-4 w-4 shrink-0" />;
     case "cpu":
       return <Cpu className="h-4 w-4 shrink-0" />;
     case "wallet":

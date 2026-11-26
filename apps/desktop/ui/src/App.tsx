@@ -33,6 +33,7 @@ import { FinanceView } from "./views/FinanceView";
 import { McpView } from "./views/McpView";
 import { ModuleComingSoonView } from "./views/ModuleComingSoonView";
 import { SettingsView } from "./views/SettingsView";
+import { TalkView } from "./views/TalkView";
 
 function applyThemePreference(theme: string) {
   const root = document.documentElement;
@@ -420,6 +421,17 @@ export function App() {
               onCancelLogin={handleCancelLogin}
               onOpenSettings={() => setActiveNav("settings")}
               onOverviewUpdated={setOverview}
+            />
+          ) : activeModule?.id === "talk" ? (
+            <TalkView
+              isNextcloudConnected={
+                overview.connectionStatus.state === "connected"
+              }
+              currentLoginName={
+                overview.connectionStatus.state === "connected"
+                  ? overview.connectionStatus.loginName
+                  : null
+              }
             />
           ) : activeModule?.id === "mcp" ? (
             <McpView

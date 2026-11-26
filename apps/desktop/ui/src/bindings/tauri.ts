@@ -64,6 +64,27 @@ export const commands = {
 	skipAppUpdate: (version: string, options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("skip_app_update", { version }, options),
 	clearSkippedAppUpdate: (options?: InvokeOptions) => __TAURI_INVOKE<WorkspaceOverview_Serialize>("clear_skipped_app_update", undefined, options),
 	installAppUpdate: (force: boolean, options?: InvokeOptions) => __TAURI_INVOKE<null>("install_app_update", { force }, options),
+	getTalkCapabilities: (options?: InvokeOptions) => __TAURI_INVOKE<TalkCapabilities>("get_talk_capabilities", undefined, options),
+	listTalkRooms: (modifiedSince: number | null, options?: InvokeOptions) => __TAURI_INVOKE<TalkRoomsPage_Serialize>("list_talk_rooms", { modifiedSince }, options),
+	createTalkRoom: (input: CreateTalkRoomRequest_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<TalkRoom_Serialize>("create_talk_room", { input }, options),
+	toggleTalkRoomFavorite: (token: string, favorite: boolean, options?: InvokeOptions) => __TAURI_INVOKE<null>("toggle_talk_room_favorite", { token, favorite }, options),
+	leaveTalkRoom: (token: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("leave_talk_room", { token }, options),
+	getTalkMessages: (token: string, beforeMessageId: number | null, limit: number, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessagesPage_Serialize>("get_talk_messages", { token, beforeMessageId, limit }, options),
+	sendTalkMessage: (input: SendTalkMessageRequest_Deserialize, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("send_talk_message", { input }, options),
+	editTalkMessage: (token: string, messageId: number | null, message: string, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("edit_talk_message", { token, messageId, message }, options),
+	deleteTalkMessage: (token: string, messageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("delete_talk_message", { token, messageId }, options),
+	markTalkRead: (token: string, lastReadMessageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("mark_talk_read", { token, lastReadMessageId }, options),
+	toggleTalkReaction: (token: string, messageId: number | null, reaction: string, add: boolean, options?: InvokeOptions) => __TAURI_INVOKE<null>("toggle_talk_reaction", { token, messageId, reaction, add }, options),
+	shareTalkFileReference: (token: string, fileId: string, caption: string | null, options?: InvokeOptions) => __TAURI_INVOKE<TalkMessage_Serialize>("share_talk_file_reference", { token, fileId, caption }, options),
+	uploadTalkAttachmentBase64: (token: string, roomDisplayName: string, fileName: string, dataBase64: string, options?: InvokeOptions) => __TAURI_INVOKE<string>("upload_talk_attachment_base64", { token, roomDisplayName, fileName, dataBase64 }, options),
+	getTalkDraft: (token: string, options?: InvokeOptions) => __TAURI_INVOKE<string | null>("get_talk_draft", { token }, options),
+	saveTalkDraft: (token: string, text: string, options?: InvokeOptions) => __TAURI_INVOKE<null>("save_talk_draft", { token, text }, options),
+	/**
+	 *  Starts a single Rust-owned long-poll loop (`lookIntoFuture=1&timeout=60`) for ONLY the
+	 *  currently open conversation, automatically cancelling any previous conversation's loop.
+	 */
+	startTalkPolling: (token: string, lastKnownMessageId: number | null, options?: InvokeOptions) => __TAURI_INVOKE<null>("start_talk_polling", { token, lastKnownMessageId }, options),
+	stopTalkPolling: (options?: InvokeOptions) => __TAURI_INVOKE<void>("stop_talk_polling", undefined, options),
 };
 
 /* Types */
@@ -174,6 +195,23 @@ export type ConfigureMcpServerResponse_Deserialize = {
 export type ConfigureMcpServerResponse_Serialize = {
 	status: McpServerStatus_Serialize,
 	overview: WorkspaceOverview_Serialize,
+};
+
+/**  Request payload to create a new 1:1 or group Talk conversation. */
+export type CreateTalkRoomRequest = CreateTalkRoomRequest_Serialize | CreateTalkRoomRequest_Deserialize;
+
+/**  Request payload to create a new 1:1 or group Talk conversation. */
+export type CreateTalkRoomRequest_Deserialize = {
+	roomType: TalkRoomType,
+	roomName?: string | null,
+	invite?: string | null,
+};
+
+/**  Request payload to create a new 1:1 or group Talk conversation. */
+export type CreateTalkRoomRequest_Serialize = {
+	roomType: TalkRoomType,
+	roomName: string | null,
+	invite: string | null,
 };
 
 /**  Opaque entity tag used for optimistic concurrency (`If-Match` / HTTP 412 conflict detection). */
@@ -492,7 +530,7 @@ export type McpToolInfo = {
 };
 
 /**  Capabilities a workspace module can declare to the host shell. */
-export type ModuleCapability = "storage" | "preview" | "mcpServerTools" | "mcpClient" | "workflows";
+export type ModuleCapability = "storage" | "preview" | "mcpServerTools" | "mcpClient" | "workflows" | "chat";
 
 /**  Serializable metadata describing a registered workspace module. */
 export type ModuleDescriptor = {
@@ -526,6 +564,25 @@ export type PreviewKind = "markdown" | "image" | "video" | "pdf" | "vectorSvg" |
 export type SaveMarkdownResponse = {
 	path: CloudPath,
 	etag: Etag,
+};
+
+/**  Request payload to send a new Talk chat message. */
+export type SendTalkMessageRequest = SendTalkMessageRequest_Serialize | SendTalkMessageRequest_Deserialize;
+
+/**  Request payload to send a new Talk chat message. */
+export type SendTalkMessageRequest_Deserialize = {
+	token: string,
+	message: string,
+	replyTo?: number | null,
+	referenceId?: string | null,
+};
+
+/**  Request payload to send a new Talk chat message. */
+export type SendTalkMessageRequest_Serialize = {
+	token: string,
+	message: string,
+	replyTo: number | null,
+	referenceId: string | null,
 };
 
 /**  Engineering metadata extracted from SolidWorks OLE2 `SummaryInformation` streams. */
@@ -574,6 +631,172 @@ export type SolidWorksPreview_Serialize = {
 	thumbnailDataUrl: string | null,
 	metadata: SolidWorksMetadata_Serialize,
 	streamCount: number,
+};
+
+/**  Feature-detected Nextcloud Talk (`spreed`) server capabilities from `/ocs/v1.php/cloud/capabilities`. */
+export type TalkCapabilities = {
+	enabled: boolean,
+	features: string[],
+	maxMessageLength: number,
+	attachmentsAllowed: boolean,
+	attachmentsFolder: string,
+	conversationSubfolders: boolean,
+	richObjectSharing: boolean,
+	reactionsSupported: boolean,
+	editMessagesSupported: boolean,
+	deleteMessagesSupported: boolean,
+};
+
+/**  A Nextcloud file referenced or shared inside a Talk message (zero file copies). */
+export type TalkFileReference = TalkFileReference_Serialize | TalkFileReference_Deserialize;
+
+/**  A Nextcloud file referenced or shared inside a Talk message (zero file copies). */
+export type TalkFileReference_Deserialize = {
+	fileId: string,
+	name: string,
+	path?: string | null,
+	mimeType?: string | null,
+	size?: number | null,
+	link?: string | null,
+};
+
+/**  A Nextcloud file referenced or shared inside a Talk message (zero file copies). */
+export type TalkFileReference_Serialize = {
+	fileId: string,
+	name: string,
+	path: string | null,
+	mimeType: string | null,
+	size: number | null,
+	link: string | null,
+};
+
+/**  A single Nextcloud Talk chat message. */
+export type TalkMessage = TalkMessage_Serialize | TalkMessage_Deserialize;
+
+/**  A single Nextcloud Talk chat message. */
+export type TalkMessage_Deserialize = {
+	id: number | null,
+	token: string,
+	actorType: string,
+	actorId: string,
+	actorDisplayName: string,
+	timestamp: number | null,
+	message: string,
+	messageType: string,
+	systemMessage: string,
+	isReplyable: boolean,
+	deleted: boolean,
+	referenceId?: string | null,
+	parent?: TalkParentMessage | null,
+	reactions: { [key in string]: number },
+	reactionsSelf: string[],
+	fileReference?: TalkFileReference_Deserialize | null,
+};
+
+/**  A single Nextcloud Talk chat message. */
+export type TalkMessage_Serialize = {
+	id: number | null,
+	token: string,
+	actorType: string,
+	actorId: string,
+	actorDisplayName: string,
+	timestamp: number | null,
+	message: string,
+	messageType: string,
+	systemMessage: string,
+	isReplyable: boolean,
+	deleted: boolean,
+	referenceId: string | null,
+	parent: TalkParentMessage | null,
+	reactions: { [key in string]: number },
+	reactionsSelf: string[],
+	fileReference: TalkFileReference_Serialize | null,
+};
+
+/**  A page of Talk messages plus pagination headers (`X-Chat-Last-Given`, `X-Chat-Last-Common-Read`). */
+export type TalkMessagesPage = TalkMessagesPage_Serialize | TalkMessagesPage_Deserialize;
+
+/**  A page of Talk messages plus pagination headers (`X-Chat-Last-Given`, `X-Chat-Last-Common-Read`). */
+export type TalkMessagesPage_Deserialize = {
+	messages: TalkMessage_Deserialize[],
+	lastGiven?: number | null,
+	lastCommonRead?: number | null,
+	fromCache: boolean,
+};
+
+/**  A page of Talk messages plus pagination headers (`X-Chat-Last-Given`, `X-Chat-Last-Common-Read`). */
+export type TalkMessagesPage_Serialize = {
+	messages: TalkMessage_Serialize[],
+	lastGiven: number | null,
+	lastCommonRead: number | null,
+	fromCache: boolean,
+};
+
+/**  Compact parent summary when a message replies to an earlier message. */
+export type TalkParentMessage = {
+	id: number | null,
+	actorDisplayName: string,
+	message: string,
+	deleted: boolean,
+};
+
+/**  Summary of a Nextcloud Talk conversation shown in the sidebar. */
+export type TalkRoom = TalkRoom_Serialize | TalkRoom_Deserialize;
+
+/**  Talk conversation category matching Nextcloud Talk's integer `type` enum. */
+export type TalkRoomType = "oneToOne" | "group" | "public" | "changelog" | "noteToSelf" | "other";
+
+/**  Summary of a Nextcloud Talk conversation shown in the sidebar. */
+export type TalkRoom_Deserialize = {
+	token: string,
+	name: string,
+	displayName: string,
+	description: string,
+	roomType: TalkRoomType,
+	isFavorite: boolean,
+	unreadMessages: number,
+	unreadMention: boolean,
+	lastActivity: number | null,
+	lastReadMessage?: number | null,
+	lastMessagePreview?: string | null,
+	lastMessageActor?: string | null,
+	readOnly: boolean,
+	canLeave: boolean,
+};
+
+/**  Summary of a Nextcloud Talk conversation shown in the sidebar. */
+export type TalkRoom_Serialize = {
+	token: string,
+	name: string,
+	displayName: string,
+	description: string,
+	roomType: TalkRoomType,
+	isFavorite: boolean,
+	unreadMessages: number,
+	unreadMention: boolean,
+	lastActivity: number | null,
+	lastReadMessage: number | null,
+	lastMessagePreview: string | null,
+	lastMessageActor: string | null,
+	readOnly: boolean,
+	canLeave: boolean,
+};
+
+/**  Result of listing Talk conversations, including the incremental `modifiedSince` cursor. */
+export type TalkRoomsPage = TalkRoomsPage_Serialize | TalkRoomsPage_Deserialize;
+
+/**  Result of listing Talk conversations, including the incremental `modifiedSince` cursor. */
+export type TalkRoomsPage_Deserialize = {
+	rooms: TalkRoom_Deserialize[],
+	modifiedBefore?: number | null,
+	fromCache: boolean,
+};
+
+/**  Result of listing Talk conversations, including the incremental `modifiedSince` cursor. */
+export type TalkRoomsPage_Serialize = {
+	rooms: TalkRoom_Serialize[],
+	modifiedBefore: number | null,
+	fromCache: boolean,
 };
 
 export type UpdateSafetyStatus = {

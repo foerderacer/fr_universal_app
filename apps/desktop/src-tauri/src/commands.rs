@@ -19,6 +19,10 @@ use fr_nextcloud::{
     initiate_login_flow, normalize_server_url, poll_login_flow,
 };
 use fr_storage::{CloudPath, Etag};
+use fr_talk::{
+    CreateTalkRoomRequest, SendTalkMessageRequest, TalkCapabilities, TalkMessage, TalkMessagesPage,
+    TalkRoom, TalkRoomsPage, validate_room_token,
+};
 use fr_workflows::{WorkflowDefinition, WorkflowRunRecord, WorkflowSyncReport};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -2060,6 +2064,474 @@ pub async fn install_app_update(
             technical_details: Some(err.to_string()),
         })?;
     app.restart();
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06: Nextcloud Talk Integration (Chat-only + Pure File-ID References)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkMessagesEvent {
+    pub token: String,
+    pub messages: Vec<TalkMessage>,
+    pub last_given: Option<i64>,
+}
+
+fn f64_to_i64_id(val: f64) -> Result<i64, UserFacingError> {
+    if !val.is_finite() || val.fract() != 0.0 || val < 0.0 || val > (i64::MAX as f64) {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "Invalid message identifier.".into(),
+        )));
+    }
+    Ok(val as i64)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_talk_capabilities(
+    state: State<'_, AppState>,
+) -> Result<TalkCapabilities, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let caps = client
+        .fetch_capabilities()
+        .await
+        .map_err(UserFacingError::from)?;
+    if let Ok(mut guard) = state.talk_capabilities.lock() {
+        *guard = Some(caps.clone());
+    }
+    Ok(caps)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_talk_rooms(
+    state: State<'_, AppState>,
+    modified_since: Option<f64>,
+) -> Result<TalkRoomsPage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let since = modified_since.map(f64_to_i64_id).transpose()?;
+
+    match client.list_rooms(since).await {
+        Ok(page) => {
+            if !page.rooms.is_empty() || since.is_none() {
+                let cache = state.talk_cache.clone();
+                let rooms_clone = page.rooms.clone();
+                let replace = since.is_none();
+                let _ = tokio::task::spawn_blocking(move || {
+                    cache.put_rooms(&scope, &rooms_clone, replace)
+                })
+                .await;
+            }
+            Ok(page)
+        }
+        Err(FrError::Network(_)) => {
+            let cache = state.talk_cache.clone();
+            let cached = tokio::task::spawn_blocking(move || cache.list_rooms(&scope))
+                .await
+                .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+                .map_err(UserFacingError::from)?;
+            Ok(TalkRoomsPage {
+                rooms: cached,
+                modified_before: None,
+                from_cache: true,
+            })
+        }
+        Err(other) => Err(UserFacingError::from(other)),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn create_talk_room(
+    state: State<'_, AppState>,
+    input: CreateTalkRoomRequest,
+) -> Result<TalkRoom, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let room = client
+        .create_room(&input)
+        .await
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    let room_clone = room.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || cache.put_rooms(&scope, &[room_clone], false)).await;
+    Ok(room)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn toggle_talk_room_favorite(
+    state: State<'_, AppState>,
+    token: String,
+    favorite: bool,
+) -> Result<(), UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    client
+        .set_favorite(&token, favorite)
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn leave_talk_room(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<(), UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    state.stop_talk_polling();
+    client
+        .leave_room(&token)
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_talk_messages(
+    state: State<'_, AppState>,
+    token: String,
+    before_message_id: Option<f64>,
+    limit: u32,
+) -> Result<TalkMessagesPage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let before = before_message_id.map(f64_to_i64_id).transpose()?;
+
+    match client
+        .fetch_messages(&token, false, before, limit, 15)
+        .await
+    {
+        Ok(page) => {
+            let cache = state.talk_cache.clone();
+            let tok = token.clone();
+            let msgs = page.messages.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || cache.put_messages(&scope, &tok, &msgs)).await;
+            Ok(page)
+        }
+        Err(FrError::Network(_)) if before.is_none() => {
+            let cache = state.talk_cache.clone();
+            let tok = token.clone();
+            let cached = tokio::task::spawn_blocking(move || {
+                cache.list_messages(&scope, &tok, limit as usize)
+            })
+            .await
+            .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+            .map_err(UserFacingError::from)?;
+            Ok(TalkMessagesPage {
+                messages: cached,
+                last_given: None,
+                last_common_read: None,
+                from_cache: true,
+            })
+        }
+        Err(other) => Err(UserFacingError::from(other)),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn send_talk_message(
+    state: State<'_, AppState>,
+    input: SendTalkMessageRequest,
+) -> Result<TalkMessage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let sent = client
+        .send_message(
+            &input.token,
+            &input.message,
+            input.reply_to,
+            input.reference_id.as_deref(),
+        )
+        .await
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    let tok = input.token;
+    let msg_clone = sent.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = cache.put_messages(&scope, &tok, &[msg_clone]);
+        let _ = cache.save_draft(&scope, &tok, "");
+    })
+    .await;
+    Ok(sent)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_talk_message(
+    state: State<'_, AppState>,
+    token: String,
+    message_id: f64,
+    message: String,
+) -> Result<TalkMessage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let id = f64_to_i64_id(message_id)?;
+    let edited = client
+        .edit_message(&token, id, &message)
+        .await
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    let tok = token;
+    let msg_clone = edited.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || cache.put_messages(&scope, &tok, &[msg_clone])).await;
+    Ok(edited)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_talk_message(
+    state: State<'_, AppState>,
+    token: String,
+    message_id: f64,
+) -> Result<TalkMessage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let id = f64_to_i64_id(message_id)?;
+    let deleted = client
+        .delete_message(&token, id)
+        .await
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    let tok = token;
+    let msg_clone = deleted.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || cache.put_messages(&scope, &tok, &[msg_clone])).await;
+    Ok(deleted)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn mark_talk_read(
+    state: State<'_, AppState>,
+    token: String,
+    last_read_message_id: f64,
+) -> Result<(), UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let id = f64_to_i64_id(last_read_message_id)?;
+    client
+        .mark_read(&token, id)
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn toggle_talk_reaction(
+    state: State<'_, AppState>,
+    token: String,
+    message_id: f64,
+    reaction: String,
+    add: bool,
+) -> Result<(), UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let id = f64_to_i64_id(message_id)?;
+    client
+        .set_reaction(&token, id, &reaction, add)
+        .await
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn share_talk_file_reference(
+    state: State<'_, AppState>,
+    token: String,
+    file_id: String,
+    caption: Option<String>,
+) -> Result<TalkMessage, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let sent = client
+        .share_file_reference(&token, &file_id, caption.as_deref(), None)
+        .await
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    let tok = token;
+    let msg_clone = sent.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || cache.put_messages(&scope, &tok, &[msg_clone])).await;
+    Ok(sent)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn upload_talk_attachment_base64(
+    state: State<'_, AppState>,
+    token: String,
+    room_display_name: String,
+    file_name: String,
+    data_base64: String,
+) -> Result<String, UserFacingError> {
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let service = require_files_service(&state)?;
+    let caps = {
+        let cached = state.talk_capabilities.lock().ok().and_then(|g| g.clone());
+        match cached {
+            Some(c) => c,
+            None => {
+                let fetched = client
+                    .fetch_capabilities()
+                    .await
+                    .map_err(UserFacingError::from)?;
+                if let Ok(mut guard) = state.talk_capabilities.lock() {
+                    *guard = Some(fetched.clone());
+                }
+                fetched
+            }
+        }
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|err| UserFacingError {
+            code: "invalid_upload".into(),
+            title: "File upload couldn't be read".into(),
+            message: "The selected file data wasn't valid.".into(),
+            recovery_hint: Some("Select the file again and retry.".into()),
+            technical_details: Some(err.to_string()),
+        })?;
+    let cloud_path = client
+        .upload_and_attach_file(
+            service.storage().as_ref(),
+            &caps,
+            &token,
+            &room_display_name,
+            &file_name,
+            bytes::Bytes::from(decoded),
+        )
+        .await
+        .map_err(UserFacingError::from)?;
+    Ok(cloud_path.as_str().to_owned())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_talk_draft(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<Option<String>, UserFacingError> {
+    validate_room_token(&token).map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    tokio::task::spawn_blocking(move || cache.get_draft(&scope, &token))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_talk_draft(
+    state: State<'_, AppState>,
+    token: String,
+    text: String,
+) -> Result<(), UserFacingError> {
+    validate_room_token(&token).map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let cache = state.talk_cache.clone();
+    tokio::task::spawn_blocking(move || cache.save_draft(&scope, &token, &text))
+        .await
+        .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
+        .map_err(UserFacingError::from)
+}
+
+/// Starts a single Rust-owned long-poll loop (`lookIntoFuture=1&timeout=60`) for ONLY the
+/// currently open conversation, automatically cancelling any previous conversation's loop.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_talk_polling(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    last_known_message_id: Option<f64>,
+) -> Result<(), UserFacingError> {
+    validate_room_token(&token).map_err(UserFacingError::from)?;
+    let client = state.talk_client().map_err(UserFacingError::from)?;
+    let scope = state
+        .require_active_account_scope()
+        .map_err(UserFacingError::from)?;
+    let mut cursor = last_known_message_id.map(f64_to_i64_id).transpose()?;
+    let cache = state.talk_cache.clone();
+
+    state.stop_talk_polling();
+
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut backoff_secs = 2u64;
+        loop {
+            match client.fetch_messages(&token, true, cursor, 100, 30).await {
+                Ok(page) => {
+                    backoff_secs = 2;
+                    if let Some(last_id) =
+                        page.messages.iter().map(|m| m.id).max().or(page.last_given)
+                    {
+                        cursor = Some(last_id);
+                    }
+                    if !page.messages.is_empty() {
+                        let cache_bg = cache.clone();
+                        let scope_bg = scope.clone();
+                        let tok_bg = token.clone();
+                        let msgs_bg = page.messages.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            cache_bg.put_messages(&scope_bg, &tok_bg, &msgs_bg)
+                        })
+                        .await;
+                        let _ = app.emit(
+                            "talk://messages",
+                            &TalkMessagesEvent {
+                                token: token.clone(),
+                                messages: page.messages,
+                                last_given: cursor,
+                            },
+                        );
+                    }
+                }
+                Err(FrError::AuthRequired(_)) | Err(FrError::NotFound(_)) => {
+                    tracing::info!("Stopping Talk long-poll for room {token} (auth/not found)");
+                    break;
+                }
+                Err(err) => {
+                    tracing::debug!("Talk long-poll retry in {backoff_secs}s: {err}");
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            }
+        }
+    });
+
+    if let Ok(mut guard) = state.talk_poll_handle.lock() {
+        *guard = Some(handle);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn stop_talk_polling(state: State<'_, AppState>) {
+    state.stop_talk_polling();
 }
 
 #[cfg(test)]
