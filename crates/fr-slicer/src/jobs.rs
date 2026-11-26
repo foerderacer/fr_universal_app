@@ -112,7 +112,19 @@ impl SliceJobManager {
                 },
             );
             while guard.order.len() > MAX_RETAINED_JOBS {
-                if let Some(oldest) = guard.order.pop_back() {
+                // Never evict an active (Queued/Running) job so its cancel handle & completion record stay intact.
+                let evict_idx = guard.order.iter().rposition(|id| {
+                    guard.jobs.get(id).is_none_or(|j| {
+                        !matches!(
+                            j.record.state,
+                            SliceJobState::Queued | SliceJobState::Running
+                        )
+                    })
+                });
+                let Some(idx) = evict_idx else {
+                    break;
+                };
+                if let Some(oldest) = guard.order.remove(idx) {
                     guard.jobs.remove(&oldest);
                 }
             }
@@ -264,5 +276,48 @@ impl SliceJobManager {
                 )
             })
             .count() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_manager_tracks_lifecycle_cancellation_and_never_evicts_running_jobs() {
+        let mgr = SliceJobManager::new();
+        let (running, mut cancel_rx) = mgr.create_job(
+            "first.gcode".into(),
+            "PLA".into(),
+            RigidityPreset::Medium,
+            QualityPreset::Standard,
+        );
+        mgr.update_progress(&running.id, 30, "Slicing...".into());
+        assert_eq!(mgr.active_job_count(), 1);
+
+        for i in 0..15 {
+            let (j, _) = mgr.create_job(
+                format!("part_{i}.gcode"),
+                "PLA".into(),
+                RigidityPreset::Low,
+                QualityPreset::Fast,
+            );
+            mgr.mark_completed(
+                &j.id,
+                Bytes::from_static(b"G28 W\n"),
+                Some("10m".into()),
+                Some(5.0),
+                Some(1500.0),
+                None,
+                String::new(),
+            );
+        }
+        assert!(mgr.get_job(&running.id).is_some());
+        assert_eq!(mgr.active_job_count(), 1);
+
+        let cancelled = mgr.cancel_job(&running.id).unwrap();
+        assert_eq!(cancelled.state, SliceJobState::Cancelled);
+        assert!(*cancel_rx.borrow_and_update());
+        assert_eq!(mgr.active_job_count(), 0);
     }
 }

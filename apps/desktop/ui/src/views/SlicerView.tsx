@@ -138,6 +138,8 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const draftTimerRef = useRef<number | null>(null);
+  const pendingMaterialDraftRef = useRef<MaterialPreset_Serialize | null>(null);
+  const pickerSeqRef = useRef<number>(0);
   const objectsRef = useRef<PlateObject[]>([]);
   objectsRef.current = objects;
 
@@ -148,6 +150,21 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
     }, 5000);
   }, []);
 
+  const flushMaterialDraft = useCallback(() => {
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    const draft = pendingMaterialDraftRef.current;
+    if (!draft) return;
+    pendingMaterialDraftRef.current = null;
+    setOverview((prev) => (prev ? { ...prev, materialDraft: draft } : prev));
+    setRestoredDraftNotice(true);
+    void saveMaterialPresetDraft(draft).catch((err) => {
+      setError(toUserFacingError(err));
+    });
+  }, []);
+
   const refreshOverview = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -155,13 +172,25 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
       const data = await getSlicerOverview();
       setOverview(data);
       setRecentJobs(data.recentJobs);
-      setEnginePathInput(data.binary.path ?? "");
-      if (
-        data.materials.length > 0 &&
-        !data.materials.some((m) => m.id === materialId)
-      ) {
-        setMaterialId(data.materials[0].id);
-      }
+      setActiveJob((prev) => {
+        if (prev) {
+          const updated = data.recentJobs.find((j) => j.id === prev.id);
+          if (updated) return updated;
+        }
+        return (
+          data.recentJobs.find(
+            (j) => j.state === "queued" || j.state === "running",
+          ) ??
+          data.recentJobs[0] ??
+          null
+        );
+      });
+      setEnginePathInput((prev) => (prev ? prev : (data.binary.path ?? "")));
+      setMaterialId((prev) =>
+        data.materials.length > 0 && !data.materials.some((m) => m.id === prev)
+          ? data.materials[0].id
+          : prev,
+      );
       if (data.materialDraft) {
         setRestoredDraftNotice(true);
       }
@@ -170,36 +199,37 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
     } finally {
       setLoading(false);
     }
-  }, [materialId]);
+  }, []);
 
   useEffect(() => {
     void refreshOverview();
   }, [refreshOverview]);
 
-  // Dismiss modals with Escape key
+  // Dismiss modals with Escape key (flushing any unsaved material draft)
   useEffect(() => {
     if (!showCloudPicker && !showMaterialModal) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setShowCloudPicker(false);
-        setShowMaterialModal(false);
+        if (showMaterialModal) {
+          flushMaterialDraft();
+          setShowMaterialModal(false);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showCloudPicker, showMaterialModal]);
+  }, [showCloudPicker, showMaterialModal, flushMaterialDraft]);
 
-  // Dispose Three.js geometries on unmount
+  // Flush any pending custom material draft and dispose Three.js geometries on unmount
   useEffect(() => {
     return () => {
-      if (draftTimerRef.current !== null) {
-        window.clearTimeout(draftTimerRef.current);
-      }
+      flushMaterialDraft();
       for (const obj of objectsRef.current) {
         obj.geometry.dispose();
       }
     };
-  }, []);
+  }, [flushMaterialDraft]);
 
   // Listen to real-time slicer progress and completion events from Rust
   useEffect(() => {
@@ -207,17 +237,22 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
     let cancelled = false;
     const unlisteners: (() => void)[] = [];
 
+    const isTerminal = (state: SliceJobRecord_Serialize["state"]) =>
+      state === "completed" || state === "failed" || state === "cancelled";
+
     void listen<SlicerProgressPayload>("slicer://progress", (event) => {
       if (cancelled) return;
       const { jobId, percent, stage } = event.payload;
       setActiveJob((prev) =>
-        prev && prev.id === jobId
+        prev && prev.id === jobId && !isTerminal(prev.state)
           ? { ...prev, state: "running", percent, stage }
           : prev,
       );
       setRecentJobs((prev) =>
         prev.map((j) =>
-          j.id === jobId ? { ...j, state: "running", percent, stage } : j,
+          j.id === jobId && !isTerminal(j.state)
+            ? { ...j, state: "running", percent, stage }
+            : j,
         ),
       );
     }).then((fn) => {
@@ -229,7 +264,7 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
       if (cancelled) return;
       const updated = event.payload;
       setActiveJob((prev) =>
-        prev && prev.id === updated.id ? updated : prev,
+        !prev || prev.id === updated.id ? updated : prev,
       );
       setRecentJobs((prev) => {
         const exists = prev.some((j) => j.id === updated.id);
@@ -336,16 +371,22 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
   }
 
   const loadPickerFolder = useCallback(async (path: string) => {
+    const seq = ++pickerSeqRef.current;
     setLoadingPicker(true);
     setError(null);
     try {
       const items = await listFiles(path);
+      if (pickerSeqRef.current !== seq) return;
       setPickerPath(path);
       setPickerItems(items);
     } catch (err) {
-      setError(toUserFacingError(err));
+      if (pickerSeqRef.current === seq) {
+        setError(toUserFacingError(err));
+      }
     } finally {
-      setLoadingPicker(false);
+      if (pickerSeqRef.current === seq) {
+        setLoadingPicker(false);
+      }
     }
   }, []);
 
@@ -395,34 +436,42 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
   }
 
   function handleRemoveObject(id: string) {
-    setObjects((prev) => {
-      const target = prev.find((o) => o.id === id);
-      target?.geometry.dispose();
-      const next = prev.filter((o) => o.id !== id);
-      if (selectedObjectId === id) {
-        setSelectedObjectId(next[0]?.id ?? null);
-      }
-      return next;
-    });
+    const target = objects.find((o) => o.id === id);
+    const remaining = objects.filter((o) => o.id !== id);
+    target?.geometry.dispose();
+    setObjects(remaining);
+    if (selectedObjectId === id) {
+      setSelectedObjectId(remaining[0]?.id ?? null);
+    }
   }
 
-  /** Simple shelf-pack auto-arrange keeping a 8 mm margin between parts on the MK3S bed. */
+  /** Shelf-pack auto-arrange using actual rotated bounds centers with 8 mm clearance. */
   function handleAutoArrange() {
     if (objects.length === 0) return;
     const gap = 8;
     const measured = objects.map((o) => {
       const b = computeObjectPrinterBounds(o);
+      const cx = (b.minX + b.maxX) / 2;
+      const cy = (b.minY + b.maxY) / 2;
       return {
         obj: o,
         w: Math.max(1, b.maxX - b.minX),
         d: Math.max(1, b.maxY - b.minY),
+        offsetX: cx - o.positionX,
+        offsetY: cy - o.positionY,
       };
     });
 
     let cursorX = gap;
     let cursorY = gap;
     let rowDepth = 0;
-    const placed: { id: string; x: number; y: number }[] = [];
+    const placed: {
+      id: string;
+      centerX: number;
+      centerY: number;
+      offsetX: number;
+      offsetY: number;
+    }[] = [];
 
     for (const item of measured) {
       if (cursorX + item.w + gap > MK3S_BED_X && cursorX > gap) {
@@ -432,23 +481,24 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
       }
       placed.push({
         id: item.obj.id,
-        x: cursorX + item.w / 2,
-        y: cursorY + item.d / 2,
+        centerX: cursorX + item.w / 2,
+        centerY: cursorY + item.d / 2,
+        offsetX: item.offsetX,
+        offsetY: item.offsetY,
       });
       cursorX += item.w + gap;
       rowDepth = Math.max(rowDepth, item.d);
     }
 
-    // Center the whole arranged cluster on the 250x210 bed
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
     for (let i = 0; i < placed.length; i++) {
-      minX = Math.min(minX, placed[i].x - measured[i].w / 2);
-      maxX = Math.max(maxX, placed[i].x + measured[i].w / 2);
-      minY = Math.min(minY, placed[i].y - measured[i].d / 2);
-      maxY = Math.max(maxY, placed[i].y + measured[i].d / 2);
+      minX = Math.min(minX, placed[i].centerX - measured[i].w / 2);
+      maxX = Math.max(maxX, placed[i].centerX + measured[i].w / 2);
+      minY = Math.min(minY, placed[i].centerY - measured[i].d / 2);
+      maxY = Math.max(maxY, placed[i].centerY + measured[i].d / 2);
     }
     const shiftX = MK3S_BED_X / 2 - (minX + maxX) / 2;
     const shiftY = MK3S_BED_Y / 2 - (minY + maxY) / 2;
@@ -456,7 +506,10 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
     const coords = new Map(
       placed.map((p) => [
         p.id,
-        { x: Number((p.x + shiftX).toFixed(1)), y: Number((p.y + shiftY).toFixed(1)) },
+        {
+          x: Number((p.centerX + shiftX - p.offsetX).toFixed(1)),
+          y: Number((p.centerY + shiftY - p.offsetY).toFixed(1)),
+        },
       ]),
     );
     setObjects((prev) =>
@@ -530,11 +583,19 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
     setEditingMaterial((prev) => {
       if (!prev) return prev;
       const next = { ...prev, ...patch };
+      pendingMaterialDraftRef.current = next;
       if (draftTimerRef.current !== null) {
         window.clearTimeout(draftTimerRef.current);
       }
       draftTimerRef.current = window.setTimeout(() => {
-        void saveMaterialPresetDraft(next).catch(() => {});
+        draftTimerRef.current = null;
+        const latest = pendingMaterialDraftRef.current;
+        if (!latest) return;
+        pendingMaterialDraftRef.current = null;
+        setOverview((o) => (o ? { ...o, materialDraft: latest } : o));
+        void saveMaterialPresetDraft(latest).catch((err) => {
+          setError(toUserFacingError(err));
+        });
       }, 350);
       return next;
     });
@@ -549,6 +610,7 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
       window.clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
     }
+    pendingMaterialDraftRef.current = null;
     try {
       const saved = await saveCustomMaterialPreset(editingMaterial);
       setMaterialId(saved.id);
@@ -569,6 +631,7 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
       window.clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
     }
+    pendingMaterialDraftRef.current = null;
     await clearMaterialPresetDraft().catch(() => {});
     setEditingMaterial(null);
     setShowMaterialModal(false);
@@ -621,8 +684,28 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
         saveToCloudFolder:
           isNextcloudConnected && autoSaveCloud ? cloudOutputFolder : null,
       });
-      setActiveJob(job);
-      setRecentJobs((prev) => [job, ...prev.filter((j) => j.id !== job.id)]);
+      // Do not overwrite if a terminal event for this job already arrived while awaiting IPC.
+      setActiveJob((prev) =>
+        prev &&
+        prev.id === job.id &&
+        (prev.state === "completed" ||
+          prev.state === "failed" ||
+          prev.state === "cancelled")
+          ? prev
+          : job,
+      );
+      setRecentJobs((prev) => {
+        const existing = prev.find((j) => j.id === job.id);
+        if (
+          existing &&
+          (existing.state === "completed" ||
+            existing.state === "failed" ||
+            existing.state === "cancelled")
+        ) {
+          return prev;
+        }
+        return [job, ...prev.filter((j) => j.id !== job.id)];
+      });
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -1454,7 +1537,7 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
               )}
 
             {/* Recent Jobs */}
-            {recentJobs.length > 1 && (
+            {recentJobs.length > 0 && (
               <div className="space-y-1 pt-1">
                 <p className="text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
                   Recent slices
@@ -1614,7 +1697,10 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
               </h2>
               <button
                 type="button"
-                onClick={() => setShowMaterialModal(false)}
+                onClick={() => {
+                  flushMaterialDraft();
+                  setShowMaterialModal(false);
+                }}
                 className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
                 <X className="h-4 w-4" />
@@ -1760,7 +1846,10 @@ export function SlicerView({ isNextcloudConnected }: SlicerViewProps) {
               <div className="flex gap-2">
                 <button
                   type="button"
-                  onClick={() => setShowMaterialModal(false)}
+                  onClick={() => {
+                    flushMaterialDraft();
+                    setShowMaterialModal(false);
+                  }}
                   className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-medium dark:border-slate-700"
                 >
                   Close

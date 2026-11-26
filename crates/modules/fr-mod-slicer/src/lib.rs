@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use fr_core::{FrError, FrModule, ModuleCapability, ModuleDescriptor, ModuleStatus, Result};
 use fr_mcp::{McpToolHandler, McpToolRegistry};
 use fr_slicer::{
-    PrinterSpecs, PrusaSlicerEngine, QualityPreset, RigidityPreset, SliceEngineRequest,
-    SliceOverrides, SlicerPresetStore, detect_prusaslicer_binary, quality_presets_info,
-    rigidity_presets_info, sanitize_gcode_filename,
+    MAX_MODEL_BYTES, PrinterSpecs, PrusaSlicerEngine, QualityPreset, RigidityPreset,
+    SliceEngineRequest, SliceOverrides, SlicerPresetStore, detect_prusaslicer_binary,
+    quality_presets_info, rigidity_presets_info, sanitize_gcode_filename,
+    validate_raw_model_fits_mk3s,
 };
 use fr_storage::{CloudPath, StorageBackend};
 use serde_json::{Value, json};
@@ -139,7 +140,8 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
             .get("output_folder")
             .and_then(Value::as_str)
             .unwrap_or("/");
-        format!("Slice '{model}' for Prusa MK3S and save .gcode into '{folder}'")
+        let out_name = sanitize_gcode_filename(model);
+        format!("Slice '{model}' for Prusa MK3S and save '{out_name}' into '{folder}'")
     }
     async fn call(&self, args: Value) -> Result<Value> {
         let model_path_raw = args
@@ -188,8 +190,19 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
 
         let material = self.0.find_material(material_id)?;
         let model_cloud_path = CloudPath::parse(model_path_raw)?;
+        let stat = storage.stat(&model_cloud_path).await?;
+        if stat.size > MAX_MODEL_BYTES as u64 {
+            return Err(FrError::InvalidInput(
+                "The selected 3D model exceeds the 100 MiB slicing limit.".into(),
+            ));
+        }
         let (model_bytes, _etag) = storage.read(&model_cloud_path).await?;
-        let output_name = sanitize_gcode_filename(model_cloud_path.file_name().unwrap_or("print"));
+        let model_file_name = model_cloud_path
+            .file_name()
+            .unwrap_or("model.stl")
+            .to_owned();
+        validate_raw_model_fits_mk3s(&model_file_name, &model_bytes)?;
+        let output_name = sanitize_gcode_filename(&model_file_name);
         let folder_path = CloudPath::parse(output_folder_raw)?;
         let output_cloud_path = folder_path.join(&output_name)?;
 
@@ -199,12 +212,10 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
             .run_slice(
                 SliceEngineRequest {
                     job_id: "mcp-slice".into(),
-                    model_file_name: model_cloud_path
-                        .file_name()
-                        .unwrap_or("model.stl")
-                        .to_owned(),
+                    model_file_name,
                     model_bytes,
                     bounds: None,
+                    preserve_arrangement: false,
                     quality,
                     rigidity,
                     material,
@@ -219,7 +230,10 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
             )
             .await?;
 
-        let _ = storage.mkdir(&folder_path).await;
+        match storage.mkdir(&folder_path).await {
+            Ok(()) | Err(FrError::AlreadyExists(_)) => {}
+            Err(err) => return Err(err),
+        }
         storage
             .write(&output_cloud_path, result.gcode_bytes.clone(), None)
             .await?;
@@ -231,5 +245,36 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
             "filamentGrams": result.filament_grams,
             "filamentMm": result.filament_mm,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slicer_module_descriptor_declares_slicing_capability() {
+        let desc = SlicerModule.descriptor();
+        assert_eq!(desc.id, "slicer");
+        assert!(desc.capabilities.contains(&ModuleCapability::Slicing));
+        assert!(desc.capabilities.contains(&ModuleCapability::Storage));
+    }
+
+    #[tokio::test]
+    async fn mcp_list_presets_returns_mk3s_and_four_builtin_materials() {
+        let dir = std::env::temp_dir().join(format!(
+            "fr-mod-slicer-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(SlicerPresetStore::from_dir(&dir));
+        let tool = SlicerListPresetsTool(store);
+        let val = tool.call(json!({})).await.unwrap();
+        assert_eq!(val["printer"]["bedXMm"], 250.0);
+        assert_eq!(val["materials"].as_array().unwrap().len(), 4);
+        assert_eq!(val["rigidity"].as_array().unwrap().len(), 4);
+        assert_eq!(val["quality"].as_array().unwrap().len(), 3);
     }
 }

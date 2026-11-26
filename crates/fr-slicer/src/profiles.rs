@@ -308,7 +308,7 @@ pub fn compose_prusaslicer_ini(
 
     // 1. Fixed Prusa MK3S printer profile (0.4 mm nozzle, 250x210x210 mm)
     kv.insert("printer_model", "MK3S".into());
-    kv.insert("gcode_flavor", "marlin".into());
+    kv.insert("gcode_flavor", "marlin2".into());
     kv.insert("bed_shape", "0x0,250x0,250x210,0x210".into());
     kv.insert("max_print_height", "210".into());
     kv.insert("nozzle_diameter", format!("{MK3S_NOZZLE_DIAMETER_MM:.1}"));
@@ -386,7 +386,15 @@ pub fn compose_prusaslicer_ini(
     }
 
     // 4. Material preset (temperatures, cooling, volumetric limit)
-    kv.insert("filament_type", material.filament_type.clone());
+    // Sanitize filament_type against INI injection even if called directly without validate().
+    let safe_filament_type = match material.filament_type.trim() {
+        "PLA" => "PLA",
+        "PETG" => "PETG",
+        "ABS" => "ABS",
+        "FLEX" => "FLEX",
+        _ => "PLA",
+    };
+    kv.insert("filament_type", safe_filament_type.to_owned());
     kv.insert("temperature", material.nozzle_temp_c.to_string());
     kv.insert(
         "first_layer_temperature",
@@ -509,10 +517,11 @@ impl SlicerPresetStore {
             preset.filament_type = "PLA".into();
         }
 
-        // Generate a clean non-builtin ID when creating a new preset or duplicating a built-in.
-        let clean_id = slugify_id(&preset.id);
+        // Generate a clean non-builtin ID when creating a new preset or duplicating a built-in,
+        // keeping total length <= 48 chars so subsequent edits preserve the exact ID.
+        let clean_id = slugify_id(&preset.id, 64);
         if clean_id.is_empty() || builtins.iter().any(|b| b.id == clean_id) {
-            let base = slugify_id(&preset.name);
+            let base = slugify_id(&preset.name, 34);
             let suffix = &uuid::Uuid::new_v4().simple().to_string()[..6];
             preset.id = if base.is_empty() {
                 format!("custom-{suffix}")
@@ -578,11 +587,11 @@ impl SlicerPresetStore {
     }
 
     pub fn has_material_draft(&self) -> bool {
-        self.draft_path.exists()
+        self.get_material_draft().ok().flatten().is_some()
     }
 }
 
-fn slugify_id(raw: &str) -> String {
+fn slugify_id(raw: &str, max_len: usize) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in raw.trim().chars() {
@@ -594,7 +603,12 @@ fn slugify_id(raw: &str) -> String {
             prev_dash = true;
         }
     }
-    out.trim_matches('-').chars().take(48).collect()
+    out.trim_matches('-')
+        .chars()
+        .take(max_len)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_owned()
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -714,10 +728,20 @@ mod tests {
         );
 
         // Saving custom material persists it and clears draft
-        let saved = store.save_custom_material(custom).unwrap();
-        assert!(saved.id.starts_with("custom-team-carbon-petg-"));
+        let mut long_custom = custom;
+        long_custom.name = "Prusament PETG Carbon Fiber Matte Black Formula Student Edition".into();
+        let saved = store.save_custom_material(long_custom).unwrap();
+        assert!(saved.id.starts_with("custom-prusament-petg-"));
+        assert!(saved.id.len() <= 48);
         assert!(!saved.built_in);
         assert!(!store.has_material_draft());
+        assert_eq!(store.list_all_materials().unwrap().len(), 5);
+
+        // Editing the same long-named preset updates in place instead of duplicating.
+        let mut edited = saved.clone();
+        edited.nozzle_temp_c = 250;
+        let saved_again = store.save_custom_material(edited).unwrap();
+        assert_eq!(saved_again.id, saved.id);
         assert_eq!(store.list_all_materials().unwrap().len(), 5);
 
         // Builtins cannot be deleted

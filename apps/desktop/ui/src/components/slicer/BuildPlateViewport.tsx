@@ -171,6 +171,15 @@ export function BuildPlateViewport({
       renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
       renderer.domElement.removeEventListener("pointerup", handlePointerUp);
       controls.dispose();
+      while (objectsGroup.children.length > 0) {
+        const child = objectsGroup.children[0];
+        objectsGroup.remove(child);
+        if (child instanceof THREE.Mesh) {
+          const mat = child.material;
+          if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+          else mat.dispose();
+        }
+      }
       bedGeom.dispose();
       bedMat.dispose();
       gridGeom.dispose();

@@ -1864,11 +1864,7 @@ pub async fn check_for_app_update(
     perform_update_check(&app, &state).await
 }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn get_update_safety_status(
-    state: State<'_, AppState>,
-) -> Result<UpdateSafetyStatus, UserFacingError> {
+async fn collect_update_safety_status(state: &AppState) -> UpdateSafetyStatus {
     let running_workflows = state.workflow_runner.active_run_count();
     let cache = state.cache.clone();
     let scope = state.active_account_scope();
@@ -1896,7 +1892,15 @@ pub async fn get_update_safety_status(
             .warnings
             .push("You have an unsaved custom 3D filament preset draft in the 3D Slicer.".into());
     }
-    Ok(safety)
+    safety
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_update_safety_status(
+    state: State<'_, AppState>,
+) -> Result<UpdateSafetyStatus, UserFacingError> {
+    Ok(collect_update_safety_status(&state).await)
 }
 
 #[tauri::command]
@@ -1969,25 +1973,14 @@ pub async fn install_app_update(
     // Pre-restart safety gate MUST run BEFORE download_and_install because on Windows
     // the NSIS installer automatically terminates the running process during install (H7).
     if !force {
-        let running_workflows = state.workflow_runner.active_run_count();
-        let cache = state.cache.clone();
-        let scope = state.active_account_scope();
-        let pending_drafts = tokio::task::spawn_blocking(move || {
-            cache
-                .as_ref()
-                .and_then(|c| c.count_markdown_drafts(Some(&scope)).ok())
-                .unwrap_or(0)
-        })
-        .await
-        .unwrap_or(0);
-        let safety = evaluate_pre_restart_safety(pending_drafts, running_workflows);
+        let safety = collect_update_safety_status(&state).await;
         if !safety.safe_to_restart {
             return Err(UserFacingError {
                 code: "update_unsafe_to_restart".into(),
                 title: "Save your work before installing".into(),
                 message: safety.warnings.join(" "),
                 recovery_hint: Some(
-                    "Save your open drafts or wait for active workflows to finish, or confirm you want to continue anyway."
+                    "Save your open drafts or wait for active workflows/slicing jobs to finish, or confirm you want to continue anyway."
                         .into(),
                 ),
                 technical_details: None,
@@ -2725,6 +2718,19 @@ pub async fn set_prusaslicer_path(
         .filter(|s| !s.is_empty());
 
     if let Some(ref p) = cleaned {
+        if p.chars()
+            .any(|c| matches!(c, '&' | '|' | ';' | '>' | '<' | '%' | '^' | '\n' | '\r'))
+        {
+            return Err(UserFacingError {
+                code: "slicer_invalid_path".into(),
+                title: "Invalid PrusaSlicer path".into(),
+                message: "The executable path contains unsupported special characters.".into(),
+                recovery_hint: Some(
+                    "Provide a clean filesystem path to the PrusaSlicer executable.".into(),
+                ),
+                technical_details: Some(p.clone()),
+            });
+        }
         let pb = PathBuf::from(p);
         if !pb.is_file() {
             return Err(UserFacingError {
@@ -2740,21 +2746,18 @@ pub async fn set_prusaslicer_path(
         }
     }
 
-    let candidate = {
-        let mut guard = state
-            .config
-            .lock()
-            .map_err(|_| lock_error("Mutex poisoned while saving PrusaSlicer path"))?;
-        let mut next = guard.clone();
-        next.prusaslicer_path = cleaned.clone();
-        *guard = next.clone();
-        next
-    };
+    // Persist atomically to disk BEFORE updating in-memory config so RAM and disk never diverge.
+    let mut candidate = state.current_config();
+    candidate.prusaslicer_path = cleaned.clone();
+    let candidate_to_save = candidate.clone();
     let store = state.config_store.clone();
-    tokio::task::spawn_blocking(move || store.save(&candidate))
+    tokio::task::spawn_blocking(move || store.save(&candidate_to_save))
         .await
         .map_err(|err| UserFacingError::from(FrError::Other(err.to_string())))?
         .map_err(UserFacingError::from)?;
+    if let Ok(mut guard) = state.config.lock() {
+        *guard = candidate;
+    }
 
     Ok(detect_prusaslicer_binary(cleaned.as_deref()).await)
 }
@@ -2850,6 +2853,12 @@ pub async fn load_cloud_model_base64(
         UserFacingError::from(FrError::AuthRequired("Nextcloud is not signed in.".into()))
     })?;
     let path = CloudPath::parse(&cloud_path).map_err(UserFacingError::from)?;
+    let stat = storage.stat(&path).await.map_err(UserFacingError::from)?;
+    if stat.size > MAX_MODEL_BYTES as u64 {
+        return Err(UserFacingError::from(FrError::InvalidInput(
+            "This 3D model exceeds the 100 MiB size limit.".into(),
+        )));
+    }
     let (bytes, _etag) = storage.read(&path).await.map_err(UserFacingError::from)?;
     if bytes.len() > MAX_MODEL_BYTES {
         return Err(UserFacingError::from(FrError::InvalidInput(
@@ -2923,6 +2932,18 @@ pub async fn start_slice_job(
         }
     })?;
 
+    if state.slicer_jobs.active_job_count() >= 2 {
+        return Err(UserFacingError {
+            code: "slicer_busy".into(),
+            title: "Slicing is already in progress".into(),
+            message:
+                "Wait for the current slicing job to finish or cancel it before starting another."
+                    .into(),
+            recovery_hint: None,
+            technical_details: None,
+        });
+    }
+
     let output_file_name = sanitize_gcode_filename(
         request
             .output_name
@@ -2930,6 +2951,7 @@ pub async fn start_slice_job(
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&request.model_file_name),
     );
+    let preserve_arrangement = request.bounds.is_some();
     let (record, cancel_rx) = state.slicer_jobs.create_job(
         output_file_name.clone(),
         material.name.clone(),
@@ -2957,6 +2979,7 @@ pub async fn start_slice_job(
                     model_file_name: request.model_file_name,
                     model_bytes: Bytes::from(model_raw),
                     bounds: request.bounds,
+                    preserve_arrangement,
                     quality: request.quality,
                     rigidity: request.rigidity,
                     material,

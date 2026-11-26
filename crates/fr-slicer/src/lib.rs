@@ -21,6 +21,7 @@ pub use profiles::{
     compose_prusaslicer_ini, quality_presets_info, rigidity_presets_info,
 };
 pub use validate::{
-    MAX_MODEL_BYTES, PlateBoundsMm, SliceValidationRequest, sanitize_gcode_filename,
-    validate_material_preset, validate_slice_request,
+    ALLOWED_FILAMENT_TYPES, MAX_MODEL_BYTES, PlateBoundsMm, SliceValidationRequest,
+    estimate_stl_dimensions_mm, sanitize_gcode_filename, validate_material_preset,
+    validate_raw_model_fits_mk3s, validate_slice_request,
 };

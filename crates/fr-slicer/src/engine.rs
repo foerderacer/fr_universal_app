@@ -51,6 +51,8 @@ pub struct SliceEngineRequest {
     pub model_file_name: String,
     pub model_bytes: Bytes,
     pub bounds: Option<PlateBoundsMm>,
+    /// When true, passes `--dont-arrange` so PrusaSlicer preserves absolute MK3S bed placement.
+    pub preserve_arrangement: bool,
     pub quality: QualityPreset,
     pub rigidity: RigidityPreset,
     pub material: MaterialPreset,
@@ -139,9 +141,11 @@ impl PrusaSlicerEngine {
         });
 
         let mut cmd = build_command(&self.binary_path);
-        cmd.current_dir(work_dir.path())
-            .arg("--export-gcode")
-            .arg("--load")
+        cmd.current_dir(work_dir.path()).arg("--export-gcode");
+        if req.preserve_arrangement {
+            cmd.arg("--dont-arrange");
+        }
+        cmd.arg("--load")
             .arg(&ini_path)
             .arg("--output")
             .arg(&output_path)
@@ -190,20 +194,29 @@ impl PrusaSlicerEngine {
 
         let mut log_lines: Vec<String> = Vec::new();
         let mut last_percent = 5u8;
+        let mut cancel_closed = false;
         let deadline = tokio::time::sleep(req.timeout);
         tokio::pin!(deadline);
 
         let status = loop {
             tokio::select! {
                 biased;
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        for h in reader_handles {
-                            h.abort();
+                changed = cancel_rx.changed(), if !cancel_closed => {
+                    match changed {
+                        Ok(()) => {
+                            if *cancel_rx.borrow() {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                for h in reader_handles {
+                                    h.abort();
+                                }
+                                return Err(FrError::Other("slicer_cancelled: Slicing was cancelled.".into()));
+                            }
                         }
-                        return Err(FrError::Other("slicer_cancelled: Slicing was cancelled.".into()));
+                        Err(_) => {
+                            // Sender dropped: stop polling this branch so we never busy-loop.
+                            cancel_closed = true;
+                        }
                     }
                 }
                 () = &mut deadline => {
@@ -232,8 +245,36 @@ impl PrusaSlicerEngine {
                             }
                         }
                         None => {
-                            // Both stdout and stderr closed; wait for process exit.
-                            break child.wait().await.map_err(FrError::Io)?;
+                            // Both stdout and stderr closed; wait for exit under the same cancel/timeout guard.
+                            break loop {
+                                tokio::select! {
+                                    biased;
+                                    changed = cancel_rx.changed(), if !cancel_closed => {
+                                        match changed {
+                                            Ok(()) => {
+                                                if *cancel_rx.borrow() {
+                                                    let _ = child.kill().await;
+                                                    let _ = child.wait().await;
+                                                    return Err(FrError::Other("slicer_cancelled: Slicing was cancelled.".into()));
+                                                }
+                                            }
+                                            Err(_) => {
+                                                cancel_closed = true;
+                                            }
+                                        }
+                                    }
+                                    () = &mut deadline => {
+                                        let _ = child.kill().await;
+                                        let _ = child.wait().await;
+                                        return Err(FrError::Other(
+                                            "slicer_timeout: Slicing took too long and was stopped automatically.".into(),
+                                        ));
+                                    }
+                                    wait_res = child.wait() => {
+                                        break wait_res.map_err(FrError::Io)?;
+                                    }
+                                }
+                            };
                         }
                     }
                 }
@@ -289,19 +330,24 @@ impl PrusaSlicerEngine {
 fn build_command(binary_path: &Path) -> Command {
     #[cfg(windows)]
     {
-        // Support `.cmd`/`.bat` scripts (used in unit tests) as well as `.exe` binaries.
-        let is_batch = binary_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
-            .unwrap_or(false);
-        let mut cmd = if is_batch {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(binary_path);
-            c
-        } else {
-            Command::new(binary_path)
+        // Only allow `.cmd`/`.bat` wrappers in unit tests; production always spawns the binary directly.
+        #[cfg(test)]
+        let mut cmd = {
+            let is_batch = binary_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+                .unwrap_or(false);
+            if is_batch {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(binary_path);
+                c
+            } else {
+                Command::new(binary_path)
+            }
         };
+        #[cfg(not(test))]
+        let mut cmd = Command::new(binary_path);
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
@@ -657,6 +703,7 @@ mod tests {
                 max_z: 25.0,
                 object_count: 1,
             }),
+            preserve_arrangement: true,
             quality: QualityPreset::Standard,
             rigidity: RigidityPreset::Medium,
             material: builtin_materials()[0].clone(),

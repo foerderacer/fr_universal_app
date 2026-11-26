@@ -37,12 +37,22 @@ pub struct SliceValidationRequest {
     pub material: MaterialPreset,
 }
 
+/// Allowed PrusaSlicer `filament_type` values for Prusa MK3S profiles.
+pub const ALLOWED_FILAMENT_TYPES: &[&str] = &["PLA", "PETG", "ABS", "FLEX"];
+
 /// Validates a material preset against Prusa MK3S hardware safety limits.
 pub fn validate_material_preset(material: &MaterialPreset) -> Result<()> {
     if material.name.trim().is_empty() {
         return Err(FrError::InvalidInput(
             "Give this material preset a name before saving.".into(),
         ));
+    }
+    let ft = material.filament_type.trim();
+    if !ALLOWED_FILAMENT_TYPES.contains(&ft) {
+        return Err(FrError::InvalidInput(format!(
+            "Unsupported filament family '{}'. Choose PLA, PETG, ABS, or FLEX (TPU).",
+            ft.chars().take(24).collect::<String>()
+        )));
     }
     if material.nozzle_temp_c < MK3S_MIN_NOZZLE_TEMP_C
         || material.nozzle_temp_c > MK3S_MAX_NOZZLE_TEMP_C
@@ -238,6 +248,114 @@ pub fn sanitize_gcode_filename(raw_name: &str) -> String {
     format!("{safe}.gcode")
 }
 
+/// Estimates axis-aligned `(size_x, size_y, size_z)` dimensions in mm directly from raw
+/// binary or ASCII STL bytes so server-side / MCP slicing can enforce MK3S bed bounds.
+pub fn estimate_stl_dimensions_mm(bytes: &[u8]) -> Option<(f64, f64, f64)> {
+    // Check binary STL first: 80-byte header + u32 triangle count + 50 bytes per triangle.
+    if bytes.len() >= 84 {
+        let tri_count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+        let expected_len = 84usize.checked_add(tri_count.checked_mul(50)?)?;
+        if tri_count > 0 && expected_len == bytes.len() {
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut min_z = f64::INFINITY;
+            let mut max_z = f64::NEG_INFINITY;
+
+            for t in 0..tri_count {
+                let base = 84 + t * 50;
+                // 3 vertices start at offset +12 (after 12-byte normal)
+                for v in 0..3 {
+                    let vo = base + 12 + v * 12;
+                    let x = f32::from_le_bytes([
+                        bytes[vo],
+                        bytes[vo + 1],
+                        bytes[vo + 2],
+                        bytes[vo + 3],
+                    ]) as f64;
+                    let y = f32::from_le_bytes([
+                        bytes[vo + 4],
+                        bytes[vo + 5],
+                        bytes[vo + 6],
+                        bytes[vo + 7],
+                    ]) as f64;
+                    let z = f32::from_le_bytes([
+                        bytes[vo + 8],
+                        bytes[vo + 9],
+                        bytes[vo + 10],
+                        bytes[vo + 11],
+                    ]) as f64;
+                    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                        return None;
+                    }
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                    min_z = min_z.min(z);
+                    max_z = max_z.max(z);
+                }
+            }
+            return Some((max_x - min_x, max_y - min_y, max_z - min_z));
+        }
+    }
+
+    // Fallback: ASCII STL `vertex x y z` parsing
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    let mut found = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("vertex") {
+            let mut parts = rest.split_whitespace();
+            let (Some(xs), Some(ys), Some(zs)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(x), Ok(y), Ok(z)) = (xs.parse::<f64>(), ys.parse::<f64>(), zs.parse::<f64>())
+            else {
+                continue;
+            };
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return None;
+            }
+            found = true;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+        }
+    }
+
+    found.then_some((max_x - min_x, max_y - min_y, max_z - min_z))
+}
+
+/// Validates that raw model dimensions fit within the Prusa MK3S build volume (`250 × 210 × 210 mm`)
+/// when centered on the bed (used by MCP/headless single-model slicing).
+pub fn validate_raw_model_fits_mk3s(file_name: &str, bytes: &[u8]) -> Result<()> {
+    if !file_name.trim().to_ascii_lowercase().ends_with(".stl") {
+        return Ok(());
+    }
+    if let Some((sx, sy, sz)) = estimate_stl_dimensions_mm(bytes)
+        && (sx > MK3S_BED_X_MM + BED_EPSILON_MM
+            || sy > MK3S_BED_Y_MM + BED_EPSILON_MM
+            || sz > MK3S_BED_Z_MM + BED_EPSILON_MM)
+    {
+        return Err(FrError::InvalidInput(format!(
+            "Model dimensions ({sx:.1} × {sy:.1} × {sz:.1} mm) exceed the Prusa MK3S build volume ({MK3S_BED_X_MM:.0} × {MK3S_BED_Y_MM:.0} × {MK3S_BED_Z_MM:.0} mm)."
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,9 +404,27 @@ mod tests {
         assert!(validate_slice_request(&too_hot).is_err());
 
         // Excess bed temp rejected
-        let mut hot_bed = ok_req;
+        let mut hot_bed = ok_req.clone();
         hot_bed.material.bed_temp_c = 135;
         assert!(validate_slice_request(&hot_bed).is_err());
+
+        // INI injection via filament_type rejected
+        let mut injected = ok_req;
+        injected.material.filament_type = "PLA\nend_gcode = M999".into();
+        assert!(validate_slice_request(&injected).is_err());
+    }
+
+    #[test]
+    fn estimates_ascii_stl_dimensions_and_rejects_oversized_models() {
+        let small = b"solid box\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 40 0 0\nvertex 40 30 20\nendloop\nendfacet\nendsolid box\n";
+        let dims = estimate_stl_dimensions_mm(small).unwrap();
+        assert!((dims.0 - 40.0).abs() < 0.01);
+        assert!((dims.1 - 30.0).abs() < 0.01);
+        assert!((dims.2 - 20.0).abs() < 0.01);
+        assert!(validate_raw_model_fits_mk3s("small.stl", small).is_ok());
+
+        let huge = b"solid big\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 400 0 0\nvertex 400 50 50\nendloop\nendfacet\nendsolid big\n";
+        assert!(validate_raw_model_fits_mk3s("huge.stl", huge).is_err());
     }
 
     #[test]

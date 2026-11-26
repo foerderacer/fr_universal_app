@@ -125,7 +125,23 @@ function mergeBufferGeometriesSimple(
   return out;
 }
 
-/** Builds a positioned Three.js transform matrix for a PlateObject sitting flush on y = 0. */
+/** Computes the exact axis-aligned bounding box of transformed mesh vertices (never AABB-of-AABB). */
+function computeTransformedVertexBounds(
+  geometry: THREE.BufferGeometry,
+  matrix: THREE.Matrix4,
+): THREE.Box3 {
+  const pos = geometry.getAttribute("position");
+  const box = new THREE.Box3();
+  if (!pos || pos.count === 0) return box;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(matrix);
+    box.expandByPoint(v);
+  }
+  return box;
+}
+
+/** Builds a positioned Three.js transform matrix for a PlateObject sitting flush on exact y = 0. */
 export function buildObjectTransformMatrix(obj: PlateObject): {
   matrix: THREE.Matrix4;
   worldBox: THREE.Box3;
@@ -145,23 +161,16 @@ export function buildObjectTransformMatrix(obj: PlateObject): {
     q,
     scaleVec,
   );
-  const geomBox =
-    obj.geometry.boundingBox?.clone() ??
-    new THREE.Box3().setFromBufferAttribute(
-      obj.geometry.getAttribute("position") as THREE.BufferAttribute,
-    );
-  const rotatedBox = geomBox.clone().applyMatrix4(preMatrix);
+  const rotatedBox = computeTransformedVertexBounds(obj.geometry, preMatrix);
+  const minY = rotatedBox.isEmpty() ? 0 : rotatedBox.min.y;
 
   const sceneX = obj.positionX - MK3S_BED_X / 2;
-  const sceneY = -rotatedBox.min.y;
+  const sceneY = -minY;
   const sceneZ = MK3S_BED_Y / 2 - obj.positionY;
 
-  const matrix = new THREE.Matrix4().compose(
-    new THREE.Vector3(sceneX, sceneY, sceneZ),
-    q,
-    scaleVec,
-  );
-  const worldBox = geomBox.clone().applyMatrix4(matrix);
+  const translation = new THREE.Vector3(sceneX, sceneY, sceneZ);
+  const matrix = new THREE.Matrix4().compose(translation, q, scaleVec);
+  const worldBox = rotatedBox.clone().translate(translation);
   return { matrix, worldBox };
 }
 
