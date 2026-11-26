@@ -375,5 +375,41 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // Verify clear_account_cache wipes rooms, messages, and drafts for that scope only.
+        store
+            .save_draft("https://cloud.example|alice", "abc123", "Unsent draft")
+            .unwrap();
+        store
+            .save_draft("https://cloud.example|bob", "abc123", "Bob draft")
+            .unwrap();
+        store
+            .clear_account_cache("https://cloud.example|alice")
+            .unwrap();
+        assert!(
+            store
+                .list_rooms("https://cloud.example|alice")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_messages("https://cloud.example|alice", "abc123", 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_draft("https://cloud.example|alice", "abc123")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_draft("https://cloud.example|bob", "abc123")
+                .unwrap()
+                .as_deref(),
+            Some("Bob draft")
+        );
     }
 }

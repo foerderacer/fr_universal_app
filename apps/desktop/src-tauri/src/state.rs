@@ -325,21 +325,25 @@ impl AppState {
     }
 
     pub fn activate_session(&self, creds: NextcloudCredentials) -> fr_core::Result<()> {
-        let switched_account = self
-            .active_credentials
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard.as_ref().map(|prev| {
-                    prev.server_url != creds.server_url || prev.login_name != creds.login_name
-                })
+        let prev_account_scope = self.active_credentials.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|prev| {
+                if prev.server_url != creds.server_url || prev.login_name != creds.login_name {
+                    Some(format!(
+                        "{}|{}",
+                        prev.server_url.trim_end_matches('/'),
+                        prev.login_name
+                    ))
+                } else {
+                    None
+                }
             })
-            .unwrap_or(false);
-        if switched_account {
+        });
+        if let Some(prev_scope) = prev_account_scope {
             self.stop_talk_polling();
             if let Ok(mut guard) = self.talk_capabilities.lock() {
                 *guard = None;
             }
+            let _ = self.talk_cache.clear_account_cache(&prev_scope);
             if let Some(ref cache) = self.cache {
                 let _ = cache.clear_cached_data();
             }

@@ -11,7 +11,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   FileItemView_Serialize,
   FilePreviewPayload_Serialize,
@@ -57,6 +57,8 @@ export function FilePreviewPane({
   const [imageRotation, setImageRotation] = useState(0);
 
   const isMarkdown = item.previewKind === "markdown";
+  const onPreviewErrorRef = useRef(onPreviewError);
+  onPreviewErrorRef.current = onPreviewError;
 
   useEffect(() => {
     setError(null);
@@ -84,7 +86,7 @@ export function FilePreviewPane({
         if (!cancelled) {
           const uf = toUserFacingError(err);
           setError(uf);
-          onPreviewError?.(uf);
+          onPreviewErrorRef.current?.(uf);
         }
       })
       .finally(() => {
@@ -94,7 +96,7 @@ export function FilePreviewPane({
     return () => {
       cancelled = true;
     };
-  }, [item.entry.path, isMarkdown, onDirtyChange, onPreviewError]);
+  }, [item.entry.path, isMarkdown, onDirtyChange]);
 
   async function handleOpenNative(allowExecutable = false) {
     setOpeningNative(true);

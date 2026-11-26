@@ -179,7 +179,10 @@ export function TalkView({
   const pendingDraftsRef = useRef<Map<string, string>>(new Map());
   const userTypedInRoomRef = useRef<Set<string>>(new Set());
   const lastScrolledTokenRef = useRef<string | null>(null);
+  const hasInitialRoomScrollRef = useRef<boolean>(false);
   const lastMessageIdRef = useRef<number>(0);
+  const previewFileRefRef = useRef<TalkFileReference_Serialize | null>(null);
+  previewFileRefRef.current = previewFileRef;
   const selectedTokenRef = useRef<string | null>(null);
   selectedTokenRef.current = selectedToken;
 
@@ -209,6 +212,14 @@ export function TalkView({
     });
   }, []);
 
+  const pauseDraftTimer = useCallback((token: string) => {
+    const timer = draftTimersRef.current.get(token);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      draftTimersRef.current.delete(token);
+    }
+  }, []);
+
   const cancelPendingDraft = useCallback((token: string) => {
     const timer = draftTimersRef.current.get(token);
     if (timer !== undefined) {
@@ -216,6 +227,22 @@ export function TalkView({
       draftTimersRef.current.delete(token);
     }
     pendingDraftsRef.current.delete(token);
+  }, []);
+
+  const handlePreviewError = useCallback((previewErr: UserFacingError) => {
+    const activeRef = previewFileRefRef.current;
+    if (!activeRef) return;
+    if (
+      previewErr.code === "not_found" ||
+      previewErr.code === "permission_denied"
+    ) {
+      setAccessDeniedFile(activeRef);
+      setPreviewItem(null);
+      setPreviewFileRef(null);
+      setPreviewExpanded(false);
+    } else if (previewErr.code === "auth_required") {
+      setError(previewErr);
+    }
   }, []);
 
   // Flush any queued drafts on unmount so edits are never silently lost.
@@ -328,6 +355,7 @@ export function TalkView({
     const token = selectedToken;
     userTypedInRoomRef.current.delete(token);
     setLoadingMessages(true);
+    setLoadingOlder(false);
     setMessages([]);
     setMessagesFromCache(false);
     setPreviewItem(null);
@@ -394,15 +422,18 @@ export function TalkView({
   // Auto-scroll to bottom only on initial room load or when newer messages arrive,
   // never when prepending older history via "Load older messages".
   useEffect(() => {
-    const newestId =
-      messages.length > 0 ? (messages[messages.length - 1]?.id ?? 0) : 0;
-    const switchedRoom = lastScrolledTokenRef.current !== selectedToken;
-    if (switchedRoom) {
+    if (lastScrolledTokenRef.current !== selectedToken) {
       lastScrolledTokenRef.current = selectedToken;
+      lastMessageIdRef.current = 0;
+      hasInitialRoomScrollRef.current = false;
+      return;
+    }
+    if (messages.length === 0) return;
+    const newestId = messages[messages.length - 1]?.id ?? 0;
+    if (!hasInitialRoomScrollRef.current) {
+      hasInitialRoomScrollRef.current = true;
       lastMessageIdRef.current = newestId;
-      if (messages.length > 0) {
-        messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
-      }
+      messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
       return;
     }
     if (newestId > lastMessageIdRef.current) {
@@ -454,9 +485,7 @@ export function TalkView({
         setError(toUserFacingError(err));
       }
     } finally {
-      if (selectedTokenRef.current === token) {
-        setLoadingOlder(false);
-      }
+      setLoadingOlder(false);
     }
   }
 
@@ -470,7 +499,10 @@ export function TalkView({
     const currentEditing = editingMsg;
     const currentReplyTo = replyTo;
     if (!currentEditing) {
-      cancelPendingDraft(token);
+      // Pause timer while sending so it cannot race with server-side draft clearing,
+      // while keeping pendingDraftsRef populated in case sending fails and the user switches rooms.
+      pauseDraftTimer(token);
+      pendingDraftsRef.current.set(token, trimmed);
     }
     try {
       if (currentEditing && currentEditing.id !== null) {
@@ -486,6 +518,8 @@ export function TalkView({
           replyTo: currentReplyTo?.id ?? null,
           referenceId: null,
         });
+        cancelPendingDraft(token);
+        void saveTalkDraft(token, "").catch(() => {});
         if (selectedTokenRef.current !== token) return;
         setMessages((prev) => mergeMessages(prev, [sent]));
         setReplyTo(null);
@@ -644,7 +678,7 @@ export function TalkView({
       setError({
         code: "invalid_input",
         title: "File is too large for Talk chat",
-        message: `"${file.name}" is ${formatBytes(file.size)}, which exceeds the 50 MB chat attachment limit.`,
+        message: `"${file.name}" is ${formatBytes(file.size)}, which exceeds the 50 MiB chat attachment limit.`,
         recoveryHint:
           "Upload larger files in Nextcloud Files first, then use 'Reference from Nextcloud Files' to link them with zero copies.",
         technicalDetails: null,
@@ -1331,19 +1365,7 @@ export function TalkView({
                 setPreviewExpanded(false);
               }}
               onRefreshFolder={() => {}}
-              onPreviewError={(previewErr) => {
-                if (
-                  previewFileRef &&
-                  (previewErr.code === "auth_required" ||
-                    previewErr.code === "not_found" ||
-                    previewErr.code === "permission_denied")
-                ) {
-                  setAccessDeniedFile(previewFileRef);
-                  setPreviewItem(null);
-                  setPreviewFileRef(null);
-                  setPreviewExpanded(false);
-                }
-              }}
+              onPreviewError={handlePreviewError}
             />
           </div>
         )}

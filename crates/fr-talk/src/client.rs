@@ -71,7 +71,7 @@ pub(crate) fn sanitize_path_segment(raw: &str) -> String {
             }
         })
         .collect();
-    let trimmed = cleaned.trim().trim_matches('.');
+    let trimmed = cleaned.trim_matches(|c: char| c.is_whitespace() || c == '.');
     if trimmed.is_empty() {
         return "attachment".to_owned();
     }
