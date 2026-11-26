@@ -275,7 +275,7 @@ impl FinanceLedger {
                 "Currency must be a 3-letter ISO code (e.g. EUR, USD).".into(),
             ));
         }
-        if req.amount_cents.abs() > MAX_ABS_AMOUNT_CENTS {
+        if req.amount_cents.unsigned_abs() > MAX_ABS_AMOUNT_CENTS as u64 {
             return Err(FrError::InvalidInput(
                 "Amount is outside the supported range.".into(),
             ));

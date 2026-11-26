@@ -264,6 +264,8 @@ export function AutomationsView({
     setBusyId(wf.id);
     try {
       const cloudPath = await pushWorkflowToNextcloud(wf.id);
+      const refreshed = await listWorkflows();
+      setWorkflows(refreshed);
       flashNotice(`Shared "${wf.name}" to Nextcloud at ${cloudPath}.`);
     } catch (err) {
       setError(toUserFacingError(err));

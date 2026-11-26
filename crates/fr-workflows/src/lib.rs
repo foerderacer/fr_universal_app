@@ -172,12 +172,12 @@ pub fn validate_workflow(wf: &WorkflowDefinition) -> Result<()> {
                 .into(),
         ));
     }
-    if wf.name.trim().is_empty() || wf.name.trim().len() > 160 {
+    if wf.name.trim().is_empty() || wf.name.trim().chars().count() > 160 {
         return Err(FrError::InvalidInput(
             "Workflow name is required and must be 160 characters or fewer.".into(),
         ));
     }
-    if wf.description.trim().len() > 1000 {
+    if wf.description.trim().chars().count() > 1000 {
         return Err(FrError::InvalidInput(
             "Workflow description must be 1,000 characters or fewer.".into(),
         ));
@@ -329,12 +329,27 @@ impl WorkflowStore {
         wf.name = wf.name.trim().to_owned();
         wf.description = wf.description.trim().to_owned();
         validate_workflow(&wf)?;
-        let json = serde_json::to_string(&wf)?;
         let now = Utc::now().timestamp_millis();
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Preserve previously recorded remote_etag when callers (such as UI edits/toggles)
+        // omit or send a stale `None` so subsequent pushes do not trigger false 412 conflicts.
+        if wf.remote_etag.is_none()
+            && let Some(prev_raw) = conn
+                .query_row(
+                    "SELECT definition_json FROM workflows WHERE id = ?1",
+                    params![wf.id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sqlite_err)?
+            && let Ok(prev) = serde_json::from_str::<WorkflowDefinition>(&prev_raw)
+        {
+            wf.remote_etag = prev.remote_etag;
+        }
+        let json = serde_json::to_string(&wf)?;
         conn.execute(
             "INSERT INTO workflows (id, definition_json, updated_at_ms)
              VALUES (?1, ?2, ?3)
@@ -847,19 +862,23 @@ impl WorkflowRunner {
         let expected_etag = match wf.remote_etag.as_deref() {
             Some(raw) if !raw.is_empty() => Some(Etag::new(raw)),
             _ => {
-                // If we have never synced/pushed this ID before, refuse to silently overwrite an
-                // existing remote file authored by a teammate.
-                if let Ok(remote) = storage.stat(&target).await {
-                    return Err(FrError::Conflict {
-                        path: target.as_str().to_owned(),
-                        expected: "none".into(),
-                        actual: remote
-                            .etag
-                            .map(|e| e.as_str().to_owned())
-                            .unwrap_or_else(|| "existing".into()),
-                    });
+                // If we have never synced/pushed this ID before, ONLY proceed when the remote
+                // file is definitively absent (`NotFound`). Propagate transient/auth errors so
+                // we never fail open into an unconditional overwrite.
+                match storage.stat(&target).await {
+                    Ok(remote) => {
+                        return Err(FrError::Conflict {
+                            path: target.as_str().to_owned(),
+                            expected: "none".into(),
+                            actual: remote
+                                .etag
+                                .map(|e| e.as_str().to_owned())
+                                .unwrap_or_else(|| "existing".into()),
+                        });
+                    }
+                    Err(FrError::NotFound(_)) => None,
+                    Err(other) => return Err(other),
                 }
-                None
             }
         };
 
@@ -875,7 +894,9 @@ impl WorkflowRunner {
 
         wf.remote_etag = Some(new_etag.as_str().to_owned());
         let store = self.store.clone();
-        let _ = tokio::task::spawn_blocking(move || store.upsert_workflow(wf)).await;
+        tokio::task::spawn_blocking(move || store.upsert_workflow(wf))
+            .await
+            .map_err(|err| FrError::Other(err.to_string()))??;
 
         Ok(target)
     }
@@ -1352,5 +1373,67 @@ mod tests {
             after_restart.is_empty(),
             "24h schedule must not re-fire immediately after app restart"
         );
+    }
+
+    #[tokio::test]
+    async fn push_edit_push_preserves_remote_etag_and_detects_remote_conflict() {
+        let data_dir = tempdir().unwrap();
+        let db_dir = tempdir().unwrap();
+        let storage = LocalFsBackend::new(data_dir.path());
+        let store = WorkflowStore::open(db_dir.path().join("workflows.sqlite")).unwrap();
+        let runner = WorkflowRunner::new(
+            store.clone(),
+            test_mcp_client(db_dir.path()),
+            EventBus::default(),
+        );
+
+        let wf = WorkflowDefinition {
+            id: "shared-flow".into(),
+            name: "Shared Flow".into(),
+            description: "v1".into(),
+            enabled: false,
+            trigger: WorkflowTrigger::Manual,
+            steps: vec![WorkflowStep::CreateFolder {
+                path: "/Out".into(),
+            }],
+            from_team_sync: false,
+            remote_etag: None,
+        };
+        store.upsert_workflow(wf.clone()).unwrap();
+
+        // First push creates /_FR_App/workflows/shared-flow.json and persists remote_etag.
+        let pushed_path = runner
+            .push_to_nextcloud("shared-flow", &storage)
+            .await
+            .unwrap();
+        assert_eq!(pushed_path.as_str(), "/_FR_App/workflows/shared-flow.json");
+
+        // Simulate UI edit sending stale `remote_etag: None`; store must preserve stored ETag.
+        let mut edited = wf.clone();
+        edited.description = "v2".into();
+        edited.remote_etag = None;
+        let saved = store.upsert_workflow(edited).unwrap();
+        assert!(saved.remote_etag.is_some());
+
+        // Second push succeeds cleanly using the preserved ETag.
+        runner
+            .push_to_nextcloud("shared-flow", &storage)
+            .await
+            .unwrap();
+
+        // Now a teammate modifies the remote file directly -> next push MUST return Conflict.
+        storage
+            .write(
+                &pushed_path,
+                Bytes::from_static(b"{\"changed\":true}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let conflict = runner
+            .push_to_nextcloud("shared-flow", &storage)
+            .await
+            .unwrap_err();
+        assert!(matches!(conflict, FrError::Conflict { .. }));
     }
 }
