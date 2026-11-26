@@ -255,7 +255,8 @@ pub fn estimate_stl_dimensions_mm(bytes: &[u8]) -> Option<(f64, f64, f64)> {
     if bytes.len() >= 84 {
         let tri_count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
         let expected_len = 84usize.checked_add(tri_count.checked_mul(50)?)?;
-        if tri_count > 0 && expected_len == bytes.len() {
+        let looks_ascii = bytes.starts_with(b"solid") && expected_len != bytes.len();
+        if tri_count > 0 && !looks_ascii && bytes.len() >= expected_len {
             let mut min_x = f64::INFINITY;
             let mut max_x = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;

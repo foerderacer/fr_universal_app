@@ -775,4 +775,138 @@ mod tests {
             "cancellation took too long"
         );
     }
+
+    /// Runs against the real locally installed PrusaSlicer binary when available,
+    /// verifying our composed MK3S INI produces valid non-empty G-code with metadata.
+    #[tokio::test]
+    async fn real_prusaslicer_slices_composed_mk3s_ini_when_installed() {
+        let bin = detect_prusaslicer_binary(None).await;
+        let Some(path) = bin.path.filter(|_| bin.available) else {
+            return;
+        };
+
+        // Closed 20x20x20 mm cube positioned at (100..120, 90..110, 0..20) in MK3S bed space.
+        let cube_stl = "\
+solid cube
+facet normal 0 0 -1
+  outer loop
+    vertex 100 90 0
+    vertex 120 110 0
+    vertex 120 90 0
+  endloop
+endfacet
+facet normal 0 0 -1
+  outer loop
+    vertex 100 90 0
+    vertex 100 110 0
+    vertex 120 110 0
+  endloop
+endfacet
+facet normal 0 0 1
+  outer loop
+    vertex 100 90 20
+    vertex 120 90 20
+    vertex 120 110 20
+  endloop
+endfacet
+facet normal 0 0 1
+  outer loop
+    vertex 100 90 20
+    vertex 120 110 20
+    vertex 100 110 20
+  endloop
+endfacet
+facet normal 0 -1 0
+  outer loop
+    vertex 100 90 0
+    vertex 120 90 0
+    vertex 120 90 20
+  endloop
+endfacet
+facet normal 0 -1 0
+  outer loop
+    vertex 100 90 0
+    vertex 120 90 20
+    vertex 100 90 20
+  endloop
+endfacet
+facet normal 0 1 0
+  outer loop
+    vertex 100 110 0
+    vertex 120 110 20
+    vertex 120 110 0
+  endloop
+endfacet
+facet normal 0 1 0
+  outer loop
+    vertex 100 110 0
+    vertex 100 110 20
+    vertex 120 110 20
+  endloop
+endfacet
+facet normal -1 0 0
+  outer loop
+    vertex 100 90 0
+    vertex 100 90 20
+    vertex 100 110 20
+  endloop
+endfacet
+facet normal -1 0 0
+  outer loop
+    vertex 100 90 0
+    vertex 100 110 20
+    vertex 100 110 0
+  endloop
+endfacet
+facet normal 1 0 0
+  outer loop
+    vertex 120 90 0
+    vertex 120 110 20
+    vertex 120 90 20
+  endloop
+endfacet
+facet normal 1 0 0
+  outer loop
+    vertex 120 90 0
+    vertex 120 110 0
+    vertex 120 110 20
+  endloop
+endfacet
+endsolid cube
+";
+        let engine = PrusaSlicerEngine::new(path);
+        for rigidity in [RigidityPreset::Medium, RigidityPreset::Mold] {
+            let (_tx, rx) = watch::channel(false);
+            let res = engine
+                .run_slice(
+                    SliceEngineRequest {
+                        job_id: format!("real-{rigidity:?}"),
+                        model_file_name: "cube.stl".into(),
+                        model_bytes: Bytes::from_static(cube_stl.as_bytes()),
+                        bounds: Some(PlateBoundsMm {
+                            min_x: 100.0,
+                            max_x: 120.0,
+                            min_y: 90.0,
+                            max_y: 110.0,
+                            min_z: 0.0,
+                            max_z: 20.0,
+                            object_count: 1,
+                        }),
+                        preserve_arrangement: true,
+                        quality: QualityPreset::Standard,
+                        rigidity,
+                        material: builtin_materials()[0].clone(),
+                        overrides: SliceOverrides::default(),
+                        timeout: Duration::from_secs(60),
+                    },
+                    rx,
+                    |_| {},
+                )
+                .await
+                .expect("real PrusaSlicer must produce G-code for composed MK3S INI");
+            assert!(!res.gcode_bytes.is_empty());
+            assert!(res.estimated_time.is_some());
+            assert!(res.filament_grams.unwrap_or(0.0) > 0.0);
+        }
+    }
 }

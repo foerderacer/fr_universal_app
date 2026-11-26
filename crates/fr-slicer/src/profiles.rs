@@ -336,6 +336,8 @@ pub fn compose_prusaslicer_ini(
     kv.insert("top_infill_extrusion_width", "0.4".into());
     kv.insert("start_gcode", MK3S_START_GCODE.into());
     kv.insert("end_gcode", MK3S_END_GCODE.into());
+    // Required by PrusaSlicer whenever `use_relative_e_distances = 1` (official MK3S profile).
+    kv.insert("layer_gcode", "G92 E0".into());
 
     // 2. Quality preset (layer height)
     kv.insert("layer_height", format!("{:.2}", quality.layer_height_mm()));
@@ -395,6 +397,13 @@ pub fn compose_prusaslicer_ini(
         _ => "PLA",
     };
     kv.insert("filament_type", safe_filament_type.to_owned());
+    let filament_density = match safe_filament_type {
+        "PETG" => "1.27",
+        "ABS" => "1.04",
+        "FLEX" => "1.21",
+        _ => "1.24",
+    };
+    kv.insert("filament_density", filament_density.to_owned());
     kv.insert("temperature", material.nozzle_temp_c.to_string());
     kv.insert(
         "first_layer_temperature",
@@ -655,6 +664,8 @@ mod tests {
         assert!(ini_medium.contains("bed_temperature = 60\n"));
         assert!(ini_medium.contains("support_material = 0\n"));
         assert!(ini_medium.contains("start_gcode = M862.3 P \"MK3S\""));
+        assert!(ini_medium.contains("layer_gcode = G92 E0\n"));
+        assert!(ini_medium.contains("gcode_flavor = marlin2\n"));
 
         // Mold preset + Fine quality + ABS + supports + brim
         let abs = builtin_materials()

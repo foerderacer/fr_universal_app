@@ -197,6 +197,11 @@ impl McpToolHandler for SlicerSliceCloudModelTool {
             ));
         }
         let (model_bytes, _etag) = storage.read(&model_cloud_path).await?;
+        if model_bytes.len() > MAX_MODEL_BYTES {
+            return Err(FrError::InvalidInput(
+                "The selected 3D model exceeds the 100 MiB slicing limit.".into(),
+            ));
+        }
         let model_file_name = model_cloud_path
             .file_name()
             .unwrap_or("model.stl")
