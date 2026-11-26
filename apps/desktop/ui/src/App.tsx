@@ -33,6 +33,7 @@ import { FinanceView } from "./views/FinanceView";
 import { McpView } from "./views/McpView";
 import { ModuleComingSoonView } from "./views/ModuleComingSoonView";
 import { SettingsView } from "./views/SettingsView";
+import { SlicerView } from "./views/SlicerView";
 import { TalkView } from "./views/TalkView";
 
 function applyThemePreference(theme: string) {
@@ -432,6 +433,12 @@ export function App() {
                 (overview.connectionStatus.state === "connected"
                   ? overview.connectionStatus.loginName
                   : null)
+              }
+            />
+          ) : activeModule?.id === "slicer" ? (
+            <SlicerView
+              isNextcloudConnected={
+                overview.connectionStatus.state === "connected"
               }
             />
           ) : activeModule?.id === "mcp" ? (

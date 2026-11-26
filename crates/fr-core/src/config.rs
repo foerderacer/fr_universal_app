@@ -52,6 +52,9 @@ pub struct AppConfig {
     /// RFC 3339 timestamp of the last completed update check.
     #[serde(default)]
     pub last_update_check_at: Option<String>,
+    /// Optional user-configured path to the local PrusaSlicer CLI executable.
+    #[serde(default)]
+    pub prusaslicer_path: Option<String>,
     /// Preferred UI color theme (`"system"`, `"light"`, or `"dark"`).
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -90,6 +93,7 @@ impl Default for AppConfig {
             finance_folder: default_finance_folder(),
             skipped_update_version: None,
             last_update_check_at: None,
+            prusaslicer_path: None,
             theme: default_theme(),
         }
     }
@@ -190,6 +194,7 @@ mod tests {
             finance_folder: "/Finance".into(),
             skipped_update_version: Some("0.2.0".into()),
             last_update_check_at: Some("2026-11-26T10:00:00Z".into()),
+            prusaslicer_path: None,
             theme: "dark".into(),
         };
 

@@ -3,6 +3,7 @@ import {
   Cpu,
   Folder,
   MessageSquare,
+  Printer,
   Settings,
   Wallet,
   Workflow,
@@ -25,6 +26,8 @@ function ModuleIcon({ icon }: { icon: string }) {
       return <Folder className="h-4 w-4 shrink-0" />;
     case "message":
       return <MessageSquare className="h-4 w-4 shrink-0" />;
+    case "printer":
+      return <Printer className="h-4 w-4 shrink-0" />;
     case "cpu":
       return <Cpu className="h-4 w-4 shrink-0" />;
     case "wallet":
