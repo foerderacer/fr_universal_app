@@ -27,6 +27,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches Cargo workspace version
+        shell: bash
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(grep -m1 '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          echo "Tag version: $TAG_VER | Cargo.toml version: $CARGO_VER"
+          if [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "::error::Git tag $GITHUB_REF_NAME does not match Cargo.toml workspace version $CARGO_VER."
+            exit 1
+          fi
+
       - name: Verify updater signing configuration
         shell: bash
         env:
@@ -37,6 +48,22 @@ jobs:
             echo "::error::TAURI_SIGNING_PRIVATE_KEY (secret) and FR_UPDATER_PUBKEY (repo variable) must either BOTH be configured or BOTH be empty."
             exit 1
           fi
+
+      - name: Prepare updater config overlay (when signing is configured)
+        if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        shell: bash
+        env:
+          FR_UPDATER_PUBKEY: ${{ vars.FR_UPDATER_PUBKEY }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = "apps/desktop/src-tauri/tauri.updater.conf.json";
+            const cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+            cfg.plugins = cfg.plugins || {};
+            cfg.plugins.updater = cfg.plugins.updater || {};
+            cfg.plugins.updater.pubkey = process.env.FR_UPDATER_PUBKEY.trim();
+            fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+          '
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,8 +84,8 @@ jobs:
       - name: Verify Rust tests before packaging
         run: cargo test --workspace
 
-      # Publishes a draft GitHub Release; publish the draft once Windows & macOS
-      # artifacts have both uploaded so releases/latest/download/latest.json goes live.
+      # Publishes a draft GitHub Release (D2: human publishes the draft after QA
+      # so releases/latest/download/latest.json only goes live once verified).
       - name: Build & release Tauri installers
         uses: tauri-apps/tauri-action@v0
         env:
@@ -67,7 +94,7 @@ jobs:
           FR_UPDATER_PUBKEY: ${{ vars.FR_UPDATER_PUBKEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Optional Apple Developer ID signing & notarization secrets (macOS)
+          # Optional Apple Developer ID signing & notarization secrets (macOS — best-effort unsigned when unset)
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -78,8 +105,118 @@ jobs:
           projectPath: apps/desktop/src-tauri
           tagName: v__VERSION__
           releaseName: "FR Universal App v__VERSION__"
-          releaseBody: "Cross-platform Windows (.msi / .exe) and macOS universal (.dmg) release."
+          releaseBody: "Cross-platform Windows (NSIS per-user setup) and macOS universal (.dmg) release."
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
           args: ${{ matrix.args }} ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config tauri.updater.conf.json' || '' }}
+
+  finalize-release:
+    name: Verify & Merge Updater Manifest
+    needs: publish-release
+    if: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify latest.json and merge platform signatures
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          node -e '
+            const { execFileSync } = require("child_process");
+            const fs = require("fs");
+            const tag = process.env.TAG_NAME;
+            const repo = process.env.REPO;
+            const version = tag.replace(/^v/, "");
+
+            // Draft releases are not returned by /releases/tags/{tag}; list recent releases instead.
+            const releasesJson = execFileSync(
+              "gh",
+              ["api", `/repos/${repo}/releases?per_page=20`],
+              { encoding: "utf8" }
+            );
+            const releases = JSON.parse(releasesJson);
+            const release = releases.find((r) => r.tag_name === tag);
+            if (!release) {
+              throw new Error(`Could not find draft or published release for tag ${tag}.`);
+            }
+            const assets = release.assets || [];
+
+            const byName = new Map(assets.map((a) => [a.name, a]));
+            const sigAssets = assets.filter((a) => a.name.endsWith(".sig"));
+            if (sigAssets.length === 0) {
+              throw new Error("No .sig updater signature assets were uploaded to the draft release.");
+            }
+
+            const readAssetText = (asset) =>
+              execFileSync(
+                "gh",
+                ["api", "-H", "Accept: application/octet-stream", `/repos/${repo}/releases/assets/${asset.id}`],
+                { encoding: "utf8" }
+              ).trim();
+
+            const platforms = {};
+            for (const sigAsset of sigAssets) {
+              const bundleName = sigAsset.name.slice(0, -4);
+              const bundleAsset = byName.get(bundleName);
+              if (!bundleAsset) {
+                throw new Error(`Signature ${sigAsset.name} has no matching bundle asset ${bundleName}`);
+              }
+              const signature = readAssetText(sigAsset);
+              const entry = {
+                signature,
+                url: bundleAsset.browser_download_url,
+              };
+              const lower = bundleName.toLowerCase();
+              if (lower.endsWith("-setup.exe")) {
+                platforms["windows-x86_64"] = entry;
+              } else if (lower.endsWith(".app.tar.gz")) {
+                platforms["darwin-aarch64"] = entry;
+                platforms["darwin-x86_64"] = entry;
+              }
+            }
+
+            if (!platforms["windows-x86_64"]) {
+              throw new Error("Merged latest.json is missing windows-x86_64 (-setup.exe) entry.");
+            }
+            if (!platforms["darwin-aarch64"] || !platforms["darwin-x86_64"]) {
+              throw new Error("Merged latest.json is missing macOS (.app.tar.gz) entries.");
+            }
+
+            const manifest = {
+              version,
+              notes: release.body || "",
+              pub_date: new Date().toISOString(),
+              platforms,
+            };
+            fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
+            console.log("Verified merged latest.json:", JSON.stringify({ version, platforms: Object.keys(platforms) }));
+
+            const existingManifest = byName.get("latest.json");
+            if (existingManifest) {
+              execFileSync(
+                "gh",
+                ["api", "-X", "DELETE", `/repos/${repo}/releases/assets/${existingManifest.id}`],
+                { stdio: "inherit" }
+              );
+            }
+            execFileSync(
+              "curl",
+              [
+                "-fsSL",
+                "-X",
+                "POST",
+                "-H",
+                `Authorization: Bearer ${process.env.GH_TOKEN}`,
+                "-H",
+                "Content-Type: application/json",
+                "--data-binary",
+                "@latest.json",
+                `https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=latest.json`,
+              ],
+              { stdio: "inherit" }
+            );
+          '

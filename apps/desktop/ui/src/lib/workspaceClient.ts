@@ -5,6 +5,7 @@ import {
   type AppUpdateCheckResult_Serialize,
   type LoginPollStatusResponse_Serialize,
   type LoginStartResponse,
+  type UpdateSafetyStatus,
   type UpdateSettingsRequest,
   type UserAccountInfo_Serialize,
   type UserFacingError,
@@ -12,6 +13,8 @@ import {
 } from "../bindings/tauri";
 
 const BROWSER_STORAGE_KEY = "fr_universal_app_preview_config";
+export const GITHUB_RELEASES_URL =
+  "https://github.com/foerderacer/fr_universal_app/releases";
 
 function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
   const fallbackConfig = {
@@ -23,6 +26,8 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     mcpServerPort: 38420,
     mcpRequireWriteApproval: true,
     financeFolder: "/Finance",
+    skippedUpdateVersion: null as string | null,
+    lastUpdateCheckAt: null as string | null,
     theme: "system",
   };
 
@@ -200,17 +205,48 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult_Serializ
     return {
       configured: false,
       available: false,
+      skipped: false,
       currentVersion: "0.1.0",
       latestVersion: null,
       notes: null,
+      releaseUrl: GITHUB_RELEASES_URL,
+      lastCheckedAt: null,
       message:
-        "Automatic update checks are available inside the desktop application.",
+        "Development build — signed automatic updates are only active in official GitHub Releases.",
     };
   }
   return commands.checkForAppUpdate();
 }
 
-export async function installAppUpdate(): Promise<void> {
+export async function getUpdateSafetyStatus(): Promise<UpdateSafetyStatus> {
+  if (!isTauri()) {
+    return {
+      safeToRestart: true,
+      pendingDraftsCount: 0,
+      runningWorkflowsCount: 0,
+      warnings: [],
+    };
+  }
+  return commands.getUpdateSafetyStatus();
+}
+
+export async function skipAppUpdate(
+  version: string,
+): Promise<WorkspaceOverview_Serialize> {
+  if (!isTauri()) {
+    return createBrowserPreviewOverview();
+  }
+  return commands.skipAppUpdate(version);
+}
+
+export async function clearSkippedAppUpdate(): Promise<WorkspaceOverview_Serialize> {
+  if (!isTauri()) {
+    return createBrowserPreviewOverview();
+  }
+  return commands.clearSkippedAppUpdate();
+}
+
+export async function installAppUpdate(force = false): Promise<void> {
   if (!isTauri()) {
     throw {
       code: "browser_preview",
@@ -220,7 +256,7 @@ export async function installAppUpdate(): Promise<void> {
       technicalDetails: null,
     } satisfies UserFacingError;
   }
-  await commands.installAppUpdate();
+  await commands.installAppUpdate(force);
 }
 
 export async function openExternalUrl(url: string): Promise<void> {

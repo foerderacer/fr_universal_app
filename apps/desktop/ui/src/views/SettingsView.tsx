@@ -1,6 +1,7 @@
 import {
   Check,
   Download,
+  ExternalLink,
   Loader2,
   LogOut,
   RefreshCw,
@@ -17,9 +18,11 @@ import type {
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
 import {
+  GITHUB_RELEASES_URL,
   checkForAppUpdate,
+  clearSkippedAppUpdate,
   formatBytes,
-  installAppUpdate,
+  openExternalUrl,
   toUserFacingError,
 } from "../lib/workspaceClient";
 
@@ -28,6 +31,8 @@ interface SettingsViewProps {
   onSave: (input: UpdateSettingsRequest) => Promise<void>;
   onResetUrl: () => Promise<string>;
   onSignOut: () => Promise<void>;
+  onOverviewUpdated: (overview: WorkspaceOverview_Serialize) => void;
+  onOpenUpdateDialog: (update: AppUpdateCheckResult_Serialize) => void;
   error: UserFacingError | null;
   onClearError: () => void;
 }
@@ -37,6 +42,8 @@ export function SettingsView({
   onSave,
   onResetUrl,
   onSignOut,
+  onOverviewUpdated,
+  onOpenUpdateDialog,
   error,
   onClearError,
 }: SettingsViewProps) {
@@ -53,7 +60,6 @@ export function SettingsView({
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateResult, setUpdateResult] =
     useState<AppUpdateCheckResult_Serialize | null>(null);
   const [updateError, setUpdateError] = useState<UserFacingError | null>(null);
@@ -125,6 +131,15 @@ export function SettingsView({
     try {
       const res = await checkForAppUpdate();
       setUpdateResult(res);
+      if (res.lastCheckedAt) {
+        onOverviewUpdated({
+          ...overview,
+          config: {
+            ...overview.config,
+            lastUpdateCheckAt: res.lastCheckedAt,
+          },
+        });
+      }
     } catch (err) {
       setUpdateError(toUserFacingError(err));
     } finally {
@@ -132,15 +147,14 @@ export function SettingsView({
     }
   }
 
-  async function handleInstallUpdate() {
-    setInstallingUpdate(true);
+  async function handleResetSkippedVersion() {
     setUpdateError(null);
     try {
-      await installAppUpdate();
+      const updated = await clearSkippedAppUpdate();
+      onOverviewUpdated(updated);
+      setUpdateResult(null);
     } catch (err) {
       setUpdateError(toUserFacingError(err));
-    } finally {
-      setInstallingUpdate(false);
     }
   }
 
@@ -314,36 +328,76 @@ export function SettingsView({
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              App Updates
+              About &amp; App Updates
             </h2>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
               Current version: <code>v{overview.appVersion}</code> (
-              {overview.platform}). Official GitHub Releases deliver signed
-              one-click updates automatically.
+              {overview.platform}). Official releases check GitHub Releases
+              automatically every 6 hours and verify signatures before
+              installing.
             </p>
+            {overview.config.lastUpdateCheckAt && (
+              <p className="mt-1 text-[11px] text-slate-400">
+                Last checked:{" "}
+                {new Date(overview.config.lastUpdateCheckAt).toLocaleString()}
+              </p>
+            )}
+            {overview.config.skippedUpdateVersion && (
+              <div className="mt-1.5 flex items-center gap-2 text-[11px] text-amber-700 dark:text-amber-400">
+                <span>
+                  Skipped version:{" "}
+                  <code>v{overview.config.skippedUpdateVersion}</code>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleResetSkippedVersion()}
+                  className="font-semibold underline hover:no-underline"
+                >
+                  Reset
+                </button>
+              </div>
+            )}
           </div>
 
-          <button
-            type="button"
-            disabled={checkingUpdate || installingUpdate}
-            onClick={() => void handleCheckForUpdate()}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-          >
-            {checkingUpdate ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            {checkingUpdate ? "Checking..." : "Check for Updates"}
-          </button>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void openExternalUrl(GITHUB_RELEASES_URL)}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Releases
+            </button>
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={() => void handleCheckForUpdate()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              {checkingUpdate ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5" />
+              )}
+              {checkingUpdate ? "Checking..." : "Check for Updates"}
+            </button>
+          </div>
         </div>
 
         {updateError && (
-          <div className="mt-3">
+          <div className="mt-3 space-y-2">
             <ErrorBanner
               error={updateError}
               onDismiss={() => setUpdateError(null)}
             />
+            <button
+              type="button"
+              onClick={() => void openExternalUrl(GITHUB_RELEASES_URL)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Download the latest installer from GitHub Releases
+            </button>
           </div>
         )}
 
@@ -360,18 +414,11 @@ export function SettingsView({
             {updateResult.available && (
               <button
                 type="button"
-                disabled={installingUpdate}
-                onClick={() => void handleInstallUpdate()}
-                className="mt-3 inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+                onClick={() => onOpenUpdateDialog(updateResult)}
+                className="mt-3 inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
               >
-                {installingUpdate ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Download className="h-3.5 w-3.5" />
-                )}
-                {installingUpdate
-                  ? "Downloading & Installing..."
-                  : `Install v${updateResult.latestVersion}`}
+                <Download className="h-3.5 w-3.5" />
+                Review &amp; Install v{updateResult.latestVersion}
               </button>
             )}
           </div>

@@ -491,6 +491,34 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Counts unsaved local Markdown drafts (optionally filtered to one account scope).
+    pub fn count_markdown_drafts(&self, server_scope: Option<&str>) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count: i64 = match server_scope {
+            Some(scope) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM markdown_drafts WHERE server_scope = ?1",
+                    params![scope],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_err)?,
+            None => conn
+                .query_row("SELECT COUNT(*) FROM markdown_drafts", [], |r| r.get(0))
+                .map_err(sqlite_err)?,
+        };
+        Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    /// Best-effort SQLite WAL checkpoint before an abrupt OS installer restart (e.g. Windows NSIS).
+    pub fn flush_wal(&self) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        }
+    }
+
     fn wipe_blobs_dir(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.blobs_dir) {
             for entry in entries.flatten() {
