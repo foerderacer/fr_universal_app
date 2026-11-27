@@ -18,9 +18,9 @@ export const GITHUB_RELEASES_URL =
 
 function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
   const fallbackConfig = {
-    nextcloudUrl: "",
-    nextcloudLoginName: null as string | null,
-    pinnedFolders: [] as string[],
+    nextcloudUrl: "https://cloud.foerderacer.example",
+    nextcloudLoginName: "demo-user" as string | null,
+    pinnedFolders: ["/Engineering", "/Finance", "/3D Prints"] as string[],
     cacheLimitMb: 2048,
     mcpServerEnabled: false,
     mcpServerPort: 38420,
@@ -28,8 +28,8 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     financeFolder: "/Finance",
     skippedUpdateVersion: null as string | null,
     lastUpdateCheckAt: null as string | null,
-    prusaslicerPath: null as string | null,
-    theme: "system",
+    prusaslicerPath: "/usr/bin/prusa-slicer" as string | null,
+    theme: "dark",
   };
 
   let config = fallbackConfig;
@@ -46,11 +46,24 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
     appVersion: "0.1.0",
     platform: "browser-preview",
     config,
-    defaultNextcloudUrl: "",
+    defaultNextcloudUrl: "https://cloud.foerderacer.example",
     connectionStatus: config.nextcloudUrl
-      ? { state: "signedOut", serverUrl: config.nextcloudUrl }
+      ? {
+          state: "connected",
+          serverUrl: config.nextcloudUrl,
+          loginName: config.nextcloudLoginName ?? "demo-user",
+        }
       : { state: "notConfigured" },
-    accountInfo: null,
+    accountInfo: config.nextcloudUrl
+      ? {
+          id: "demo-user",
+          displayName: "Alex Lindner",
+          email: "alex@foerderacer.example",
+          quotaUsedBytes: 14_820_000_000,
+          quotaTotalBytes: 107_374_182_400,
+          quotaRelative: 13.8,
+        }
+      : null,
     loginPendingUrl: null,
     mcpServer: {
       enabled: config.mcpServerEnabled,
@@ -71,26 +84,6 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         capabilities: ["storage", "preview", "mcpServerTools"],
       },
       {
-        id: "talk",
-        name: "Talk",
-        description:
-          "Team group chat via Nextcloud Talk with zero-copy cloud file references.",
-        icon: "message",
-        version: "0.1.0",
-        status: "active",
-        capabilities: ["chat", "storage", "preview", "mcpServerTools"],
-      },
-      {
-        id: "mcp",
-        name: "MCP / AI",
-        description:
-          "Connect local AI assistants to your workspace and manage external MCP tools.",
-        icon: "cpu",
-        version: "0.1.0",
-        status: "active",
-        capabilities: ["mcpServerTools", "mcpClient"],
-      },
-      {
         id: "finance",
         name: "Finance",
         description:
@@ -101,6 +94,26 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         capabilities: ["storage", "preview", "mcpServerTools"],
       },
       {
+        id: "slicer",
+        name: "3D Printing",
+        description:
+          "Prepare Prusa MK3S build plates and slice STL/3MF meshes cleanly.",
+        icon: "printer",
+        version: "0.1.0",
+        status: "active",
+        capabilities: ["slicing", "storage", "mcpServerTools"],
+      },
+      {
+        id: "talk",
+        name: "Chat",
+        description:
+          "Team conversations via Nextcloud Talk with zero-copy cloud file references.",
+        icon: "message",
+        version: "0.1.0",
+        status: "active",
+        capabilities: ["chat", "storage", "preview", "mcpServerTools"],
+      },
+      {
         id: "automation",
         name: "Automations",
         description:
@@ -109,6 +122,16 @@ function createBrowserPreviewOverview(): WorkspaceOverview_Serialize {
         version: "0.1.0",
         status: "active",
         capabilities: ["storage", "workflows", "mcpClient", "mcpServerTools"],
+      },
+      {
+        id: "mcp",
+        name: "MCP / AI",
+        description:
+          "Connect local AI assistants to your workspace and manage external MCP tools.",
+        icon: "cpu",
+        version: "0.1.0",
+        status: "active",
+        capabilities: ["mcpServerTools", "mcpClient"],
       },
     ],
   };

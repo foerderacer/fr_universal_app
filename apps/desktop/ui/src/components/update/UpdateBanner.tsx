@@ -1,5 +1,6 @@
-import { Download, Sparkles, X } from "lucide-react";
+import { Download, X } from "lucide-react";
 import type { AppUpdateCheckResult_Serialize } from "../../bindings/tauri";
+import { IconButton } from "../ui/Tooltip";
 
 interface UpdateBannerProps {
   update: AppUpdateCheckResult_Serialize;
@@ -18,51 +19,35 @@ export function UpdateBanner({
   return (
     <div
       role="status"
-      className="mx-auto mb-4 max-w-5xl rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900 shadow-xs dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-blue-200"
+      className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--accent-border)] bg-[var(--accent-soft)] px-4 py-2 text-xs text-[var(--text-primary)]"
     >
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <Sparkles className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-          <span className="truncate">
-            <strong>A new version (v{latest}) of FR Universal App is ready.</strong>{" "}
-            Updates are cryptographically signed and verified before installing.
-          </span>
-        </div>
+      <span className="truncate">
+        Update{" "}
+        <span className="mono-num font-medium">v{latest}</span> is available
+        (signed release).
+      </span>
 
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={onReviewUpdate}
+          className="inline-flex h-6 items-center gap-1 rounded bg-[var(--accent)] px-2 text-[11px] font-medium text-white hover:bg-[var(--accent-hover)]"
+        >
+          <Download className="h-3 w-3" strokeWidth={1.5} />
+          Update
+        </button>
+        {update.latestVersion && (
           <button
             type="button"
-            onClick={onReviewUpdate}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 font-semibold text-white hover:bg-blue-700"
+            onClick={() => onSkipVersion(update.latestVersion!)}
+            className="h-6 rounded px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
           >
-            <Download className="h-3.5 w-3.5" />
-            Update now
+            Skip
           </button>
-          <button
-            type="button"
-            onClick={onDismissLater}
-            className="rounded-lg border border-blue-200 bg-white px-2.5 py-1.5 font-medium text-blue-800 hover:bg-blue-100/60 dark:border-blue-800 dark:bg-slate-900 dark:text-blue-200"
-          >
-            Later
-          </button>
-          {update.latestVersion && (
-            <button
-              type="button"
-              onClick={() => onSkipVersion(update.latestVersion!)}
-              className="rounded-lg px-2 py-1.5 font-medium text-blue-700 hover:underline dark:text-blue-300"
-            >
-              Skip v{latest}
-            </button>
-          )}
-          <button
-            type="button"
-            aria-label="Dismiss update notification"
-            onClick={onDismissLater}
-            className="rounded-lg p-1 text-blue-600 hover:bg-blue-100 dark:text-blue-300 dark:hover:bg-blue-900/50"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        )}
+        <IconButton size="xs" label="Dismiss" onClick={onDismissLater}>
+          <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+        </IconButton>
       </div>
     </div>
   );

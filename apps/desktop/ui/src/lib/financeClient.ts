@@ -7,6 +7,11 @@ import {
   type WorkspaceOverview_Serialize,
 } from "../bindings/tauri";
 
+import {
+  PREVIEW_FINANCE_ENTRIES,
+  PREVIEW_FINANCE_SUMMARIES,
+} from "./previewFixtures";
+
 function requireDesktop(action: string): never {
   throw {
     code: "browser_preview",
@@ -18,7 +23,7 @@ function requireDesktop(action: string): never {
 }
 
 export async function listFinanceEntries(): Promise<FinanceEntry_Serialize[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) return PREVIEW_FINANCE_ENTRIES;
   return commands.listFinanceEntries();
 }
 
@@ -35,7 +40,7 @@ export async function deleteFinanceEntry(entryId: string): Promise<void> {
 }
 
 export async function getFinanceSummary(): Promise<FinanceCurrencySummary[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) return PREVIEW_FINANCE_SUMMARIES;
   return commands.getFinanceSummary();
 }
 
@@ -59,7 +64,7 @@ export function formatCurrencyCents(
   const safe = typeof cents === "number" && Number.isFinite(cents) ? cents : 0;
   const amount = safe / 100;
   try {
-    return new Intl.NumberFormat(undefined, {
+    return new Intl.NumberFormat("en-IE", {
       style: "currency",
       currency: currency.toUpperCase(),
       minimumFractionDigits: 2,

@@ -1,5 +1,8 @@
+import { Grid3x3, RotateCcw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { handleToolbarKeyDown } from "../../lib/shortcuts";
+import { IconButton } from "../ui/Tooltip";
 
 interface Cad3dViewerProps {
   url: string;
@@ -8,7 +11,9 @@ interface Cad3dViewerProps {
 
 function parseStlToGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
   const view = new DataView(buffer);
-  const textHead = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(80, buffer.byteLength)));
+  const textHead = new TextDecoder().decode(
+    new Uint8Array(buffer, 0, Math.min(80, buffer.byteLength)),
+  );
   const isBinary =
     buffer.byteLength >= 84 &&
     (!textHead.trimStart().startsWith("solid") ||
@@ -20,7 +25,7 @@ function parseStlToGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
     const triCount = view.getUint32(80, true);
     let offset = 84;
     for (let i = 0; i < triCount && offset + 50 <= buffer.byteLength; i += 1) {
-      offset += 12; // skip normal
+      offset += 12;
       for (let v = 0; v < 3; v += 1) {
         positions.push(
           view.getFloat32(offset, true),
@@ -29,11 +34,12 @@ function parseStlToGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
         );
         offset += 12;
       }
-      offset += 2; // attribute byte count
+      offset += 2;
     }
   } else {
     const text = new TextDecoder().decode(buffer);
-    const regex = /vertex\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)/g;
+    const regex =
+      /vertex\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)/g;
     let match: RegExpExecArray | null;
     while ((match = regex.exec(text)) !== null) {
       positions.push(Number(match[1]), Number(match[2]), Number(match[3]));
@@ -51,16 +57,27 @@ function parseStlToGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
 
 export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const meshMaterialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+  const resetViewRef = useRef<(() => void) | null>(null);
+  const [wireframe, setWireframe] = useState(false);
+  const wireframeRef = useRef(false);
+  wireframeRef.current = wireframe;
   const [error, setError] = useState<{
     message: string;
     details: string | null;
   } | null>(null);
 
   useEffect(() => {
+    if (meshMaterialRef.current) {
+      meshMaterialRef.current.wireframe = wireframe;
+    }
+  }, [wireframe]);
+
+  useEffect(() => {
     const ext = fileName.split(".").pop()?.toLowerCase();
     if (ext !== "stl") {
       setError({
-        message: `Interactive 3D preview currently renders .stl meshes directly. Click "Open in Native App" to inspect .${ext ?? "cad"} files.`,
+        message: `Interactive 3D preview renders .stl meshes directly. Open in native app to inspect .${ext ?? "cad"} files.`,
         details: null,
       });
       return;
@@ -74,19 +91,24 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
     let animId = 0;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0f172a);
-    const width = container.clientWidth || 600;
-    const height = container.clientHeight || 420;
+    const isDark = document.documentElement.classList.contains("dark");
+    const cssBg =
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--bg-viewport")
+        .trim() || (isDark ? "#111216" : "#eef0f4");
+    scene.background = new THREE.Color(cssBg);
+    const width = container.clientWidth || 560;
+    const height = container.clientHeight || 400;
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 10000);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     container.innerHTML = "";
     container.appendChild(renderer.domElement);
 
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
-    keyLight.position.set(1, 2, 3);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 0.95);
+    keyLight.position.set(1.5, 2.5, 3);
     scene.add(keyLight);
 
     const pivot = new THREE.Group();
@@ -96,6 +118,13 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
     let lastX = 0;
     let lastY = 0;
     let distance = 4;
+
+    resetViewRef.current = () => {
+      pivot.rotation.set(0, 0, 0);
+      distance = 4;
+      camera.position.set(0, 0.6, distance);
+      camera.lookAt(0, 0, 0);
+    };
 
     const onDown = (e: PointerEvent) => {
       dragging = true;
@@ -144,11 +173,17 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
           const scale = 2.0 / maxDim;
           geometry.scale(scale, scale, scale);
         }
+        const cssMesh =
+          getComputedStyle(document.documentElement)
+            .getPropertyValue("--vp-mesh")
+            .trim() || (isDark ? "#9aa0ae" : "#737b8c");
         const material = new THREE.MeshStandardMaterial({
-          color: 0x38bdf8,
-          metalness: 0.25,
+          color: new THREE.Color(cssMesh),
+          metalness: 0.2,
           roughness: 0.45,
+          wireframe: wireframeRef.current,
         });
+        meshMaterialRef.current = material;
         const mesh = new THREE.Mesh(geometry, material);
         pivot.add(mesh);
         camera.position.set(0, 0.6, distance);
@@ -165,14 +200,49 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
         if (!disposed) {
           setError({
             message:
-              'We couldn\'t display this 3D model in the app. Click "Open in Native App" to inspect it in your CAD viewer.',
+              'We couldn\'t display this 3D model in the app. Use "Open in native app" to inspect it in your CAD viewer.',
             details: err instanceof Error ? err.message : String(err),
           });
         }
       });
 
+    const resizeObserver = new ResizeObserver(() => {
+      if (disposed || !container) return;
+      const w = container.clientWidth || 560;
+      const h = container.clientHeight || 400;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    });
+    resizeObserver.observe(container);
+
+    const themeObserver = new MutationObserver(() => {
+      if (disposed) return;
+      const dark = document.documentElement.classList.contains("dark");
+      const nextBg =
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--bg-viewport")
+          .trim() || (dark ? "#111216" : "#eef0f4");
+      scene.background = new THREE.Color(nextBg);
+      if (meshMaterialRef.current) {
+        const nextMesh =
+          getComputedStyle(document.documentElement)
+            .getPropertyValue("--vp-mesh")
+            .trim() || (dark ? "#9aa0ae" : "#737b8c");
+        meshMaterialRef.current.color = new THREE.Color(nextMesh);
+      }
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+
     return () => {
       disposed = true;
+      resizeObserver.disconnect();
+      themeObserver.disconnect();
+      meshMaterialRef.current = null;
+      resetViewRef.current = null;
       cancelAnimationFrame(animId);
       dom.removeEventListener("pointerdown", onDown);
       window.removeEventListener("pointermove", onMove);
@@ -184,12 +254,12 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
 
   if (error) {
     return (
-      <div className="rounded-xl border border-slate-200 bg-slate-50 p-6 text-center text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+      <div className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-5 text-center text-xs text-[var(--text-secondary)]">
         <p>{error.message}</p>
         {error.details && (
-          <details className="mt-2 text-xs text-slate-500">
+          <details className="mt-2 text-[11px] text-[var(--text-muted)]">
             <summary className="cursor-pointer font-medium">Technical details</summary>
-            <p className="mt-1 font-mono break-all">{error.details}</p>
+            <p className="mono-num mt-1 break-all">{error.details}</p>
           </details>
         )}
       </div>
@@ -197,14 +267,30 @@ export function Cad3dViewer({ url, fileName }: Cad3dViewerProps) {
   }
 
   return (
-    <div className="flex h-full flex-col gap-2">
-      <p className="text-xs text-slate-500 dark:text-slate-400">
-        Drag to orbit · Scroll to zoom
-      </p>
+    <div className="relative h-full min-h-[380px] w-full overflow-hidden rounded-md border border-[var(--border-hairline)] bg-[var(--bg-viewport)]">
+      <div ref={containerRef} className="h-full w-full" />
       <div
-        ref={containerRef}
-        className="h-[440px] w-full overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800"
-      />
+        role="toolbar"
+        aria-label="3D viewer controls"
+        onKeyDown={handleToolbarKeyDown}
+        className="absolute top-2 right-2 flex items-center gap-0.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] p-0.5"
+      >
+        <IconButton
+          label="Toggle wireframe"
+          size="xs"
+          active={wireframe}
+          onClick={() => setWireframe((w) => !w)}
+        >
+          <Grid3x3 className="h-3.5 w-3.5" strokeWidth={1.5} />
+        </IconButton>
+        <IconButton
+          label="Reset camera"
+          size="xs"
+          onClick={() => resetViewRef.current?.()}
+        >
+          <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />
+        </IconButton>
+      </div>
     </div>
   );
 }

@@ -11,7 +11,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import type {
   FileItemView_Serialize,
   FilePreviewPayload_Serialize,
@@ -20,10 +20,38 @@ import type {
 import { getFilePreview, openFileInNativeApp } from "../../lib/filesClient";
 import { formatBytes, toUserFacingError } from "../../lib/workspaceClient";
 import { ErrorBanner } from "../ErrorBanner";
-import { Cad3dViewer } from "./Cad3dViewer";
-import { MarkdownEditor } from "./MarkdownEditor";
-import { PdfViewer } from "./PdfViewer";
-import { DxfViewer, SvgViewer } from "./VectorViewer";
+import { IconButton, Tooltip } from "../ui/Tooltip";
+import { formatIsoDate } from "../../lib/dateFormat";
+import { hasActiveOverlay, isEditableTarget } from "../../lib/shortcuts";
+
+const Cad3dViewer = lazy(() =>
+  import("./Cad3dViewer").then((m) => ({ default: m.Cad3dViewer })),
+);
+const MarkdownEditor = lazy(() =>
+  import("./MarkdownEditor").then((m) => ({ default: m.MarkdownEditor })),
+);
+const PdfViewer = lazy(() =>
+  import("./PdfViewer").then((m) => ({ default: m.PdfViewer })),
+);
+const DxfViewer = lazy(() =>
+  import("./VectorViewer").then((m) => ({ default: m.DxfViewer })),
+);
+const SvgViewer = lazy(() =>
+  import("./VectorViewer").then((m) => ({ default: m.SvgViewer })),
+);
+
+function ViewerFallback({ label }: { label: string }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex h-56 items-center justify-center gap-2 text-xs text-[var(--text-muted)]"
+    >
+      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+      {label}
+    </div>
+  );
+}
 
 interface FilePreviewPaneProps {
   item: FileItemView_Serialize;
@@ -59,6 +87,25 @@ export function FilePreviewPane({
   const isMarkdown = item.previewKind === "markdown";
   const onPreviewErrorRef = useRef(onPreviewError);
   onPreviewErrorRef.current = onPreviewError;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Consistently honor the advertised Esc shortcut in every module hosting FilePreviewPane (Files, Finance, Chat)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+      if (hasActiveOverlay()) {
+        return;
+      }
+      if (isEditableTarget(e.target)) {
+        return;
+      }
+      e.preventDefault();
+      onCloseRef.current();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   useEffect(() => {
     setError(null);
@@ -116,65 +163,61 @@ export function FilePreviewPane({
     }
   }
 
+  const extLabel = (
+    item.entry.name.split(".").pop()?.toUpperCase() || "FILE"
+  ).slice(0, 8);
+
   return (
-    <div className="flex h-full flex-col rounded-2xl border border-slate-200 bg-white shadow-xs dark:border-slate-800 dark:bg-slate-900">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-        <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+    <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
+      {/* Compact Flush Preview Header */}
+      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="mono-num shrink-0 rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+            {extLabel}
+          </span>
+          <p className="truncate text-xs font-medium text-[var(--text-primary)]">
             {item.entry.name}
-          </p>
-          <p className="truncate text-xs text-slate-500 dark:text-slate-400">
-            {formatBytes(item.entry.size)}
-            {item.entry.modifiedAt
-              ? ` · Modified ${new Date(item.entry.modifiedAt).toLocaleString()}`
-              : ""}
           </p>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1.5">
-          <button
-            type="button"
+        <div className="flex shrink-0 items-center gap-0.5">
+          <IconButton
+            label={
+              item.previewKind === "solidWorks"
+                ? "Open in SolidWorks"
+                : "Open in native app"
+            }
+            size="xs"
             disabled={openingNative}
             onClick={() => void handleOpenNative()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
           >
             {openingNative ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
             ) : (
-              <ExternalLink className="h-3.5 w-3.5" />
+              <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
             )}
-            {item.previewKind === "solidWorks"
-              ? "Open in SolidWorks"
-              : "Open in Native App"}
-          </button>
+          </IconButton>
 
-          <button
-            type="button"
+          <IconButton
+            label={expanded ? "Restore split view" : "Expand preview"}
+            size="xs"
             onClick={onToggleExpand}
-            title={expanded ? "Restore split view" : "Expand preview"}
-            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
           >
             {expanded ? (
-              <Minimize2 className="h-4 w-4" />
+              <Minimize2 className="h-3.5 w-3.5" strokeWidth={1.5} />
             ) : (
-              <Maximize2 className="h-4 w-4" />
+              <Maximize2 className="h-3.5 w-3.5" strokeWidth={1.5} />
             )}
-          </button>
+          </IconButton>
 
-          <button
-            type="button"
-            onClick={onClose}
-            title="Close preview"
-            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <IconButton label="Close preview" shortcut="Esc" size="xs" onClick={onClose}>
+            <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
       </div>
 
       {/* Body */}
-      <div className="min-h-0 flex-1 overflow-auto p-4">
+      <div className="min-h-0 flex-1 overflow-auto p-3">
         {error && (
           <div className="mb-3">
             <ErrorBanner error={error} onDismiss={() => setError(null)} />
@@ -183,27 +226,33 @@ export function FilePreviewPane({
 
         {execConfirmWarning && (
           <div
-            role="alertdialog"
-            className="mb-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/40"
+            role="alert"
+            aria-label="Confirm opening executable file"
+            className="mb-3 rounded-md border border-[var(--status-warning)]/40 bg-[var(--status-warning-soft)] p-3 text-xs text-[var(--text-primary)]"
           >
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
-              <div className="flex-1 text-xs text-amber-900 dark:text-amber-200">
-                <p className="font-semibold">Confirm opening executable file</p>
-                <p className="mt-1">{execConfirmWarning}</p>
-                <div className="mt-3 flex flex-wrap gap-2">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle
+                className="mt-0.5 h-4 w-4 shrink-0 text-[var(--status-warning-text)]"
+                strokeWidth={1.5}
+              />
+              <div className="flex-1">
+                <p className="font-medium">Confirm opening executable file</p>
+                <p className="mt-0.5 text-[var(--text-secondary)]">
+                  {execConfirmWarning}
+                </p>
+                <div className="mt-2.5 flex items-center gap-2">
                   <button
                     type="button"
                     disabled={openingNative}
                     onClick={() => void handleOpenNative(true)}
-                    className="rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
+                    className="rounded-md bg-[var(--status-warning)] px-2.5 py-1 text-[11px] font-medium text-[var(--status-warning-fg)] disabled:opacity-50"
                   >
                     Open anyway
                   </button>
                   <button
                     type="button"
                     onClick={() => setExecConfirmWarning(null)}
-                    className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
+                    className="rounded-md border border-[var(--border-strong)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                   >
                     Cancel
                   </button>
@@ -214,91 +263,90 @@ export function FilePreviewPane({
         )}
 
         {isMarkdown ? (
-          <MarkdownEditor
-            path={item.entry.path}
-            onSaved={() => onRefreshFolder()}
-            onDirtyChange={onDirtyChange}
-          />
+          <Suspense fallback={<ViewerFallback label="Loading editor…" />}>
+            <MarkdownEditor
+              path={item.entry.path}
+              onSaved={() => onRefreshFolder()}
+              onDirtyChange={onDirtyChange}
+            />
+          </Suspense>
         ) : loading ? (
-          <div className="flex h-64 items-center justify-center gap-2 text-sm text-slate-500">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading preview...
+          <div className="flex h-56 items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+            <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+            Loading preview…
           </div>
         ) : !payload ? null : (
-          <div className="flex h-full flex-col gap-3">
+          <div className="flex h-full flex-col gap-2.5">
             {payload.note && (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+              <div className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">
                 {payload.note}
               </div>
             )}
 
             {payload.previewKind === "image" && payload.mediaUrl && (
-              <div className="flex h-full flex-col gap-3">
-                <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
-                  <span className="text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex h-full flex-col gap-2">
+                <div className="flex items-center justify-between rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2.5 py-1">
+                  <span className="mono-num text-[11px] text-[var(--text-secondary)]">
                     {payload.imageDimensions
                       ? `${payload.imageDimensions.width} × ${payload.imageDimensions.height} px`
-                      : "Image preview"}
+                      : "Image"}
                   </span>
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
+                  <div className="flex items-center gap-0.5">
+                    <IconButton
+                      label="Zoom out"
+                      size="xs"
                       onClick={() =>
                         setImageZoom((z) =>
                           Math.max(0.25, Number((z - 0.25).toFixed(2))),
                         )
                       }
-                      className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-                      aria-label="Zoom out"
                     >
-                      <ZoomOut className="h-4 w-4" />
-                    </button>
-                    <span className="w-12 text-center text-xs font-medium text-slate-600 dark:text-slate-300">
+                      <ZoomOut className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    </IconButton>
+                    <span className="mono-num w-10 text-center text-[11px] text-[var(--text-secondary)]">
                       {Math.round(imageZoom * 100)}%
                     </span>
-                    <button
-                      type="button"
+                    <IconButton
+                      label="Zoom in"
+                      size="xs"
                       onClick={() =>
                         setImageZoom((z) =>
                           Math.min(5, Number((z + 0.25).toFixed(2))),
                         )
                       }
-                      className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-                      aria-label="Zoom in"
                     >
-                      <ZoomIn className="h-4 w-4" />
-                    </button>
-                    <button
-                      type="button"
+                      <ZoomIn className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    </IconButton>
+                    <IconButton
+                      label="Rotate 90°"
+                      size="xs"
                       onClick={() => setImageRotation((r) => (r + 90) % 360)}
-                      className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-                      aria-label="Rotate 90 degrees"
                     >
-                      <RotateCw className="h-4 w-4" />
-                    </button>
+                      <RotateCw className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    </IconButton>
                   </div>
                 </div>
-                <div className="fr-checkerboard flex flex-1 items-center justify-center overflow-auto rounded-xl border border-slate-200 p-4 dark:border-slate-800">
+                <div className="fr-checkerboard flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-md border border-[var(--border-hairline)] p-4">
                   <img
                     src={payload.mediaUrl}
                     alt={payload.entry.name}
                     style={{
                       transform: `scale(${imageZoom}) rotate(${imageRotation}deg)`,
                     }}
-                    className="max-h-[520px] max-w-full rounded-md object-contain shadow-sm transition-transform"
+                    className="max-h-full max-w-full rounded object-contain transition-transform"
                   />
                 </div>
               </div>
             )}
 
             {payload.previewKind === "video" && payload.mediaUrl && (
-              <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-black p-2 dark:border-slate-800">
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center rounded-md border border-[var(--border-hairline)] bg-[var(--bg-app)] p-2">
                 <video
                   key={payload.mediaUrl}
                   src={payload.mediaUrl}
                   controls
                   preload="metadata"
-                  className="max-h-[520px] w-full rounded-lg"
+                  className="max-h-full w-full rounded"
                 />
               </div>
             )}
@@ -306,62 +354,62 @@ export function FilePreviewPane({
             {(payload.previewKind === "pdf" ||
               payload.previewKind === "vectorAi") &&
               payload.mediaUrl && (
-                <PdfViewer
-                  url={payload.mediaUrl}
-                  fileName={payload.entry.name}
-                  onFallbackNote={
-                    payload.previewKind === "vectorAi"
-                      ? 'This Adobe Illustrator (.ai) file was saved without PDF compatibility. Click "Open in Native App" to view it in Illustrator.'
-                      : undefined
-                  }
-                />
+                <Suspense fallback={<ViewerFallback label="Loading PDF viewer…" />}>
+                  <PdfViewer
+                    url={payload.mediaUrl}
+                    fileName={payload.entry.name}
+                    onFallbackNote={
+                      payload.previewKind === "vectorAi"
+                        ? 'This Adobe Illustrator (.ai) file was saved without PDF compatibility. Use "Open in native app" to view it in Illustrator.'
+                        : undefined
+                    }
+                  />
+                </Suspense>
               )}
 
             {payload.previewKind === "vectorSvg" && payload.textContent && (
-              <SvgViewer svgText={payload.textContent} />
+              <Suspense fallback={<ViewerFallback label="Loading vector preview…" />}>
+                <SvgViewer svgText={payload.textContent} />
+              </Suspense>
             )}
 
             {payload.previewKind === "vectorDxf" && payload.textContent && (
-              <DxfViewer dxfText={payload.textContent} />
+              <Suspense fallback={<ViewerFallback label="Loading DXF viewer…" />}>
+                <DxfViewer dxfText={payload.textContent} />
+              </Suspense>
             )}
 
             {payload.previewKind === "solidWorks" && (
-              <div className="grid gap-4 lg:grid-cols-3">
-                <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-6 lg:col-span-2 dark:border-slate-800 dark:bg-slate-950">
+              <div className="flex flex-col gap-3">
+                <div className="flex min-h-[200px] flex-col items-center justify-center rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-5">
                   {payload.solidworks?.thumbnailDataUrl ? (
                     <img
                       src={payload.solidworks.thumbnailDataUrl}
                       alt={payload.entry.name}
-                      className="max-h-[420px] max-w-full rounded-lg object-contain shadow-sm"
+                      className="max-h-[340px] max-w-full rounded object-contain"
                     />
                   ) : (
-                    <div className="text-center text-slate-500">
-                      <Box className="mx-auto h-10 w-10 text-slate-400" />
-                      <p className="mt-2 text-sm font-medium">
-                        No embedded preview image found
+                    <div className="text-center text-[var(--text-muted)]">
+                      <Box className="mx-auto h-7 w-7 opacity-60" strokeWidth={1.5} />
+                      <p className="mt-2 text-xs font-medium text-[var(--text-secondary)]">
+                        No embedded preview image
                       </p>
-                      <p className="mt-1 text-xs">
-                        Click &ldquo;Open in SolidWorks&rdquo; to inspect the 3D model.
+                      <p className="mt-0.5 text-[11px]">
+                        Open in SolidWorks to inspect full 3D geometry.
                       </p>
                     </div>
                   )}
                 </div>
 
-                <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950">
-                  <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase dark:text-slate-400">
-                    Engineering Metadata
-                  </h3>
-                  <dl className="space-y-2 text-xs">
+                <div className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-3">
+                  <h2 className="mb-2 text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                    CAD Properties
+                  </h2>
+                  <dl className="divide-y divide-[var(--border-subtle)] text-xs">
+                    <MetaRow label="Title" value={payload.solidworks?.metadata.title} />
+                    <MetaRow label="Author" value={payload.solidworks?.metadata.author} />
                     <MetaRow
-                      label="Title"
-                      value={payload.solidworks?.metadata.title}
-                    />
-                    <MetaRow
-                      label="Author"
-                      value={payload.solidworks?.metadata.author}
-                    />
-                    <MetaRow
-                      label="Last saved by"
+                      label="Saved by"
                       value={payload.solidworks?.metadata.lastSavedBy}
                     />
                     <MetaRow
@@ -371,10 +419,12 @@ export function FilePreviewPane({
                     <MetaRow
                       label="Created"
                       value={payload.solidworks?.metadata.createdAt}
+                      mono
                     />
                     <MetaRow
-                      label="Last saved"
+                      label="Saved"
                       value={payload.solidworks?.metadata.lastSavedAt}
+                      mono
                     />
                     <MetaRow
                       label="Comments"
@@ -387,6 +437,7 @@ export function FilePreviewPane({
                           ? String(payload.solidworks.streamCount)
                           : null
                       }
+                      mono
                     />
                   </dl>
                 </div>
@@ -394,11 +445,13 @@ export function FilePreviewPane({
             )}
 
             {payload.previewKind === "cad3d" && payload.mediaUrl && (
-              <Cad3dViewer url={payload.mediaUrl} fileName={payload.entry.name} />
+              <Suspense fallback={<ViewerFallback label="Loading 3D viewer…" />}>
+                <Cad3dViewer url={payload.mediaUrl} fileName={payload.entry.name} />
+              </Suspense>
             )}
 
             {payload.previewKind === "plainText" && payload.textContent !== null && (
-              <pre className="max-h-[540px] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed text-slate-800 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200">
+              <pre className="mono-num max-h-[540px] overflow-auto rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-3 text-[11px] leading-relaxed text-[var(--text-primary)]">
                 {payload.textContent}
               </pre>
             )}
@@ -409,13 +462,16 @@ export function FilePreviewPane({
               payload.previewKind === "vectorAi" ||
               payload.previewKind === "cad3d") &&
               !payload.mediaUrl && (
-                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-8 text-center dark:border-slate-800 dark:bg-slate-950">
-                  <FileIcon className="mb-3 h-10 w-10 text-slate-400" />
-                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    In-app preview stream is unavailable
+                <div className="flex flex-1 flex-col items-center justify-center rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6 text-center">
+                  <FileIcon
+                    className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+                    strokeWidth={1.5}
+                  />
+                  <p className="text-xs font-medium text-[var(--text-primary)]">
+                    In-app stream unavailable
                   </p>
-                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                    Click &ldquo;Open in Native App&rdquo; to view this file in your default program.
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                    Open in native app to view this file directly.
                   </p>
                 </div>
               )}
@@ -424,42 +480,47 @@ export function FilePreviewPane({
               payload.previewKind === "vectorDxf" ||
               payload.previewKind === "plainText") &&
               payload.textContent === null && (
-                <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-8 text-center dark:border-slate-800 dark:bg-slate-950">
-                  <FileIcon className="mb-3 h-10 w-10 text-slate-400" />
-                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                <div className="flex flex-1 flex-col items-center justify-center rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6 text-center">
+                  <FileIcon
+                    className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+                    strokeWidth={1.5}
+                  />
+                  <p className="text-xs font-medium text-[var(--text-primary)]">
                     Preview skipped for large file
                   </p>
-                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                    Click &ldquo;Open in Native App&rdquo; to inspect the full file.
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                    Open in native app to inspect full contents.
                   </p>
                 </div>
               )}
 
             {(payload.previewKind === "vectorEps" ||
               payload.previewKind === "unsupported") && (
-              <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-8 text-center dark:border-slate-800 dark:bg-slate-950">
+              <div className="flex flex-1 flex-col items-center justify-center rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6 text-center">
                 {payload.thumbnailDataUrl ? (
                   <img
                     src={payload.thumbnailDataUrl}
                     alt={payload.entry.name}
-                    className="mb-4 max-h-72 rounded-lg object-contain shadow-sm"
+                    className="mb-3 max-h-64 rounded object-contain"
                   />
                 ) : (
-                  <FileIcon className="mb-3 h-10 w-10 text-slate-400" />
+                  <FileIcon
+                    className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+                    strokeWidth={1.5}
+                  />
                 )}
-                <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                <p className="text-xs font-medium text-[var(--text-primary)]">
                   {payload.entry.name}
                 </p>
-                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {payload.entry.mimeType || "Binary file"} ·{" "}
-                  {formatBytes(payload.entry.size)}
+                <p className="mono-num mt-1 text-[11px] text-[var(--text-muted)]">
+                  {payload.entry.mimeType || "Binary"} · {formatBytes(payload.entry.size)}
                 </p>
                 <button
                   type="button"
                   onClick={() => void handleOpenNative()}
-                  className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-white hover:bg-[var(--accent-hover)]"
                 >
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
                   Open in Native App
                 </button>
               </div>
@@ -467,6 +528,20 @@ export function FilePreviewPane({
           </div>
         )}
       </div>
+
+      {/* Compact Monospace Metadata Footer */}
+      <footer className="flex h-8 shrink-0 items-center justify-between gap-2 border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <Tooltip label={item.entry.path} side="top">
+          <span className="mono-num block max-w-[230px] truncate">
+            {item.entry.path}
+          </span>
+        </Tooltip>
+        <div className="mono-num flex shrink-0 items-center gap-2.5">
+          <span>{formatBytes(item.entry.size)}</span>
+          <span className="h-2.5 w-px bg-[var(--border-hairline)]" />
+          <span>{formatIsoDate(item.entry.modifiedAt)}</span>
+        </div>
+      </footer>
     </div>
   );
 }
@@ -474,14 +549,20 @@ export function FilePreviewPane({
 function MetaRow({
   label,
   value,
+  mono = false,
 }: {
   label: string;
   value: string | null | undefined;
+  mono?: boolean;
 }) {
   return (
-    <div>
-      <dt className="font-medium text-slate-500 dark:text-slate-400">{label}</dt>
-      <dd className="mt-0.5 text-slate-900 dark:text-slate-100">
+    <div className="flex items-baseline justify-between gap-3 py-1.5">
+      <dt className="shrink-0 text-[11px] text-[var(--text-muted)]">{label}</dt>
+      <dd
+        className={`min-w-0 truncate text-right text-[11px] text-[var(--text-primary)] ${
+          mono ? "mono-num" : ""
+        }`}
+      >
         {value || "—"}
       </dd>
     </div>

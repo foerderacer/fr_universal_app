@@ -1,5 +1,4 @@
 import Image from "@tiptap/extension-image";
-import Link from "@tiptap/extension-link";
 import Placeholder from "@tiptap/extension-placeholder";
 import { Table } from "@tiptap/extension-table";
 import TableCell from "@tiptap/extension-table-cell";
@@ -16,6 +15,7 @@ import {
   Check,
   Code,
   FileCode2,
+  FileText,
   Heading1,
   Heading2,
   ImagePlus,
@@ -23,6 +23,7 @@ import {
   List,
   ListChecks,
   ListOrdered,
+  MoreHorizontal,
   Quote,
   RotateCcw,
   Save,
@@ -46,8 +47,12 @@ import {
   saveMarkdownFile,
   uploadFileBytes,
 } from "../../lib/filesClient";
+import { MOD_KEY } from "../../lib/platform";
+import { handleToolbarKeyDown, hasActiveOverlay } from "../../lib/shortcuts";
 import { toUserFacingError } from "../../lib/workspaceClient";
 import { ErrorBanner } from "../ErrorBanner";
+import { InlineDeleteConfirm } from "../ui/InlineDeleteConfirm";
+import { IconButton } from "../ui/Tooltip";
 
 interface MarkdownEditorProps {
   path: string;
@@ -55,12 +60,16 @@ interface MarkdownEditorProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-function resolveRelativeCloudPath(docParentDir: string, rawSrc: string): string | null {
+function resolveRelativeCloudPath(
+  docParentDir: string,
+  rawSrc: string,
+): string | null {
   const trimmed = rawSrc.trim();
   if (!trimmed || /^(https?:|data:|blob:|mailto:|#)/i.test(trimmed)) {
     return null;
   }
-  const baseParts = docParentDir === "/" ? [] : docParentDir.split("/").filter(Boolean);
+  const baseParts =
+    docParentDir === "/" ? [] : docParentDir.split("/").filter(Boolean);
   const relParts = trimmed.startsWith("/") ? [] : [...baseParts];
   for (const seg of trimmed.split("/")) {
     if (!seg || seg === ".") continue;
@@ -119,7 +128,6 @@ function createTurndown(docParentDir: string): TurndownService {
       return `- [${checked ? "x" : " "}] ${content.trim()}\n`;
     },
   });
-  // Never persist ephemeral loopback media-proxy URLs (which contain session tokens) into .md files.
   td.addRule("stripProxyImageUrl", {
     filter: "img",
     replacement: (_content, node) => {
@@ -161,7 +169,67 @@ export function MarkdownEditor({
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [draftNotice, setDraftNotice] = useState<string | null>(null);
   const [conflictOpen, setConflictOpen] = useState(false);
+  const [confirmOverwrite, setConfirmOverwrite] = useState(false);
+  const [confirmDiscardDraft, setConfirmDiscardDraft] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [error, setError] = useState<UserFacingError | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement | null>(null);
+  const moreMenuTriggerRef = useRef<HTMLSpanElement | null>(null);
+  const moreMenuListRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!moreMenuOpen) return;
+    const firstItem =
+      moreMenuListRef.current?.querySelector<HTMLButtonElement>(
+        '[role="menuitem"]',
+      );
+    firstItem?.focus();
+    const onDown = (e: MouseEvent) => {
+      if (!moreMenuRef.current?.contains(e.target as Node)) {
+        setMoreMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setMoreMenuOpen(false);
+        moreMenuTriggerRef.current?.querySelector("button")?.focus();
+        return;
+      }
+      if (
+        e.key === "ArrowDown" ||
+        e.key === "ArrowUp" ||
+        e.key === "Home" ||
+        e.key === "End"
+      ) {
+        const items = Array.from(
+          moreMenuListRef.current?.querySelectorAll<HTMLButtonElement>(
+            '[role="menuitem"]',
+          ) ?? [],
+        );
+        if (items.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const curIdx = items.findIndex((el) => el === document.activeElement);
+        let nextIdx = 0;
+        if (e.key === "ArrowDown") {
+          nextIdx = curIdx < 0 ? 0 : (curIdx + 1) % items.length;
+        } else if (e.key === "ArrowUp") {
+          nextIdx = curIdx <= 0 ? items.length - 1 : curIdx - 1;
+        } else if (e.key === "End") {
+          nextIdx = items.length - 1;
+        }
+        items[nextIdx]?.focus();
+      }
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [moreMenuOpen]);
 
   const docParentDir = useMemo(() => {
     const idx = path.lastIndexOf("/");
@@ -201,8 +269,9 @@ export function MarkdownEditor({
 
   const editor = useEditor({
     extensions: [
-      StarterKit,
-      Link.configure({ openOnClick: false }),
+      StarterKit.configure({
+        link: { openOnClick: false },
+      }),
       Image,
       TaskList,
       TaskItem.configure({ nested: true }),
@@ -262,18 +331,16 @@ export function MarkdownEditor({
     void loadDocument();
   }, [loadDocument]);
 
-  // Debounced auto-save of unsaved drafts into local SQLite.
   useEffect(() => {
     if (!dirty || !doc) return;
     const handle = window.setTimeout(() => {
       void saveMarkdownDraft(path, markdown, etag)
-        .then(() => setDraftNotice("Draft saved locally"))
+        .then(() => setDraftNotice("Draft saved"))
         .catch(() => {});
     }, 800);
     return () => window.clearTimeout(handle);
   }, [dirty, doc, path, markdown, etag]);
 
-  // Immediately flush any pending draft on unmount, path switch, or window close so edits are never lost.
   useEffect(() => {
     const flushNow = () => {
       const cur = latestDraftRef.current;
@@ -299,12 +366,15 @@ export function MarkdownEditor({
         setDirty(false);
         setDraftNotice(null);
         setConflictOpen(false);
-        setSavedNotice("Saved to Nextcloud");
+        setSavedNotice("Saved");
         setTimeout(() => setSavedNotice(null), 2500);
         onSaved?.(res.path);
       } catch (err) {
         const uf = toUserFacingError(err);
         if (uf.code === "conflict") {
+          await saveMarkdownDraft(path, markdown, etag)
+            .then(() => setDraftNotice("Draft saved"))
+            .catch(() => {});
           setConflictOpen(true);
         } else {
           setError(uf);
@@ -316,10 +386,25 @@ export function MarkdownEditor({
     [path, markdown, etag, onSaved],
   );
 
-  // Ctrl/Cmd+S shortcut.
+  const handleReloadAfterConflict = useCallback(async () => {
+    if (dirty && doc) {
+      try {
+        await saveMarkdownDraft(path, markdown, etag);
+        setDraftNotice("Draft saved");
+      } catch (err) {
+        setError(toUserFacingError(err));
+        return;
+      }
+    }
+    await loadDocument();
+  }, [dirty, doc, path, markdown, etag, loadDocument]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        if (hasActiveOverlay()) {
+          return;
+        }
         e.preventDefault();
         if (!saving && !loading) {
           void handleSave(false);
@@ -338,7 +423,7 @@ export function MarkdownEditor({
       setConflictOpen(false);
       setDirty(false);
       setDraftNotice(null);
-      setSavedNotice(`Saved copy: ${res.path.split("/").pop()}`);
+      setSavedNotice(`Saved copy`);
       onSaved?.(res.path);
     } catch (err) {
       setError(toUserFacingError(err));
@@ -357,9 +442,7 @@ export function MarkdownEditor({
 
   async function handleDiscardDraft() {
     await discardMarkdownDraft(path);
-    if (doc) {
-      setDoc({ ...doc, draft: null });
-    }
+    if (doc) setDoc({ ...doc, draft: null });
     setDraftNotice(null);
   }
 
@@ -402,79 +485,89 @@ export function MarkdownEditor({
 
   if (loading) {
     return (
-      <div className="flex h-64 items-center justify-center text-sm text-slate-500">
-        Loading Markdown note...
+      <div className="flex h-56 items-center justify-center text-xs text-[var(--text-muted)]">
+        Loading note…
       </div>
     );
   }
 
   return (
-    <div className="flex h-full flex-col gap-3">
+    <div className="flex h-full flex-col gap-2">
       {error && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
 
       {doc?.draft && (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-          <span>
-            You have an unsaved local draft of this document from an earlier session.
-          </span>
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-[var(--status-warning)]/40 bg-[var(--status-warning-soft)] px-3 py-2 text-xs text-[var(--text-primary)]">
+          <span>Unsaved local draft found from an earlier session.</span>
+          <div className="flex items-center gap-1.5">
             <button
               type="button"
               onClick={() => void handleRestoreDraft()}
-              className="rounded-lg bg-amber-600 px-3 py-1 font-semibold text-white hover:bg-amber-700"
+              className="rounded bg-[var(--status-warning)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-warning-fg)]"
             >
-              Restore draft
+              Restore
             </button>
-            <button
-              type="button"
-              onClick={() => void handleDiscardDraft()}
-              className="rounded-lg border border-amber-300 px-3 py-1 font-medium hover:bg-amber-100 dark:border-amber-800 dark:hover:bg-amber-900/50"
-            >
-              Discard
-            </button>
+            <InlineDeleteConfirm
+              armed={confirmDiscardDraft}
+              onArm={() => setConfirmDiscardDraft(true)}
+              onCancel={() => setConfirmDiscardDraft(false)}
+              onConfirm={() => {
+                setConfirmDiscardDraft(false);
+                void handleDiscardDraft();
+              }}
+              label="Discard local draft"
+              triggerLabel="Discard"
+              confirmLabel="Discard"
+            />
           </div>
         </div>
       )}
 
       {conflictOpen && (
         <div
-          role="alertdialog"
-          className="rounded-xl border border-rose-200 bg-rose-50 p-4 dark:border-rose-900/60 dark:bg-rose-950/40"
+          role="alert"
+          aria-label="Remote file conflict"
+          className="rounded-md border border-[var(--status-danger)]/40 bg-[var(--status-danger-soft)] p-3 text-xs text-[var(--text-primary)]"
         >
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600 dark:text-rose-400" />
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle
+              className="mt-0.5 h-4 w-4 shrink-0 text-[var(--status-danger-text)]"
+              strokeWidth={1.5}
+            />
             <div className="flex-1">
-              <p className="text-sm font-semibold text-rose-900 dark:text-rose-100">
-                Someone else updated this file on Nextcloud
+              <p className="font-medium">Remote file updated on Nextcloud</p>
+              <p className="mt-0.5 text-[11px] text-[var(--text-secondary)]">
+                Your edits are preserved locally. Choose how to resolve:
               </p>
-              <p className="mt-1 text-xs text-rose-800 dark:text-rose-200">
-                Your edits are safely preserved. Choose how you want to continue:
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2">
+              <div className="mt-2.5 flex flex-wrap gap-1.5">
                 <button
                   type="button"
                   disabled={saving}
                   onClick={() => void handleSaveCopy()}
-                  className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                  className="rounded bg-[var(--accent)] px-2.5 py-1 text-[11px] font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
                 >
-                  Save as a copy (Recommended)
+                  Save copy
                 </button>
+                <InlineDeleteConfirm
+                  armed={confirmOverwrite}
+                  onArm={() => setConfirmOverwrite(true)}
+                  onCancel={() => setConfirmOverwrite(false)}
+                  onConfirm={() => {
+                    setConfirmOverwrite(false);
+                    void handleSave(true);
+                  }}
+                  label="Overwrite remote file"
+                  triggerLabel="Overwrite"
+                  confirmLabel="Overwrite"
+                  disabled={saving}
+                />
                 <button
                   type="button"
                   disabled={saving}
-                  onClick={() => void handleSave(true)}
-                  className="rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100 disabled:opacity-50 dark:border-rose-800 dark:bg-slate-900 dark:text-rose-300"
+                  onClick={() => void handleReloadAfterConflict()}
+                  className="inline-flex items-center gap-1 rounded border border-[var(--border-strong)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                 >
-                  Overwrite server version
-                </button>
-                <button
-                  type="button"
-                  disabled={saving}
-                  onClick={() => void loadDocument()}
-                  className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
-                >
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  Discard &amp; reload latest
+                  <RotateCcw className="h-3 w-3" strokeWidth={1.5} />
+                  Reload
                 </button>
               </div>
             </div>
@@ -482,96 +575,189 @@ export function MarkdownEditor({
         </div>
       )}
 
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex flex-wrap items-center gap-1">
+      {/* Compact Single-Row Icon-First Formatting Bar */}
+      <div
+        role="toolbar"
+        aria-label="Markdown formatting"
+        onKeyDown={handleToolbarKeyDown}
+        className="flex h-8 shrink-0 flex-nowrap items-center justify-between gap-1.5 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5"
+      >
+        <div className="flex flex-nowrap items-center gap-0.5">
           {mode === "rich" && editor && (
             <>
-              <ToolbarBtn
-                active={editor.isActive("heading", { level: 1 })}
-                onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
-                label="Heading 1"
-              >
-                <Heading1 className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
-                active={editor.isActive("heading", { level: 2 })}
-                onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-                label="Heading 2"
-              >
-                <Heading2 className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
+              <IconButton
+                size="xs"
+                label="Bold"
+                shortcut={`${MOD_KEY}B`}
                 active={editor.isActive("bold")}
                 onClick={() => editor.chain().focus().toggleBold().run()}
-                label="Bold"
               >
-                <Bold className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
+                <Bold className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+              <IconButton
+                size="xs"
+                label="Italic"
+                shortcut={`${MOD_KEY}I`}
                 active={editor.isActive("italic")}
                 onClick={() => editor.chain().focus().toggleItalic().run()}
-                label="Italic"
               >
-                <Italic className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
+                <Italic className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+              <IconButton
+                size="xs"
+                label="Bullet list"
                 active={editor.isActive("bulletList")}
                 onClick={() => editor.chain().focus().toggleBulletList().run()}
-                label="Bullet list"
               >
-                <List className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
+                <List className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+              <IconButton
+                size="xs"
+                label="Numbered list"
                 active={editor.isActive("orderedList")}
                 onClick={() => editor.chain().focus().toggleOrderedList().run()}
-                label="Numbered list"
               >
-                <ListOrdered className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
+                <ListOrdered className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+              <IconButton
+                size="xs"
+                label="Checklist"
                 active={editor.isActive("taskList")}
                 onClick={() => editor.chain().focus().toggleTaskList().run()}
-                label="Checklist"
               >
-                <ListChecks className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
-                active={editor.isActive("blockquote")}
-                onClick={() => editor.chain().focus().toggleBlockquote().run()}
-                label="Quote"
-              >
-                <Quote className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
-                active={editor.isActive("codeBlock")}
-                onClick={() => editor.chain().focus().toggleCodeBlock().run()}
-                label="Code block"
-              >
-                <Code className="h-4 w-4" />
-              </ToolbarBtn>
-              <ToolbarBtn
-                active={editor.isActive("table")}
-                onClick={() =>
-                  editor
-                    .chain()
-                    .focus()
-                    .insertTable({ rows: 3, cols: 3, withHeaderRow: true })
-                    .run()
-                }
-                label="Insert table"
-              >
-                <TableIcon className="h-4 w-4" />
-              </ToolbarBtn>
+                <ListChecks className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
             </>
           )}
-          <ToolbarBtn
-            active={false}
-            onClick={() => fileInputRef.current?.click()}
-            label="Insert image (uploads to assets/)"
-          >
-            <ImagePlus className="h-4 w-4" />
-          </ToolbarBtn>
+
+          {/* Overflow menu keeps the bar strictly one row at all inspector widths */}
+          <div ref={moreMenuRef} className="relative">
+            <span ref={moreMenuTriggerRef} className="inline-flex">
+              <IconButton
+                size="xs"
+                label="More blocks & insert"
+                aria-haspopup="menu"
+                aria-expanded={moreMenuOpen}
+                onClick={() => setMoreMenuOpen((v) => !v)}
+              >
+                <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+            </span>
+            {moreMenuOpen && (
+              <div
+                ref={moreMenuListRef}
+                role="menu"
+                aria-label="More formatting options"
+                className="absolute top-full left-0 z-40 mt-1 w-44 rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] p-1"
+              >
+                {mode === "rich" && editor && (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        editor.chain().focus().toggleHeading({ level: 1 }).run();
+                        setMoreMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                        editor.isActive("heading", { level: 1 })
+                          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <Heading1 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      Heading 1
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        editor.chain().focus().toggleHeading({ level: 2 }).run();
+                        setMoreMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                        editor.isActive("heading", { level: 2 })
+                          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <Heading2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      Heading 2
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        editor.chain().focus().toggleBlockquote().run();
+                        setMoreMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                        editor.isActive("blockquote")
+                          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <Quote className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      Quote
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        editor.chain().focus().toggleCodeBlock().run();
+                        setMoreMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                        editor.isActive("codeBlock")
+                          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <Code className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      Code block
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        editor
+                          .chain()
+                          .focus()
+                          .insertTable({ rows: 3, cols: 3, withHeaderRow: true })
+                          .run();
+                        setMoreMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
+                        editor.isActive("table")
+                          ? "bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                          : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <TableIcon className="h-3.5 w-3.5" strokeWidth={1.5} />
+                      Insert table
+                    </button>
+                    <div
+                      role="none"
+                      className="my-1 border-t border-[var(--border-hairline)]"
+                    />
+                  </>
+                )}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMoreMenuOpen(false);
+                    fileInputRef.current?.click();
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                >
+                  <ImagePlus className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  Insert image…
+                </button>
+              </div>
+            )}
+          </div>
+
           <input
             ref={fileInputRef}
             type="file"
@@ -585,99 +771,72 @@ export function MarkdownEditor({
           />
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 text-xs dark:border-slate-700 dark:bg-slate-950">
-            <button
-              type="button"
-              onClick={() => handleModeSwitch("rich")}
-              className={`rounded-md px-2 py-1 font-medium ${
-                mode === "rich"
-                  ? "bg-blue-600 text-white"
-                  : "text-slate-600 dark:text-slate-300"
-              }`}
-            >
-              Visual
-            </button>
-            <button
-              type="button"
-              onClick={() => handleModeSwitch("raw")}
-              className={`inline-flex items-center gap-1 rounded-md px-2 py-1 font-medium ${
-                mode === "raw"
-                  ? "bg-blue-600 text-white"
-                  : "text-slate-600 dark:text-slate-300"
-              }`}
-            >
-              <FileCode2 className="h-3 w-3" />
-              Markdown
-            </button>
-          </div>
-
+        <div className="flex shrink-0 flex-nowrap items-center gap-1">
           {draftNotice && dirty && (
-            <span className="text-[11px] text-slate-400">{draftNotice}</span>
+            <span className="hidden truncate text-[11px] text-[var(--text-muted)] sm:inline">
+              {draftNotice}
+            </span>
           )}
           {savedNotice && (
-            <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-              <Check className="h-3.5 w-3.5" />
+            <span
+              role="status"
+              aria-live="polite"
+              className="inline-flex items-center gap-1 text-[11px] text-[var(--status-positive-text)]"
+            >
+              <Check className="h-3 w-3" strokeWidth={1.5} />
               {savedNotice}
             </span>
           )}
 
-          <button
-            type="button"
+          <div className="flex items-center rounded border border-[var(--border-strong)] bg-[var(--bg-app)] p-0.5">
+            <IconButton
+              size="xs"
+              label="Rich visual mode"
+              active={mode === "rich"}
+              onClick={() => handleModeSwitch("rich")}
+            >
+              <FileText className="h-3 w-3" strokeWidth={1.5} />
+            </IconButton>
+            <IconButton
+              size="xs"
+              label="Raw Markdown mode"
+              active={mode === "raw"}
+              onClick={() => handleModeSwitch("raw")}
+            >
+              <FileCode2 className="h-3 w-3" strokeWidth={1.5} />
+            </IconButton>
+          </div>
+
+          <IconButton
+            size="xs"
+            label="Save note"
+            shortcut={`${MOD_KEY}S`}
+            tone={dirty ? "accent" : "default"}
             disabled={saving || !dirty}
             onClick={() => void handleSave(false)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-40"
           >
-            <Save className="h-3.5 w-3.5" />
-            {saving ? "Saving..." : "Save"}
-          </button>
+            <Save className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
       </div>
 
       {/* Editor Surface */}
-      <div className="flex-1 overflow-auto rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <div className="min-h-0 flex-1 overflow-auto rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] p-4 focus-within:border-[var(--accent)]">
         {mode === "rich" ? (
-          <EditorContent editor={editor} className="fr-prose min-h-[380px]" />
+          <EditorContent editor={editor} className="fr-prose min-h-[340px]" />
         ) : (
           <textarea
+            aria-label="Raw Markdown source"
             value={markdown}
             onChange={(e) => {
               setMarkdown(e.target.value);
               setDirty(true);
             }}
             spellCheck={false}
-            className="h-full min-h-[420px] w-full resize-none bg-transparent font-mono text-sm leading-relaxed text-slate-900 focus:outline-none dark:text-slate-100"
+            className="mono-num h-full min-h-[380px] w-full resize-none bg-transparent text-xs leading-relaxed text-[var(--text-primary)] focus:outline-none"
           />
         )}
       </div>
     </div>
-  );
-}
-
-function ToolbarBtn({
-  active,
-  onClick,
-  label,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      title={label}
-      aria-label={label}
-      onClick={onClick}
-      className={`rounded-lg p-1.5 transition-colors ${
-        active
-          ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
-          : "text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-      }`}
-    >
-      {children}
-    </button>
   );
 }

@@ -1,5 +1,4 @@
 import {
-  AlertTriangle,
   ArrowDown,
   ArrowUp,
   CheckCircle2,
@@ -16,12 +15,12 @@ import {
   Plus,
   RefreshCw,
   ShieldAlert,
-  Trash2,
   Workflow,
+  Wrench,
   X,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ExternalMcpServerView,
   ExternalMcpTool_Serialize,
@@ -32,6 +31,21 @@ import type {
   WorkflowTrigger,
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { NoticeBanner } from "../components/shell/NoticeBanner";
+import { WorkspaceLayout } from "../components/shell/WorkspaceLayout";
+import { InlineDeleteConfirm } from "../components/ui/InlineDeleteConfirm";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { Switch } from "../components/ui/Switch";
+import { IconButton } from "../components/ui/Tooltip";
+import { formatIsoDateTime } from "../lib/dateFormat";
+import { QUICK_CHAT_SHORTCUT } from "../lib/platform";
+import {
+  areSingleKeyShortcutsEnabled,
+  handleToolbarKeyDown,
+  hasActiveOverlay,
+  isEditableTarget,
+} from "../lib/shortcuts";
 import {
   discoverExternalMcpTools,
   listExternalMcpServers,
@@ -49,6 +63,11 @@ import { toUserFacingError } from "../lib/workspaceClient";
 
 interface AutomationsViewProps {
   isNextcloudConnected: boolean;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+  quickChatInspector?: React.ReactNode;
+  onToggleInspector?: () => void;
+  banners?: React.ReactNode;
 }
 
 function slugifyId(name: string): string {
@@ -67,7 +86,7 @@ function describeTrigger(trigger: WorkflowTrigger): string {
     case "folderWatch":
       return `Watch ${trigger.path}`;
     case "schedule":
-      return `Every ${trigger.intervalMinutes} min`;
+      return `Every ${trigger.intervalMinutes}m`;
   }
 }
 
@@ -111,12 +130,18 @@ function emptyWorkflow(): WorkflowDefinition_Serialize {
 
 export function AutomationsView({
   isNextcloudConnected,
+  sidebarOpen,
+  onToggleSidebar,
+  quickChatInspector,
+  onToggleInspector,
+  banners,
 }: AutomationsViewProps) {
+  const [section, setSection] = useState<"workflows" | "runs">("workflows");
   const [workflows, setWorkflows] = useState<WorkflowDefinition_Serialize[]>([]);
   const [runs, setRuns] = useState<WorkflowRunRecord[]>([]);
-  const [externalServers, setExternalServers] = useState<ExternalMcpServerView[]>(
-    [],
-  );
+  const [externalServers, setExternalServers] = useState<
+    ExternalMcpServerView[]
+  >([]);
   const [toolsByServer, setToolsByServer] = useState<
     Record<string, ExternalMcpTool_Serialize[]>
   >({});
@@ -129,13 +154,38 @@ export function AutomationsView({
   const [editing, setEditing] = useState<WorkflowDefinition_Serialize | null>(
     null,
   );
+  const [confirmDiscardEditor, setConfirmDiscardEditor] = useState(false);
+  const editingOpenRef = useRef(false);
+  const editingSnapshotRef = useRef<string>("");
+  useEffect(() => {
+    if (editing && !editingOpenRef.current) {
+      editingOpenRef.current = true;
+      editingSnapshotRef.current = JSON.stringify(editing);
+      setConfirmDiscardEditor(false);
+    } else if (!editing) {
+      editingOpenRef.current = false;
+      editingSnapshotRef.current = "";
+      setConfirmDiscardEditor(false);
+    }
+  }, [editing]);
+  const isEditingDirty =
+    editing !== null && JSON.stringify(editing) !== editingSnapshotRef.current;
+  function requestCloseEditor() {
+    if (isEditingDirty) {
+      setConfirmDiscardEditor(true);
+    } else {
+      setEditing(null);
+    }
+  }
   const [isNewWorkflow, setIsNewWorkflow] = useState(false);
   const [saving, setSaving] = useState(false);
   const [discoveringServerId, setDiscoveringServerId] = useState<string | null>(
     null,
   );
-
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmDeleteStepIdx, setConfirmDeleteStepIdx] = useState<
+    number | null
+  >(null);
   const [confirmTeamAction, setConfirmTeamAction] = useState<{
     wf: WorkflowDefinition_Serialize;
     action: "enable" | "run";
@@ -166,6 +216,30 @@ export function AutomationsView({
     void loadAll();
   }, [loadAll]);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (!areSingleKeyShortcutsEnabled()) return;
+      if (hasActiveOverlay() || isEditableTarget(e.target)) return;
+      if (e.key === "1") {
+        e.preventDefault();
+        setSection("workflows");
+      } else if (e.key === "2") {
+        e.preventDefault();
+        setSection("runs");
+      } else if (e.key.toLowerCase() === "r") {
+        e.preventDefault();
+        void loadAll();
+      } else if (e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        setIsNewWorkflow(true);
+        setEditing(emptyWorkflow());
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [loadAll]);
+
   function flashNotice(msg: string) {
     setNotice(msg);
     window.setTimeout(() => {
@@ -190,8 +264,8 @@ export function AutomationsView({
       setExpandedRunIds((prev) => ({ ...prev, [record.runId]: true }));
       flashNotice(
         record.succeeded
-          ? `Workflow "${wf.name}" completed (${record.stepLogs.length} step${record.stepLogs.length === 1 ? "" : "s"}).`
-          : `Workflow "${wf.name}" stopped with an error. Expand the run log below for details.`,
+          ? `Workflow "${wf.name}" completed.`
+          : `Workflow "${wf.name}" failed. Check Run History.`,
       );
     } catch (err) {
       setError(toUserFacingError(err));
@@ -211,10 +285,7 @@ export function AutomationsView({
     setError(null);
     setBusyId(wf.id);
     try {
-      const updated = await upsertWorkflow({
-        ...wf,
-        enabled: !wf.enabled,
-      });
+      const updated = await upsertWorkflow({ ...wf, enabled: !wf.enabled });
       setWorkflows(updated);
       setConfirmTeamAction(null);
     } catch (err) {
@@ -230,11 +301,11 @@ export function AutomationsView({
     try {
       const updated = await deleteWorkflow(workflowId);
       setWorkflows(updated);
-      setConfirmDeleteId(null);
       flashNotice("Workflow deleted.");
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
+      setConfirmDeleteId(null);
       setBusyId(null);
     }
   }
@@ -245,13 +316,7 @@ export function AutomationsView({
     try {
       const report = await syncWorkflowsFromNextcloud();
       setWorkflows(report.workflows);
-      const skippedPart =
-        report.skippedCount > 0
-          ? ` Skipped ${report.skippedCount} file${report.skippedCount === 1 ? "" : "s"} (${report.skippedNotes.join("; ")}).`
-          : "";
-      flashNotice(
-        `Synced ${report.importedCount} team workflow${report.importedCount === 1 ? "" : "s"} from /_FR_App/workflows/. Newly imported or changed workflows stay disabled until you review them.${skippedPart}`,
-      );
+      flashNotice(`Synced ${report.importedCount} workflow(s) from Nextcloud.`);
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -266,7 +331,7 @@ export function AutomationsView({
       const cloudPath = await pushWorkflowToNextcloud(wf.id);
       const refreshed = await listWorkflows();
       setWorkflows(refreshed);
-      flashNotice(`Shared "${wf.name}" to Nextcloud at ${cloudPath}.`);
+      flashNotice(`Shared "${wf.name}" to ${cloudPath}.`);
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -283,7 +348,7 @@ export function AutomationsView({
       setError({
         code: "workflow_id_exists",
         title: "Workflow ID already in use",
-        message: `A workflow with ID "${finalId}" already exists. Pick a different ID or edit the existing workflow.`,
+        message: `A workflow with ID "${finalId}" already exists.`,
         recoveryHint: null,
         technicalDetails: null,
       });
@@ -299,7 +364,7 @@ export function AutomationsView({
       });
       setWorkflows(updated);
       setEditing(null);
-      flashNotice(`Saved workflow "${editing.name.trim()}".`);
+      flashNotice(`Saved "${editing.name.trim()}".`);
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -345,468 +410,470 @@ export function AutomationsView({
   function removeStep(index: number) {
     setEditing((prev) => {
       if (!prev || prev.steps.length <= 1) return prev;
-      return {
-        ...prev,
-        steps: prev.steps.filter((_, i) => i !== index),
-      };
+      return { ...prev, steps: prev.steps.filter((_, i) => i !== index) };
     });
   }
 
-  return (
-    <div className="mx-auto max-w-5xl space-y-6">
-      {error && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
+  const activeWorkflowCount = workflows.filter((w) => w.enabled).length;
 
-      {notice && (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-medium text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300">
-          <span className="flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 shrink-0" />
-            {notice}
-          </span>
+  const sidebarNode = (
+    <div className="flex h-full flex-col">
+      <div className="flex-1 overflow-y-auto p-2.5">
+        <h2 className="mb-1 px-2 text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+          Automations
+        </h2>
+        <nav aria-label="Automations" className="space-y-0.5">
           <button
             type="button"
-            onClick={() => setNotice(null)}
-            className="text-emerald-700 hover:underline dark:text-emerald-300"
+            aria-current={section === "workflows" ? "page" : undefined}
+            onClick={() => setSection("workflows")}
+            className={`relative flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+              section === "workflows"
+                ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            }`}
           >
-            Dismiss
+            {section === "workflows" && (
+              <span
+                aria-hidden="true"
+                className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+              />
+            )}
+            <span className="flex items-center gap-2">
+              <Workflow className="h-3.5 w-3.5 text-[var(--text-muted)]" strokeWidth={1.5} />
+              Workflows
+            </span>
+            <span className="mono-num text-[11px] text-[var(--text-muted)]">
+              {workflows.length}
+            </span>
           </button>
-        </div>
-      )}
-
-      {confirmTeamAction && (
-        <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-          <div className="flex items-start gap-3">
-            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-            <div className="flex-1 space-y-2">
-              <p className="font-semibold">
-                Review shared team workflow before{" "}
-                {confirmTeamAction.action === "enable" ? "enabling" : "running"}
-              </p>
-              <p>
-                <strong>{confirmTeamAction.wf.name}</strong> (
-                <code>{confirmTeamAction.wf.id}</code>) was synced from
-                Nextcloud (<code>/_FR_App/workflows/</code>) — Trigger:{" "}
-                <strong>{describeTrigger(confirmTeamAction.wf.trigger)}</strong>
-                . Review every step below before approving:
-              </p>
-              <ol className="list-decimal space-y-1.5 rounded-lg border border-amber-200 bg-white/80 p-3 pl-7 font-mono text-[11px] text-amber-950 dark:border-amber-900/60 dark:bg-slate-900/80 dark:text-amber-100">
-                {confirmTeamAction.wf.steps.map((step, i) => (
-                  <li key={i} className="break-all">
-                    {step.type === "createFolder" && (
-                      <span>Create folder {step.path}</span>
-                    )}
-                    {step.type === "copyFile" && (
-                      <span>
-                        Copy {step.from} → {step.to}
-                      </span>
-                    )}
-                    {step.type === "moveFile" && (
-                      <span>
-                        Move {step.from} → {step.to}
-                      </span>
-                    )}
-                    {step.type === "writeMarkdown" && (
-                      <span>
-                        Write Markdown {step.path}
-                        {step.createOnly ? " (create only)" : " (overwrite)"}
-                      </span>
-                    )}
-                    {step.type === "callMcpTool" && (
-                      <span>
-                        Call external MCP {step.serverId}::{step.toolName} —
-                        args: {step.argumentsJson || "{}"}
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ol>
-              <div className="flex items-center gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() =>
-                    confirmTeamAction.action === "enable"
-                      ? void handleToggleEnabled(confirmTeamAction.wf, true)
-                      : void handleRunNow(confirmTeamAction.wf, true)
-                  }
-                  className="rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700"
-                >
-                  {confirmTeamAction.action === "enable"
-                    ? "I reviewed these steps — Enable"
-                    : "I reviewed these steps — Run Now"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmTeamAction(null)}
-                  className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-200"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-          <Workflow className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-          <span>
-            {workflows.length} workflow{workflows.length === 1 ? "" : "s"}{" "}
-            configured
-          </span>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => void loadAll()}
+            aria-current={section === "runs" ? "page" : undefined}
+            onClick={() => setSection("runs")}
+            className={`relative flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+              section === "runs"
+                ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            }`}
+          >
+            {section === "runs" && (
+              <span
+                aria-hidden="true"
+                className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+              />
+            )}
+            <span className="flex items-center gap-2">
+              <History className="h-3.5 w-3.5 text-[var(--text-muted)]" strokeWidth={1.5} />
+              Run History
+            </span>
+            <span className="mono-num text-[11px] text-[var(--text-muted)]">
+              {runs.length}
+            </span>
+          </button>
+        </nav>
+      </div>
+      <div className="mono-num flex h-8 shrink-0 items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <span>{activeWorkflowCount} active</span>
+        <span>{runs.length} runs</span>
+      </div>
+    </div>
+  );
+
+  return (
+    <WorkspaceLayout
+      moduleId="automation"
+      headerLeft={
+        <h1 className="text-[13px] font-medium text-[var(--text-primary)]">
+          Automations
+        </h1>
+      }
+      headerRight={
+        <div
+          role="toolbar"
+          aria-label="Workflow actions"
+          onKeyDown={handleToolbarKeyDown}
+          className="flex items-center gap-1"
+        >
+          <IconButton
+            label="Sync team workflows from Nextcloud"
+            disabled={!isNextcloudConnected || syncing}
+            onClick={() => void handleSyncFromNextcloud()}
+          >
+            {syncing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+            ) : (
+              <CloudDownload className="h-3.5 w-3.5" strokeWidth={1.5} />
+            )}
+          </IconButton>
+          <IconButton
+            label="Refresh workflows"
+            shortcut="R"
             disabled={loading}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+            onClick={() => void loadAll()}
           >
             <RefreshCw
               className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+              strokeWidth={1.5}
             />
-            Refresh
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void handleSyncFromNextcloud()}
-            disabled={!isNextcloudConnected || syncing}
-            title={
-              isNextcloudConnected
-                ? "Pull shared team workflows from /_FR_App/workflows/"
-                : "Sign in to Nextcloud first to sync team workflows"
-            }
-            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-          >
-            {syncing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <CloudDownload className="h-3.5 w-3.5" />
-            )}
-            Sync from Nextcloud
-          </button>
-
-          <button
-            type="button"
+          </IconButton>
+          <IconButton
+            label="New workflow"
+            shortcut="N"
+            tone="accent"
             onClick={() => {
               setIsNewWorkflow(true);
               setEditing(emptyWorkflow());
             }}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3.5 py-2 text-xs font-semibold text-white shadow-xs hover:bg-blue-700"
           >
-            <Plus className="h-3.5 w-3.5" />
-            New Workflow
-          </button>
+            <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
-      </div>
+      }
+      sidebar={sidebarNode}
+      sidebarOpen={sidebarOpen}
+      onToggleSidebar={onToggleSidebar}
+      inspector={quickChatInspector}
+      inspectorOpen={Boolean(quickChatInspector)}
+      onToggleInspector={onToggleInspector}
+      inspectorLabel={quickChatInspector ? "Quick chat" : "Details inspector"}
+      inspectorToggleLabel={quickChatInspector ? "Close quick chat" : undefined}
+      inspectorToggleShortcut={quickChatInspector ? QUICK_CHAT_SHORTCUT : undefined}
+      canvasMode="document"
+      banners={
+        <>
+          {banners}
+          {notice && (
+            <NoticeBanner message={notice} onDismiss={() => setNotice(null)} />
+          )}
+        </>
+      }
+    >
+      {error && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
 
-      {/* Workflow Cards */}
-      <section className="space-y-3">
-        {loading ? (
-          <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-            Loading workflows...
-          </div>
-        ) : workflows.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center dark:border-slate-700 dark:bg-slate-900">
-            <Workflow className="mx-auto h-9 w-9 text-slate-400" />
-            <h3 className="mt-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
-              No automation workflows yet
-            </h3>
-            <p className="mx-auto mt-1 max-w-md text-xs text-slate-500 dark:text-slate-400">
-              Automate repetitive Nextcloud tasks like creating project folders,
-              archiving documents, writing Markdown summaries, or invoking
-              connected external MCP tools.
-            </p>
-            <button
-              type="button"
-              onClick={() => {
-                setIsNewWorkflow(true);
-                setEditing(emptyWorkflow());
-              }}
-              className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
+      {confirmTeamAction && (
+            <div
+              role="alert"
+              className="rounded-md border border-[var(--status-warning)]/40 bg-[var(--status-warning-soft)] p-3.5 text-xs text-[var(--text-primary)]"
             >
-              <Plus className="h-3.5 w-3.5" />
-              Create your first workflow
-            </button>
-          </div>
-        ) : (
-          workflows.map((wf) => {
-            const isBusy = busyId === wf.id;
-            return (
-              <div
-                key={wf.id}
-                className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs dark:border-slate-800 dark:bg-slate-900"
-              >
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1 space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                        {wf.name}
-                      </h3>
-                      <span className="rounded-full bg-slate-100 px-2 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                        {wf.id}
+              <div className="flex items-start gap-2.5">
+                <ShieldAlert
+                  className="mt-0.5 h-4 w-4 shrink-0 text-[var(--status-warning-text)]"
+                  strokeWidth={1.5}
+                />
+                <div className="min-w-0 flex-1 space-y-2">
+                  <p className="font-medium">
+                    Review shared workflow &ldquo;{confirmTeamAction.wf.name}&rdquo;
+                  </p>
+                  <p className="text-[11px] text-[var(--text-secondary)]">
+                    This workflow was synced from Nextcloud and has not been
+                    approved yet. Review its trigger and steps before{" "}
+                    {confirmTeamAction.action === "enable"
+                      ? "enabling"
+                      : "running"}{" "}
+                    it:
+                  </p>
+                  <div className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-2 text-[11px]">
+                    <p className="text-[var(--text-secondary)]">
+                      <span className="font-medium text-[var(--text-primary)]">
+                        Trigger:
+                      </span>{" "}
+                      <span className="mono-num">
+                        {describeTrigger(confirmTeamAction.wf.trigger)}
                       </span>
-                      <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">
-                        {wf.trigger.type === "folderWatch" ? (
-                          <FolderSearch className="h-3 w-3" />
-                        ) : wf.trigger.type === "schedule" ? (
-                          <Clock className="h-3 w-3" />
-                        ) : (
-                          <Play className="h-3 w-3" />
-                        )}
-                        {describeTrigger(wf.trigger)}
-                      </span>
-                      {wf.fromTeamSync && (
-                        <span className="rounded-full bg-purple-50 px-2 py-0.5 text-[11px] font-medium text-purple-700 dark:bg-purple-950/60 dark:text-purple-300">
-                          Team Sync
-                        </span>
-                      )}
-                    </div>
-
-                    {wf.description && (
-                      <p className="text-xs text-slate-600 dark:text-slate-400">
-                        {wf.description}
+                    </p>
+                    {confirmTeamAction.wf.steps.length === 0 ? (
+                      <p className="mt-1 text-[var(--text-muted)]">
+                        No steps configured.
                       </p>
-                    )}
-
-                    <div className="flex flex-wrap gap-1.5 pt-1">
-                      {wf.steps.map((step, i) => (
-                        <span
-                          key={i}
-                          className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-600 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300"
-                        >
-                          {i + 1}.{" "}
-                          {step.type === "createFolder"
-                            ? `Create ${step.path}`
-                            : step.type === "copyFile"
-                              ? `Copy ${step.from} → ${step.to}`
-                              : step.type === "moveFile"
-                                ? `Move ${step.from} → ${step.to}`
-                                : step.type === "writeMarkdown"
-                                  ? `Write ${step.path}`
-                                  : `MCP ${step.serverId}::${step.toolName}`}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <label
-                      className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:border-slate-700 dark:text-slate-300"
-                      title="Enable or disable automatic triggers"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={wf.enabled}
-                        disabled={isBusy}
-                        onChange={() => void handleToggleEnabled(wf)}
-                        className="h-3.5 w-3.5 rounded border-slate-300 text-blue-600"
-                      />
-                      {wf.enabled ? "Enabled" : "Paused"}
-                    </label>
-
-                    <button
-                      type="button"
-                      disabled={!isNextcloudConnected || isBusy}
-                      onClick={() => void handleRunNow(wf)}
-                      title={
-                        isNextcloudConnected
-                          ? "Execute all steps now"
-                          : "Sign in to Nextcloud to run workflows"
-                      }
-                      className="inline-flex items-center gap-1 rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
-                    >
-                      {isBusy ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Play className="h-3.5 w-3.5" />
-                      )}
-                      Run Now
-                    </button>
-
-                    <button
-                      type="button"
-                      disabled={!isNextcloudConnected || isBusy}
-                      onClick={() => void handlePushToNextcloud(wf)}
-                      title="Share workflow JSON to /_FR_App/workflows/"
-                      className="inline-flex items-center gap-1 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-                    >
-                      <CloudUpload className="h-3.5 w-3.5" />
-                      Share
-                    </button>
-
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => {
-                        setIsNewWorkflow(false);
-                        setEditing(wf);
-                      }}
-                      className="inline-flex items-center gap-1 rounded-xl border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                      Edit
-                    </button>
-
-                    {confirmDeleteId === wf.id ? (
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          disabled={isBusy}
-                          onClick={() => void handleDelete(wf.id)}
-                          className="rounded-lg bg-rose-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-rose-700"
-                        >
-                          Confirm
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDeleteId(null)}
-                          className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
-                        >
-                          Cancel
-                        </button>
-                      </div>
                     ) : (
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteId(wf.id)}
-                        title="Delete workflow"
-                        className="rounded-xl border border-rose-200 p-1.5 text-rose-600 hover:bg-rose-50 dark:border-rose-900/60 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                      <ol className="mt-1.5 list-decimal space-y-1 pl-4 text-[var(--text-secondary)]">
+                        {confirmTeamAction.wf.steps.map((step, i) => (
+                          <li key={i} className="mono-num break-all">
+                            {step.type === "createFolder" && (
+                              <span>Create folder {step.path}</span>
+                            )}
+                            {step.type === "copyFile" && (
+                              <span>
+                                Copy {step.from} → {step.to}
+                              </span>
+                            )}
+                            {step.type === "moveFile" && (
+                              <span>
+                                Move {step.from} → {step.to}
+                              </span>
+                            )}
+                            {step.type === "writeMarkdown" && (
+                              <span>
+                                Write Markdown {step.path} (
+                                {step.createOnly ? "create only" : "overwrite"})
+                              </span>
+                            )}
+                            {step.type === "callMcpTool" && (
+                              <span>
+                                Call external MCP {step.serverId}::
+                                {step.toolName} — args:{" "}
+                                {step.argumentsJson || "{}"}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ol>
                     )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        confirmTeamAction.action === "enable"
+                          ? void handleToggleEnabled(confirmTeamAction.wf, true)
+                          : void handleRunNow(confirmTeamAction.wf, true)
+                      }
+                      className="rounded bg-[var(--status-warning)] px-2.5 py-1 text-[11px] font-medium text-[var(--status-warning-fg)]"
+                    >
+                      {confirmTeamAction.action === "enable"
+                        ? "I reviewed these steps — Enable"
+                        : "I reviewed these steps — Run Now"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmTeamAction(null)}
+                      className="rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    >
+                      Cancel
+                    </button>
                   </div>
                 </div>
               </div>
-            );
-          })
-        )}
-      </section>
+            </div>
+          )}
 
-      {/* Run History */}
-      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
-            <History className="h-4 w-4 text-slate-500" />
-            Recent Run History
-          </h2>
-          <span className="text-xs text-slate-400">
-            Last {runs.length} run{runs.length === 1 ? "" : "s"}
-          </span>
-        </div>
-
-        {runs.length === 0 ? (
-          <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
-            No workflow runs recorded yet. Click <strong>Run Now</strong> on any
-            workflow to inspect step-by-step results here.
-          </p>
-        ) : (
-          <div className="mt-3 divide-y divide-slate-100 dark:divide-slate-800">
-            {runs.map((run) => {
-              const expanded = Boolean(expandedRunIds[run.runId]);
-              return (
-                <div key={run.runId} className="py-2.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setExpandedRunIds((prev) => ({
-                        ...prev,
-                        [run.runId]: !prev[run.runId],
-                      }))
-                    }
-                    className="flex w-full items-center justify-between gap-3 text-left"
-                  >
-                    <div className="flex min-w-0 items-center gap-2">
-                      {expanded ? (
-                        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                      ) : (
-                        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-                      )}
-                      {run.succeeded ? (
-                        <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
-                      ) : (
-                        <XCircle className="h-4 w-4 shrink-0 text-rose-500" />
-                      )}
-                      <span className="truncate text-xs font-semibold text-slate-800 dark:text-slate-200">
-                        {run.workflowName}
-                      </span>
-                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                        {run.triggerSource}
-                      </span>
-                    </div>
-                    <span className="shrink-0 text-[11px] text-slate-400">
-                      {new Date(run.startedAt).toLocaleString()}
-                    </span>
-                  </button>
-
-                  {expanded && (
-                    <div className="mt-2 ml-6 space-y-1.5">
-                      {run.stepLogs.map((log) => (
-                        <div
-                          key={log.stepIndex}
-                          className={`rounded-xl border px-3 py-2 text-xs ${
-                            log.succeeded
-                              ? "border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/60"
-                              : "border-rose-200 bg-rose-50 dark:border-rose-900/60 dark:bg-rose-950/30"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2 font-medium">
-                            <span>
-                              Step {log.stepIndex + 1}: {log.label}
-                            </span>
-                            <span className="text-[11px] text-slate-400">
-                              {log.durationMs} ms
-                            </span>
-                          </div>
-                          {log.output && (
-                            <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-slate-600 dark:text-slate-300">
-                              {log.output}
-                            </pre>
-                          )}
+          {section === "workflows" ? (
+            loading ? (
+              <div className="py-12 text-center text-xs text-[var(--text-muted)]">
+                Loading workflows…
+              </div>
+            ) : workflows.length === 0 ? (
+              <div className="rounded-md border border-dashed border-[var(--border-strong)] p-10 text-center">
+                <Workflow
+                  className="mx-auto h-7 w-7 text-[var(--text-muted)] opacity-60"
+                  strokeWidth={1.5}
+                />
+                <p className="mt-2.5 text-xs font-medium text-[var(--text-primary)]">
+                  No automation workflows yet
+                </p>
+                <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                  Combine Nextcloud file actions with external MCP tools.
+                </p>
+              </div>
+            ) : (
+              <div className="divide-y divide-[var(--border-subtle)] rounded-md border border-[var(--border-hairline)] bg-[var(--bg-sidebar)]">
+                {workflows.map((wf) => {
+                  const isBusy = busyId === wf.id;
+                  return (
+                    <div
+                      key={wf.id}
+                      className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5"
+                    >
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-medium text-[var(--text-primary)]">
+                            {wf.name}
+                          </span>
+                          <span className="mono-num rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--text-muted)]">
+                            {wf.id}
+                          </span>
+                          <span className="inline-flex items-center gap-1 text-[11px] text-[var(--text-secondary)]">
+                            {wf.trigger.type === "folderWatch" ? (
+                              <FolderSearch className="h-3 w-3" strokeWidth={1.5} />
+                            ) : wf.trigger.type === "schedule" ? (
+                              <Clock className="h-3 w-3" strokeWidth={1.5} />
+                            ) : (
+                              <Play className="h-3 w-3" strokeWidth={1.5} />
+                            )}
+                            {describeTrigger(wf.trigger)}
+                          </span>
                         </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
+                        {wf.description && (
+                          <p className="text-[11px] text-[var(--text-muted)]">
+                            {wf.description}
+                          </p>
+                        )}
+                      </div>
 
-      {/* Workflow Builder Modal */}
+                      <div className="flex items-center gap-1.5">
+                        <div className="mr-1 inline-flex items-center gap-1.5">
+                          <Switch
+                            checked={wf.enabled}
+                            disabled={isBusy}
+                            onChange={() => void handleToggleEnabled(wf)}
+                            ariaLabel={`Toggle workflow ${wf.name}`}
+                          />
+                        </div>
+                        <IconButton
+                          size="xs"
+                          label="Run now"
+                          disabled={!isNextcloudConnected || isBusy}
+                          onClick={() => void handleRunNow(wf)}
+                        >
+                          {isBusy ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                          ) : (
+                            <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          )}
+                        </IconButton>
+                        <IconButton
+                          size="xs"
+                          label="Share to Nextcloud"
+                          disabled={!isNextcloudConnected || isBusy}
+                          onClick={() => void handlePushToNextcloud(wf)}
+                        >
+                          <CloudUpload className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </IconButton>
+                        <IconButton
+                          size="xs"
+                          label="Edit workflow"
+                          disabled={isBusy}
+                          onClick={() => {
+                            setIsNewWorkflow(false);
+                            setEditing(wf);
+                          }}
+                        >
+                          <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        </IconButton>
+                        <InlineDeleteConfirm
+                          armed={confirmDeleteId === wf.id}
+                          onArm={() => setConfirmDeleteId(wf.id)}
+                          onCancel={() => setConfirmDeleteId(null)}
+                          onConfirm={() => void handleDelete(wf.id)}
+                          label="Delete workflow"
+                          disabled={isBusy}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          ) : runs.length === 0 ? (
+            <div className="py-12 text-center text-xs text-[var(--text-muted)]">
+              No workflow runs recorded yet.
+            </div>
+          ) : (
+            <div className="divide-y divide-[var(--border-subtle)] rounded-md border border-[var(--border-hairline)] bg-[var(--bg-sidebar)]">
+              {runs.map((run) => {
+                const expanded = Boolean(expandedRunIds[run.runId]);
+                return (
+                  <div key={run.runId} className="p-3">
+                    <button
+                      type="button"
+                      aria-expanded={expanded}
+                      onClick={() =>
+                        setExpandedRunIds((prev) => ({
+                          ...prev,
+                          [run.runId]: !prev[run.runId],
+                        }))
+                      }
+                      className="flex w-full items-center justify-between gap-2 text-left text-xs"
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        {expanded ? (
+                          <ChevronDown className="h-3.5 w-3.5 text-[var(--text-muted)]" strokeWidth={1.5} />
+                        ) : (
+                          <ChevronRight className="h-3.5 w-3.5 text-[var(--text-muted)]" strokeWidth={1.5} />
+                        )}
+                        {run.succeeded ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 text-[var(--status-positive-text)]" strokeWidth={1.5} />
+                        ) : (
+                          <XCircle className="h-3.5 w-3.5 text-[var(--status-danger-text)]" strokeWidth={1.5} />
+                        )}
+                        <span className="truncate font-medium text-[var(--text-primary)]">
+                          {run.workflowName}
+                        </span>
+                      </span>
+                      <span className="mono-num shrink-0 text-[11px] text-[var(--text-muted)]">
+                        {formatIsoDateTime(run.startedAt)}
+                      </span>
+                    </button>
+                    {expanded && (
+                      <div className="mt-2 ml-5 space-y-1.5">
+                        {run.stepLogs.map((log) => (
+                          <div
+                            key={log.stepIndex}
+                            className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[11px]"
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-[var(--text-primary)]">
+                                {log.stepIndex + 1}. {log.label}
+                              </span>
+                              <span className="mono-num text-[11px] text-[var(--text-muted)]">
+                                {log.durationMs}ms
+                              </span>
+                            </div>
+                            {log.output && (
+                              <pre className="mono-num mt-1 max-h-32 overflow-auto text-[11px] whitespace-pre-wrap text-[var(--text-secondary)]">
+                                {log.output}
+                              </pre>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
       {editing && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs">
+        <Modal
+          ariaLabel={isNewWorkflow ? "New Workflow" : `Edit ${editing.name}`}
+          closeOnScrim={!isEditingDirty}
+          onClose={requestCloseEditor}
+        >
           <form
             onSubmit={handleSaveEditor}
-            className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            className="flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-md border border-[var(--border-strong)] bg-[var(--bg-sidebar)]"
           >
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4 dark:border-slate-800">
-              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                {isNewWorkflow ? "Create Workflow" : `Edit "${editing.name}"`}
+            <div className="flex h-11 items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4">
+              <h2 className="truncate text-xs font-medium text-[var(--text-primary)]">
+                {isNewWorkflow ? "New Workflow" : `Edit "${editing.name}"`}
               </h2>
-              <button
-                type="button"
-                onClick={() => setEditing(null)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              {confirmDiscardEditor ? (
+                <InlineDeleteConfirm
+                  armed
+                  onArm={() => setConfirmDiscardEditor(true)}
+                  onCancel={() => setConfirmDiscardEditor(false)}
+                  onConfirm={() => {
+                    setConfirmDiscardEditor(false);
+                    setEditing(null);
+                  }}
+                  label="Discard unsaved workflow changes"
+                  confirmLabel="Discard"
+                />
+              ) : (
+                <IconButton
+                  size="xs"
+                  label="Close"
+                  onClick={requestCloseEditor}
+                >
+                  <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+                </IconButton>
+              )}
             </div>
 
-            <div className="flex-1 space-y-5 overflow-y-auto p-5">
-              {error && (
-                <ErrorBanner error={error} onDismiss={() => setError(null)} />
-              )}
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    Workflow Name *
+            <div className="flex-1 space-y-3.5 overflow-y-auto p-4 text-xs">
+              {error && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <label
+                    htmlFor="workflow-name"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
+                    Name *
                   </label>
                   <input
+                    id="workflow-name"
                     type="text"
                     required
                     value={editing.name}
@@ -822,16 +889,18 @@ export function AutomationsView({
                           : prev,
                       );
                     }}
-                    placeholder="Weekly Project Archive"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
-
-                <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    Workflow ID
+                <div className="space-y-1">
+                  <label
+                    htmlFor="workflow-id"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
+                    ID
                   </label>
                   <input
+                    id="workflow-id"
                     type="text"
                     required
                     disabled={!isNewWorkflow}
@@ -841,133 +910,16 @@ export function AutomationsView({
                         prev ? { ...prev, id: e.target.value } : prev,
                       )
                     }
-                    placeholder="weekly-project-archive"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-xs disabled:opacity-60 dark:border-slate-700 dark:bg-slate-950"
+                    className="mono-num h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] disabled:opacity-50"
                   />
                 </div>
               </div>
 
-              <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Description
-                </label>
-                <input
-                  type="text"
-                  value={editing.description}
-                  onChange={(e) =>
-                    setEditing((prev) =>
-                      prev ? { ...prev, description: e.target.value } : prev,
-                    )
-                  }
-                  placeholder="What does this automation do?"
-                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
-                />
-              </div>
-
-              {/* Trigger Configuration */}
-              <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950/60">
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Trigger Type
-                    </label>
-                    <select
-                      value={editing.trigger.type}
-                      onChange={(e) => {
-                        const kind = e.target.value as WorkflowTrigger["type"];
-                        const trigger: WorkflowTrigger =
-                          kind === "folderWatch"
-                            ? { type: "folderWatch", path: "/Inbox" }
-                            : kind === "schedule"
-                              ? { type: "schedule", intervalMinutes: 60 }
-                              : { type: "manual" };
-                        setEditing((prev) =>
-                          prev ? { ...prev, trigger } : prev,
-                        );
-                      }}
-                      className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                    >
-                      <option value="manual">Manual (Run button / MCP)</option>
-                      <option value="folderWatch">
-                        Folder Watch (Nextcloud folder changes)
-                      </option>
-                      <option value="schedule">
-                        Schedule (Periodic interval)
-                      </option>
-                    </select>
-                  </div>
-
-                  {editing.trigger.type === "folderWatch" && (
-                    <div className="space-y-1.5">
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                        Watched Folder Path
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={editing.trigger.path}
-                        onChange={(e) =>
-                          setEditing((prev) =>
-                            prev
-                              ? {
-                                  ...prev,
-                                  trigger: {
-                                    type: "folderWatch",
-                                    path: e.target.value,
-                                  },
-                                }
-                              : prev,
-                          )
-                        }
-                        placeholder="/Inbox"
-                        className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-xs dark:border-slate-700 dark:bg-slate-900"
-                      />
-                    </div>
-                  )}
-
-                  {editing.trigger.type === "schedule" && (
-                    <div className="space-y-1.5">
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                        Interval (minutes, 1–1440)
-                      </label>
-                      <input
-                        type="number"
-                        min={1}
-                        max={1440}
-                        required
-                        value={editing.trigger.intervalMinutes}
-                        onChange={(e) =>
-                          setEditing((prev) =>
-                            prev
-                              ? {
-                                  ...prev,
-                                  trigger: {
-                                    type: "schedule",
-                                    intervalMinutes: Math.max(
-                                      1,
-                                      Math.min(
-                                        1440,
-                                        Number(e.target.value) || 60,
-                                      ),
-                                    ),
-                                  },
-                                }
-                              : prev,
-                          )
-                        }
-                        className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-                      />
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Steps Builder */}
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                  <span className="text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
                     Steps ({editing.steps.length})
-                  </h3>
+                  </span>
                   <button
                     type="button"
                     onClick={() =>
@@ -983,70 +935,68 @@ export function AutomationsView({
                           : prev,
                       )
                     }
-                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    className="inline-flex h-6 items-center gap-1 rounded border border-[var(--border-strong)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   >
-                    <Plus className="h-3 w-3" />
-                    Add Step
+                    <Plus className="h-3 w-3" strokeWidth={1.5} />
+                    Add step
                   </button>
                 </div>
 
                 {editing.steps.map((step, idx) => (
                   <div
                     key={idx}
-                    className="space-y-3 rounded-xl border border-slate-200 p-3.5 dark:border-slate-800"
+                    className="space-y-2 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-3"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-100 text-[11px] font-bold text-blue-700 dark:bg-blue-950 dark:text-blue-300">
-                          {idx + 1}
-                        </span>
-                        <select
+                      <div className="w-44">
+                        <Select
+                          size="sm"
+                          ariaLabel="Step action"
                           value={step.type}
-                          onChange={(e) =>
+                          onChange={(val) =>
                             updateStep(
                               idx,
-                              defaultStep(
-                                e.target.value as WorkflowStep_Serialize["type"],
-                              ),
+                              defaultStep(val as WorkflowStep_Serialize["type"]),
                             )
                           }
-                          className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium dark:border-slate-700 dark:bg-slate-950"
-                        >
-                          <option value="createFolder">Create Folder</option>
-                          <option value="copyFile">Copy File</option>
-                          <option value="moveFile">Move / Rename File</option>
-                          <option value="writeMarkdown">Write Markdown</option>
-                          <option value="callMcpTool">
-                            Call External MCP Tool
-                          </option>
-                        </select>
+                          options={[
+                            { value: "createFolder", label: "Create Folder" },
+                            { value: "copyFile", label: "Copy File" },
+                            { value: "moveFile", label: "Move File" },
+                            { value: "writeMarkdown", label: "Write Markdown" },
+                            { value: "callMcpTool", label: "Call MCP Tool" },
+                          ]}
+                        />
                       </div>
-
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
+                      <div className="flex items-center gap-0.5">
+                        <IconButton
+                          size="xs"
+                          label="Move step up"
                           disabled={idx === 0}
                           onClick={() => moveStep(idx, -1)}
-                          className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
                         >
-                          <ArrowUp className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
+                          <ArrowUp className="h-3 w-3" strokeWidth={1.5} />
+                        </IconButton>
+                        <IconButton
+                          size="xs"
+                          label="Move step down"
                           disabled={idx === editing.steps.length - 1}
                           onClick={() => moveStep(idx, 1)}
-                          className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
                         >
-                          <ArrowDown className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          type="button"
+                          <ArrowDown className="h-3 w-3" strokeWidth={1.5} />
+                        </IconButton>
+                        <InlineDeleteConfirm
+                          armed={confirmDeleteStepIdx === idx}
+                          onArm={() => setConfirmDeleteStepIdx(idx)}
+                          onCancel={() => setConfirmDeleteStepIdx(null)}
+                          onConfirm={() => {
+                            setConfirmDeleteStepIdx(null);
+                            removeStep(idx);
+                          }}
+                          label={`Remove step ${idx + 1}`}
                           disabled={editing.steps.length <= 1}
-                          onClick={() => removeStep(idx)}
-                          className="rounded-lg p-1 text-rose-500 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-950/40"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          iconClassName="h-3 w-3"
+                        />
                       </div>
                     </div>
 
@@ -1054,6 +1004,7 @@ export function AutomationsView({
                       <input
                         type="text"
                         required
+                        aria-label={`Step ${idx + 1} folder path`}
                         value={step.path}
                         onChange={(e) =>
                           updateStep(idx, {
@@ -1061,170 +1012,118 @@ export function AutomationsView({
                             path: e.target.value,
                           })
                         }
-                        placeholder="/Projects/2026"
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                        className="mono-num h-7 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                       />
                     )}
-
                     {(step.type === "copyFile" || step.type === "moveFile") && (
                       <div className="grid gap-2 sm:grid-cols-2">
                         <input
                           type="text"
                           required
+                          aria-label={`Step ${idx + 1} source path`}
                           value={step.from}
                           onChange={(e) =>
                             updateStep(idx, { ...step, from: e.target.value })
                           }
-                          placeholder="Source path (/Inbox/a.pdf)"
-                          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                          className="mono-num h-7 rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                         />
                         <input
                           type="text"
                           required
+                          aria-label={`Step ${idx + 1} destination path`}
                           value={step.to}
                           onChange={(e) =>
                             updateStep(idx, { ...step, to: e.target.value })
                           }
-                          placeholder="Destination path (/Archive/a.pdf)"
-                          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                          className="mono-num h-7 rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                         />
                       </div>
                     )}
-
                     {step.type === "writeMarkdown" && (
-                      <div className="space-y-2">
+                      <div className="space-y-1.5">
                         <input
                           type="text"
                           required
+                          aria-label={`Step ${idx + 1} Markdown file path`}
                           value={step.path}
                           onChange={(e) =>
                             updateStep(idx, { ...step, path: e.target.value })
                           }
-                          placeholder="/Notes/report.md"
-                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                          className="mono-num h-7 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                         />
                         <textarea
-                          rows={3}
+                          rows={2}
+                          aria-label={`Step ${idx + 1} Markdown content`}
                           value={step.content}
                           onChange={(e) =>
-                            updateStep(idx, {
-                              ...step,
-                              content: e.target.value,
-                            })
+                            updateStep(idx, { ...step, content: e.target.value })
                           }
-                          placeholder="# Markdown content..."
-                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                          className="mono-num w-full rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] p-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                         />
-                        <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+                      </div>
+                    )}
+                    {step.type === "callMcpTool" && (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div className="flex gap-1">
+                          <div className="min-w-0 flex-1">
+                            <Select
+                              size="sm"
+                              ariaLabel="External MCP server"
+                              placeholder="Select server…"
+                              value={step.serverId}
+                              onChange={(val) =>
+                                updateStep(idx, { ...step, serverId: val })
+                              }
+                              options={externalServers.map((s) => ({
+                                value: s.id,
+                                label: s.name,
+                              }))}
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            disabled={
+                              !step.serverId ||
+                              discoveringServerId === step.serverId
+                            }
+                            onClick={() => void handleDiscoverTools(step.serverId)}
+                            className="inline-flex h-7 shrink-0 items-center gap-1 rounded border border-[var(--border-strong)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+                          >
+                            <Wrench className="h-3 w-3" strokeWidth={1.5} />
+                            Tools
+                          </button>
+                        </div>
+                        {toolsByServer[step.serverId]?.length ? (
+                          <Select
+                            size="sm"
+                            mono
+                            ariaLabel="External MCP tool"
+                            placeholder="Select tool…"
+                            value={step.toolName}
+                            onChange={(val) =>
+                              updateStep(idx, { ...step, toolName: val })
+                            }
+                            options={toolsByServer[step.serverId].map((t) => ({
+                              value: t.name,
+                              label: t.name,
+                            }))}
+                          />
+                        ) : (
                           <input
-                            type="checkbox"
-                            checked={step.createOnly}
+                            type="text"
+                            required
+                            aria-label={`Step ${idx + 1} MCP tool name`}
+                            value={step.toolName}
                             onChange={(e) =>
                               updateStep(idx, {
                                 ...step,
-                                createOnly: e.target.checked,
+                                toolName: e.target.value,
                               })
                             }
-                            className="h-3.5 w-3.5 rounded border-slate-300"
+                            placeholder="tool_name"
+                            className="mono-num h-7 rounded border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-2 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                           />
-                          Create only (fail if file already exists)
-                        </label>
-                      </div>
-                    )}
-
-                    {step.type === "callMcpTool" && (
-                      <div className="space-y-2">
-                        {externalServers.length === 0 ? (
-                          <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
-                            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                            Add an external MCP server in the{" "}
-                            <strong>MCP / AI</strong> tab first, or type its ID
-                            below.
-                          </p>
-                        ) : null}
-                        <div className="grid gap-2 sm:grid-cols-2">
-                          <div className="flex gap-1.5">
-                            <select
-                              value={step.serverId}
-                              onChange={(e) =>
-                                updateStep(idx, {
-                                  ...step,
-                                  serverId: e.target.value,
-                                })
-                              }
-                              className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-950"
-                            >
-                              <option value="">Select MCP server...</option>
-                              {externalServers.map((srv) => (
-                                <option key={srv.id} value={srv.id}>
-                                  {srv.name} ({srv.id})
-                                </option>
-                              ))}
-                            </select>
-                            <button
-                              type="button"
-                              disabled={
-                                !step.serverId ||
-                                discoveringServerId === step.serverId
-                              }
-                              onClick={() =>
-                                void handleDiscoverTools(step.serverId)
-                              }
-                              title="Discover tools on this MCP server"
-                              className="shrink-0 rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-medium hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:hover:bg-slate-800"
-                            >
-                              {discoveringServerId === step.serverId
-                                ? "..."
-                                : "Tools"}
-                            </button>
-                          </div>
-
-                          {toolsByServer[step.serverId]?.length ? (
-                            <select
-                              value={step.toolName}
-                              onChange={(e) =>
-                                updateStep(idx, {
-                                  ...step,
-                                  toolName: e.target.value,
-                                })
-                              }
-                              className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
-                            >
-                              <option value="">Select tool...</option>
-                              {toolsByServer[step.serverId].map((tool) => (
-                                <option key={tool.name} value={tool.name}>
-                                  {tool.name}
-                                </option>
-                              ))}
-                            </select>
-                          ) : (
-                            <input
-                              type="text"
-                              required
-                              value={step.toolName}
-                              onChange={(e) =>
-                                updateStep(idx, {
-                                  ...step,
-                                  toolName: e.target.value,
-                                })
-                              }
-                              placeholder="Tool name (e.g. files_list)"
-                              className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
-                            />
-                          )}
-                        </div>
-                        <textarea
-                          rows={2}
-                          value={step.argumentsJson}
-                          onChange={(e) =>
-                            updateStep(idx, {
-                              ...step,
-                              argumentsJson: e.target.value,
-                            })
-                          }
-                          placeholder='{"path": "/Projects"}'
-                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
-                        />
+                        )}
                       </div>
                     )}
                   </div>
@@ -1232,28 +1131,25 @@ export function AutomationsView({
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-3.5 dark:border-slate-800">
+            <div className="flex justify-end gap-2 border-t border-[var(--border-hairline)] px-4 py-3">
               <button
                 type="button"
-                onClick={() => setEditing(null)}
-                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                onClick={requestCloseEditor}
+                className="h-8 rounded-md border border-[var(--border-strong)] px-3 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={saving}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                className="h-8 rounded-md bg-[var(--accent)] px-3.5 text-xs font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
               >
-                {saving ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : null}
-                Save Workflow
+                {saving ? "Saving…" : "Save"}
               </button>
             </div>
           </form>
-        </div>
+        </Modal>
       )}
-    </div>
+    </WorkspaceLayout>
   );
 }

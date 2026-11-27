@@ -10,6 +10,12 @@ import {
   type TalkRoomsPage_Serialize,
 } from "../bindings/tauri";
 
+import {
+  PREVIEW_TALK_CAPS,
+  PREVIEW_TALK_MESSAGES,
+  PREVIEW_TALK_ROOMS,
+} from "./previewFixtures";
+
 function requireDesktop(action: string): never {
   throw {
     code: "browser_preview",
@@ -22,18 +28,7 @@ function requireDesktop(action: string): never {
 
 export async function getTalkCapabilities(): Promise<TalkCapabilities> {
   if (!isTauri()) {
-    return {
-      enabled: false,
-      features: [],
-      maxMessageLength: 32000,
-      attachmentsAllowed: false,
-      attachmentsFolder: "/Talk",
-      conversationSubfolders: false,
-      richObjectSharing: false,
-      reactionsSupported: false,
-      editMessagesSupported: false,
-      deleteMessagesSupported: false,
-    };
+    return PREVIEW_TALK_CAPS;
   }
   return commands.getTalkCapabilities();
 }
@@ -42,7 +37,7 @@ export async function listTalkRooms(
   modifiedSince: number | null = null,
 ): Promise<TalkRoomsPage_Serialize> {
   if (!isTauri()) {
-    return { rooms: [], modifiedBefore: null, fromCache: false };
+    return { rooms: PREVIEW_TALK_ROOMS, modifiedBefore: null, fromCache: false };
   }
   return commands.listTalkRooms(modifiedSince);
 }
@@ -73,9 +68,10 @@ export async function getTalkMessages(
   limit = 50,
 ): Promise<TalkMessagesPage_Serialize> {
   if (!isTauri()) {
+    const msgs = PREVIEW_TALK_MESSAGES[token] ?? [];
     return {
-      messages: [],
-      lastGiven: null,
+      messages: beforeMessageId ? [] : msgs,
+      lastGiven: msgs[msgs.length - 1]?.id ?? null,
       lastCommonRead: null,
       fromCache: false,
     };
@@ -149,8 +145,16 @@ export async function uploadTalkAttachmentBytes(
   );
 }
 
+const PREVIEW_TALK_DRAFT_PREFIX = "fr.preview.talkDraft.v1:";
+
 export async function getTalkDraft(token: string): Promise<string | null> {
-  if (!isTauri()) return null;
+  if (!isTauri()) {
+    try {
+      return window.localStorage.getItem(`${PREVIEW_TALK_DRAFT_PREFIX}${token}`);
+    } catch {
+      return null;
+    }
+  }
   return commands.getTalkDraft(token);
 }
 
@@ -158,7 +162,19 @@ export async function saveTalkDraft(
   token: string,
   text: string,
 ): Promise<void> {
-  if (!isTauri()) return;
+  if (!isTauri()) {
+    try {
+      const key = `${PREVIEW_TALK_DRAFT_PREFIX}${token}`;
+      if (text) {
+        window.localStorage.setItem(key, text);
+      } else {
+        window.localStorage.removeItem(key);
+      }
+    } catch {
+      // Ignore storage access errors in restricted previews.
+    }
+    return;
+  }
   await commands.saveTalkDraft(token, text);
 }
 

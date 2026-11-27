@@ -3,14 +3,125 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
+  --bg-app: #f3f4f6;
+  --bg-sidebar: #f7f8fa;
+  --bg-surface: #ffffff;
+  --bg-elevated: #e9ecf0;
+  --bg-hover: #e4e8ee;
+  --bg-active: #dfe3ea;
+  --bg-viewport: #e7eaef;
+  --bg-viewport-overlay: #ffffff;
+
+  --border-hairline: rgba(15, 17, 21, 0.09);
+  --border-subtle: rgba(15, 17, 21, 0.05);
+  --border-strong: rgba(15, 17, 21, 0.48);
+
+  --text-primary: #141518;
+  --text-secondary: #4a4e58;
+  --text-muted: #5f6470;
+
+  /* 3D Viewport scene tokens (cage >= 3.4:1 against both viewport and plate) */
+  --vp-plate: #cfd5e0;
+  --vp-grid: #adb5c4;
+  --vp-cage: #676f80;
+  --vp-front-edge: #5562cc;
+  --vp-mesh: #757e90;
+  --vp-mesh-selected: #5562cc;
+  --vp-mesh-oob: #cf222e;
+
+  --accent: #5562cc;
+  --accent-text: #4754bc;
+  --focus-ring: #4754bc;
+  --accent-hover: #4754bc;
+  --accent-soft: rgba(85, 98, 204, 0.12);
+  --accent-border: rgba(85, 98, 204, 0.34);
+  --accent-vector: #4754bc;
+
+  --chart-1: #5562cc;
+  --chart-2: #2e7d8a;
+  --chart-3: #4b5563;
+  --chart-4: #8a6d3b;
+  --chart-5: #7b5b7a;
+
+  --status-positive: #1f883d;
+  --status-positive-text: #136c2e;
+  --status-positive-fg: #ffffff;
+  --status-positive-soft: rgba(31, 136, 61, 0.1);
+  --status-warning: #9a6700;
+  --status-warning-text: #7d5300;
+  --status-warning-fg: #ffffff;
+  --status-warning-soft: rgba(154, 103, 0, 0.1);
+  --status-danger: #cf222e;
+  --status-danger-text: #b61d28;
+  --status-danger-fg: #ffffff;
+  --status-danger-soft: rgba(207, 34, 46, 0.1);
+
   font-family:
+    "Inter Variable",
     "Inter",
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
     Roboto,
     sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+.dark {
+  color-scheme: dark;
+  --bg-app: #0e0f12;
+  --bg-sidebar: #121317;
+  --bg-surface: #16181d;
+  --bg-elevated: #1c1e25;
+  --bg-hover: #22252e;
+  --bg-active: #282c36;
+  --bg-viewport: #111216;
+  --bg-viewport-overlay: #16181d;
+
+  --border-hairline: rgba(255, 255, 255, 0.08);
+  --border-subtle: rgba(255, 255, 255, 0.045);
+  --border-strong: rgba(255, 255, 255, 0.36);
+
+  --text-primary: #eceef2;
+  --text-secondary: #a4a9b5;
+  --text-muted: #8e94a3;
+
+  /* 3D Viewport scene tokens (cage >= 3.4:1 against both viewport and plate) */
+  --vp-plate: #212530;
+  --vp-grid: #373c4a;
+  --vp-cage: #71788c;
+  --vp-front-edge: #6e78a8;
+  --vp-mesh: #9aa0ae;
+  --vp-mesh-selected: #636ec9;
+  --vp-mesh-oob: #e5534b;
+
+  --accent: #5e6ad2;
+  --accent-text: #8b96f0;
+  --focus-ring: #8b96f0;
+  --accent-hover: #525ec7;
+  --accent-soft: rgba(94, 106, 210, 0.14);
+  --accent-border: rgba(94, 106, 210, 0.38);
+  --accent-vector: #9aa7ff;
+
+  --chart-1: #5e6ad2;
+  --chart-2: #5b9aa6;
+  --chart-3: #8e96aa;
+  --chart-4: #a8906a;
+  --chart-5: #9d7b9b;
+
+  --status-positive: #3fb950;
+  --status-positive-text: #3fb950;
+  --status-positive-fg: #0e0f12;
+  --status-positive-soft: rgba(63, 185, 80, 0.12);
+  --status-warning: #d29922;
+  --status-warning-text: #d29922;
+  --status-warning-fg: #0e0f12;
+  --status-warning-soft: rgba(210, 153, 34, 0.12);
+  --status-danger: #e5534b;
+  --status-danger-text: #f06a63;
+  --status-danger-fg: #0e0f12;
+  --status-danger-soft: rgba(229, 83, 75, 0.12);
 }
 
 html,
@@ -18,65 +129,161 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  overflow: hidden;
 }
 
+.mono-num {
+  font-family:
+    "JetBrains Mono",
+    "SF Mono",
+    "Cascadia Code",
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Quiet minimal scrollbars (pure ::-webkit-scrollbar avoids Windows native arrow buttons) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Strip native Chromium/Firefox numeric spinner chrome for clean flat inputs */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* Custom flat hairline range slider (zero native Chromium thumb) */
+.fr-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  outline: none;
+  cursor: pointer;
+}
+
+.fr-slider:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.fr-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--accent);
+  border: 1px solid var(--bg-viewport-overlay);
+  cursor: pointer;
+}
+
+.fr-slider::-moz-range-thumb {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--accent);
+  border: 1px solid var(--bg-viewport-overlay);
+  cursor: pointer;
+}
+
+/* Neutral transparency checkerboard */
 .fr-checkerboard {
-  background-color: #f1f5f9;
+  background-color: #eceef2;
   background-image:
-    linear-gradient(45deg, #cbd5e1 25%, transparent 25%),
-    linear-gradient(-45deg, #cbd5e1 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #cbd5e1 75%),
-    linear-gradient(-45deg, transparent 75%, #cbd5e1 75%);
-  background-size: 20px 20px;
+    linear-gradient(45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(-45deg, #dfe3ea 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #dfe3ea 75%),
+    linear-gradient(-45deg, transparent 75%, #dfe3ea 75%);
+  background-size: 16px 16px;
   background-position:
     0 0,
-    0 10px,
-    10px -10px,
-    -10px 0;
+    0 8px,
+    8px -8px,
+    -8px 0;
 }
 
 .dark .fr-checkerboard {
-  background-color: #0f172a;
+  background-color: #13151a;
   background-image:
-    linear-gradient(45deg, #1e293b 25%, transparent 25%),
-    linear-gradient(-45deg, #1e293b 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #1e293b 75%),
-    linear-gradient(-45deg, transparent 75%, #1e293b 75%);
+    linear-gradient(45deg, #1b1e25 25%, transparent 25%),
+    linear-gradient(-45deg, #1b1e25 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #1b1e25 75%),
+    linear-gradient(-45deg, transparent 75%, #1b1e25 75%);
 }
 
+/* Markdown editor prose */
 .fr-prose .ProseMirror {
   outline: none;
-  min-height: 360px;
-  font-size: 0.9375rem;
-  line-height: 1.7;
+  min-height: 320px;
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  color: var(--text-primary);
 }
 
 .fr-prose .ProseMirror h1 {
-  font-size: 1.5rem;
-  font-weight: 700;
-  margin: 1rem 0 0.5rem;
+  font-size: 1.1875rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 0.85rem 0 0.45rem;
 }
 
 .fr-prose .ProseMirror h2 {
-  font-size: 1.25rem;
+  font-size: 1rem;
   font-weight: 600;
-  margin: 0.9rem 0 0.4rem;
+  letter-spacing: -0.01em;
+  margin: 0.75rem 0 0.35rem;
 }
 
 .fr-prose .ProseMirror p {
-  margin: 0.5rem 0;
+  margin: 0.45rem 0;
 }
 
 .fr-prose .ProseMirror ul {
   list-style: disc;
-  padding-left: 1.5rem;
-  margin: 0.5rem 0;
+  padding-left: 1.35rem;
+  margin: 0.45rem 0;
 }
 
 .fr-prose .ProseMirror ol {
   list-style: decimal;
-  padding-left: 1.5rem;
-  margin: 0.5rem 0;
+  padding-left: 1.35rem;
+  margin: 0.45rem 0;
 }
 
 .fr-prose .ProseMirror ul[data-type="taskList"] {
@@ -90,35 +297,127 @@ body,
   gap: 0.5rem;
 }
 
+.fr-prose .ProseMirror ul[data-type="taskList"] input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 0.2rem;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.fr-prose .ProseMirror ul[data-type="taskList"] input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.fr-prose .ProseMirror ul[data-type="taskList"] input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #ffffff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
 .fr-prose .ProseMirror blockquote {
-  border-left: 3px solid #3b82f6;
+  border-left: 2px solid var(--accent);
   padding-left: 0.875rem;
-  color: #64748b;
-  margin: 0.75rem 0;
+  color: var(--text-secondary);
+  margin: 0.65rem 0;
 }
 
 .fr-prose .ProseMirror pre {
-  background: #0f172a;
-  color: #e2e8f0;
-  padding: 0.75rem 1rem;
-  border-radius: 0.5rem;
+  background: var(--bg-app);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-primary);
+  padding: 0.75rem 0.875rem;
+  border-radius: 6px;
   overflow-x: auto;
-  font-size: 0.8125rem;
+  font-size: 0.78rem;
+  font-family:
+    "JetBrains Mono",
+    "SF Mono",
+    ui-monospace,
+    monospace;
+}
+
+.fr-prose .ProseMirror code {
+  font-family:
+    "JetBrains Mono",
+    "SF Mono",
+    ui-monospace,
+    monospace;
+  font-size: 0.82em;
+  background: var(--bg-elevated);
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+}
+
+.fr-prose .ProseMirror pre code {
+  background: transparent;
+  padding: 0;
 }
 
 .fr-prose .ProseMirror table {
   border-collapse: collapse;
   width: 100%;
-  margin: 0.75rem 0;
+  margin: 0.65rem 0;
+  font-size: 0.75rem;
 }
 
 .fr-prose .ProseMirror th,
 .fr-prose .ProseMirror td {
-  border: 1px solid #cbd5e1;
-  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border-hairline);
+  padding: 0.25rem 0.5rem;
 }
 
-.dark .fr-prose .ProseMirror th,
-.dark .fr-prose .ProseMirror td {
-  border-color: #334155;
+.fr-prose .ProseMirror th {
+  background: var(--bg-elevated);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+/* Unified accent focus ring across all interactive controls (>= 5:1 in both themes).
+   Higher specificity + !important ensures Tailwind focus:outline-none never hides keyboard focus. */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+tr:focus-visible,
+article:focus-visible,
+[tabindex="0"]:focus-visible,
+[contenteditable="true"]:focus-visible,
+[role="button"]:focus-visible,
+[role="combobox"]:focus-visible,
+[role="menuitem"]:focus-visible,
+[role="radio"]:focus-visible,
+[role="switch"]:focus-visible,
+[role="separator"]:focus-visible {
+  outline: 1.5px solid var(--focus-ring) !important;
+  outline-offset: 1px !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *:not(.animate-spin),
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-spin {
+    animation-duration: 3s !important;
+  }
 }

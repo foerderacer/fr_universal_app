@@ -9,6 +9,12 @@ import {
   type WorkspaceOverview_Serialize,
 } from "../bindings/tauri";
 
+import {
+  getPreviewFilePayload,
+  getPreviewMarkdownDoc,
+  PREVIEW_FILES_BY_DIR,
+} from "./previewFixtures";
+
 function requireDesktop(action: string): never {
   throw {
     code: "browser_preview",
@@ -20,7 +26,9 @@ function requireDesktop(action: string): never {
 }
 
 export async function listFiles(path: string): Promise<FileItemView_Serialize[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) {
+    return PREVIEW_FILES_BY_DIR[path] ?? [];
+  }
   return commands.listFiles(path);
 }
 
@@ -28,7 +36,16 @@ export async function searchFiles(
   path: string,
   query: string,
 ): Promise<FileItemView_Serialize[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) {
+    const q = query.trim().toLowerCase();
+    return Object.values(PREVIEW_FILES_BY_DIR)
+      .flat()
+      .filter(
+        (it) =>
+          it.entry.path.startsWith(path === "/" ? "/" : path) &&
+          it.entry.name.toLowerCase().includes(q),
+      );
+  }
   return commands.searchFiles(path, query);
 }
 
@@ -75,7 +92,7 @@ export async function createMarkdownFile(
 export async function readMarkdownFile(
   path: string,
 ): Promise<MarkdownDocument_Serialize> {
-  if (!isTauri()) requireDesktop("Editing Markdown");
+  if (!isTauri()) return getPreviewMarkdownDoc(path);
   return commands.readMarkdownFile(path);
 }
 
@@ -114,7 +131,7 @@ export async function discardMarkdownDraft(path: string): Promise<void> {
 export async function getFilePreview(
   path: string,
 ): Promise<FilePreviewPayload_Serialize> {
-  if (!isTauri()) requireDesktop("Previewing files");
+  if (!isTauri()) return getPreviewFilePayload(path);
   return commands.getFilePreview(path);
 }
 

@@ -1,12 +1,15 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  CheckCircle2,
+  ArrowUp,
+  Check,
   ChevronRight,
+  Copy,
   ExternalLink,
   File as FileIcon,
   Folder,
   FolderOpen,
+  Hash,
   Home,
   Loader2,
   MessageSquare,
@@ -16,11 +19,9 @@ import {
   RefreshCw,
   Reply,
   Search,
-  Send,
   Star,
-  Trash2,
   Upload,
-  Users,
+  User,
   WifiOff,
   X,
 } from "lucide-react";
@@ -37,6 +38,20 @@ import type {
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { FilePreviewPane } from "../components/files/FilePreviewPane";
+import { NoticeBanner } from "../components/shell/NoticeBanner";
+import { WorkspaceLayout } from "../components/shell/WorkspaceLayout";
+import { InlineDeleteConfirm } from "../components/ui/InlineDeleteConfirm";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { IconButton, Kbd, Tooltip } from "../components/ui/Tooltip";
+import { formatIsoDate, formatTime24h } from "../lib/dateFormat";
+import {
+  areSingleKeyShortcutsEnabled,
+  handleToolbarKeyDown,
+  hasActiveOverlay,
+  isEditableTarget,
+  useSingleKeyShortcutsEnabled,
+} from "../lib/shortcuts";
 import { listFiles } from "../lib/filesClient";
 import {
   createTalkRoom,
@@ -65,6 +80,12 @@ import {
 interface TalkViewProps {
   isNextcloudConnected: boolean;
   currentActorId: string | null;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+  inspectorOpen: boolean;
+  onToggleInspector: () => void;
+  onSetInspectorOpen: (open: boolean) => void;
+  banners?: React.ReactNode;
 }
 
 interface TalkMessagesEventPayload {
@@ -73,7 +94,7 @@ interface TalkMessagesEventPayload {
   lastGiven: number | null;
 }
 
-const QUICK_REACTIONS = ["👍", "❤️", "🎉", "👀"];
+const QUICK_REACTIONS = ["👍", "❤️", "👀"];
 const MAX_TALK_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 function inferPreviewKind(name: string): PreviewKind {
@@ -110,16 +131,64 @@ function mergeMessages(
 }
 
 function formatMessageTime(ts: number | null): string {
-  if (!ts) return "";
-  return new Date(ts * 1000).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return formatTime24h(ts);
+}
+
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+}
+
+/** Renders clean inline code (`...`) and fenced code blocks without HTML injection. */
+function FormattedMessageBody({ text }: { text: string }) {
+  const blocks = text.split(/(```[\s\S]*?```)/g);
+  return (
+    <div className="space-y-1.5 text-[13px] leading-relaxed break-words text-[var(--text-primary)]">
+      {blocks.map((block, idx) => {
+        if (block.startsWith("```") && block.endsWith("```")) {
+          const inner = block.slice(3, -3).replace(/^[a-zA-Z0-9_-]+\n/, "");
+          return (
+            <pre
+              key={idx}
+              className="mono-num overflow-x-auto rounded-md border border-[var(--border-hairline)] bg-[var(--bg-app)] p-2.5 text-[11px] leading-relaxed text-[var(--text-primary)]"
+            >
+              <code>{inner}</code>
+            </pre>
+          );
+        }
+        const parts = block.split(/(`[^`\n]+`)/g);
+        return (
+          <p key={idx} className="whitespace-pre-wrap">
+            {parts.map((part, pIdx) =>
+              part.startsWith("`") && part.endsWith("`") ? (
+                <code
+                  key={pIdx}
+                  className="mono-num rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1 py-0.5 text-[11px] text-[var(--text-primary)]"
+                >
+                  {part.slice(1, -1)}
+                </code>
+              ) : (
+                <span key={pIdx}>{part}</span>
+              ),
+            )}
+          </p>
+        );
+      })}
+    </div>
+  );
 }
 
 export function TalkView({
   isNextcloudConnected,
   currentActorId,
+  sidebarOpen,
+  onToggleSidebar,
+  inspectorOpen,
+  onToggleInspector,
+  onSetInspectorOpen,
+  banners,
 }: TalkViewProps) {
   const [capabilities, setCapabilities] = useState<TalkCapabilities | null>(
     null,
@@ -128,6 +197,8 @@ export function TalkView({
   const [roomsFromCache, setRoomsFromCache] = useState(false);
   const [loadingRooms, setLoadingRooms] = useState(true);
   const [roomSearch, setRoomSearch] = useState("");
+  const [messageFilter, setMessageFilter] = useState("");
+  const [showMessageFilter, setShowMessageFilter] = useState(false);
 
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
   const [messages, setMessages] = useState<TalkMessage_Serialize[]>([]);
@@ -135,6 +206,11 @@ export function TalkView({
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlder, setHasOlder] = useState(true);
+  const [copiedMsgId, setCopiedMsgId] = useState<number | null>(null);
+  const [confirmDeleteMsgId, setConfirmDeleteMsgId] = useState<number | null>(
+    null,
+  );
+  const [unreadBoundaryId, setUnreadBoundaryId] = useState<number | null>(null);
 
   const [composerText, setComposerText] = useState("");
   const [replyTo, setReplyTo] = useState<TalkMessage_Serialize | null>(null);
@@ -142,7 +218,6 @@ export function TalkView({
     null,
   );
   const [sending, setSending] = useState(false);
-  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
 
   const [showNewRoomModal, setShowNewRoomModal] = useState(false);
@@ -151,7 +226,7 @@ export function TalkView({
   const [newRoomInvite, setNewRoomInvite] = useState("");
   const [creatingRoom, setCreatingRoom] = useState(false);
 
-  // Flow A2: inline Nextcloud file picker for zero-copy file-ID references
+  // Zero-copy Nextcloud file picker
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [pickerPath, setPickerPath] = useState("/");
   const [pickerItems, setPickerItems] = useState<FileItemView_Serialize[]>([]);
@@ -160,7 +235,7 @@ export function TalkView({
     null,
   );
 
-  // Flow C: open clicked file reference directly inside our FilePreviewPane
+  // Inline FilePreviewPane in right drawer
   const [previewItem, setPreviewItem] = useState<FileItemView_Serialize | null>(
     null,
   );
@@ -174,7 +249,10 @@ export function TalkView({
   const [error, setError] = useState<UserFacingError | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const singleKeyEnabled = useSingleKeyShortcutsEnabled();
+  const [focusedMsgKey, setFocusedMsgKey] = useState<string | null>(null);
   const draftTimersRef = useRef<Map<string, number>>(new Map());
   const pendingDraftsRef = useRef<Map<string, string>>(new Map());
   const userTypedInRoomRef = useRef<Set<string>>(new Set());
@@ -185,6 +263,8 @@ export function TalkView({
   previewFileRefRef.current = previewFileRef;
   const selectedTokenRef = useRef<string | null>(null);
   selectedTokenRef.current = selectedToken;
+  const roomsRef = useRef<TalkRoom_Serialize[]>([]);
+  roomsRef.current = rooms;
 
   const selectedRoom = useMemo(
     () => rooms.find((r) => r.token === selectedToken) ?? null,
@@ -245,7 +325,6 @@ export function TalkView({
     }
   }, []);
 
-  // Flush any queued drafts on unmount so edits are never silently lost.
   useEffect(() => {
     const pendingDrafts = pendingDraftsRef.current;
     return () => {
@@ -255,18 +334,99 @@ export function TalkView({
     };
   }, [flushDraft]);
 
-  // Dismiss modals with Escape key.
+  const filteredRoomsRef = useRef<TalkRoom_Serialize[]>([]);
+  const roomSearchRef = useRef<HTMLInputElement | null>(null);
+
   useEffect(() => {
-    if (!showFilePicker && !showNewRoomModal) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (showFilePicker || showNewRoomModal || hasActiveOverlay()) {
+        return;
+      }
       if (e.key === "Escape") {
-        setShowFilePicker(false);
-        setShowNewRoomModal(false);
+        if (e.defaultPrevented || document.querySelector('[role="tooltip"]')) {
+          return;
+        }
+        if (editingMsg) {
+          e.preventDefault();
+          setEditingMsg(null);
+          return;
+        }
+        if (replyTo) {
+          e.preventDefault();
+          setReplyTo(null);
+          return;
+        }
+        if (showMessageFilter) {
+          e.preventDefault();
+          setShowMessageFilter(false);
+          setMessageFilter("");
+          return;
+        }
+      }
+      const inInput = isEditableTarget(e.target);
+      if (
+        areSingleKeyShortcutsEnabled() &&
+        e.key === "/" &&
+        !inInput &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
+        e.preventDefault();
+        roomSearchRef.current?.focus();
+        return;
+      }
+      if (
+        !e.defaultPrevented &&
+        (e.key === "ArrowDown" || e.key === "ArrowUp") &&
+        !inInput &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.ctrlKey
+      ) {
+        // Strict allow-list: only switch rooms when focus is in the sidebar or on page body
+        const activeEl = document.activeElement;
+        const inSidebarOrBody =
+          activeEl === document.body ||
+          (activeEl instanceof HTMLElement &&
+            Boolean(activeEl.closest('[aria-label="Module sidebar"]')));
+        if (!inSidebarOrBody) {
+          return;
+        }
+        const list = filteredRoomsRef.current;
+        if (list.length === 0) return;
+        e.preventDefault();
+        const curIdx = selectedToken
+          ? list.findIndex((r) => r.token === selectedToken)
+          : -1;
+        const nextIdx =
+          e.key === "ArrowDown"
+            ? curIdx < 0
+              ? 0
+              : Math.min(list.length - 1, curIdx + 1)
+            : curIdx <= 0
+              ? 0
+              : curIdx - 1;
+        const nextToken = list[nextIdx].token;
+        setSelectedToken(nextToken);
+        const btn = document.querySelector<HTMLElement>(
+          `button[data-room-token="${CSS.escape(nextToken)}"]`,
+        );
+        btn?.focus({ preventScroll: false });
+        btn?.scrollIntoView({ block: "nearest" });
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showFilePicker, showNewRoomModal]);
+  }, [
+    showFilePicker,
+    showNewRoomModal,
+    selectedToken,
+    confirmDeleteMsgId,
+    editingMsg,
+    replyTo,
+    showMessageFilter,
+  ]);
 
   const loadRoomsAndCaps = useCallback(async () => {
     if (!isNextcloudConnected) {
@@ -310,14 +470,12 @@ export function TalkView({
   }, [isNextcloudConnected]);
 
   useEffect(() => {
-    // Re-sync rooms whenever connection state or the signed-in Nextcloud account changes.
     if (currentActorId === null && !isNextcloudConnected) {
       setSelectedToken(null);
     }
     void loadRoomsAndCaps();
   }, [loadRoomsAndCaps, currentActorId, isNextcloudConnected]);
 
-  // Listen to Rust long-poll message push events.
   useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
@@ -345,7 +503,6 @@ export function TalkView({
     };
   }, []);
 
-  // Load selected room history, restore draft, and start Rust long-poll ONLY for this room.
   useEffect(() => {
     if (!isNextcloudConnected || !selectedToken) {
       void stopTalkPolling().catch(() => {});
@@ -364,7 +521,6 @@ export function TalkView({
     setAccessDeniedFile(null);
     setReplyTo(null);
     setEditingMsg(null);
-    setAttachMenuOpen(false);
     setHasOlder(true);
     setComposerText(pendingDraftsRef.current.get(token) ?? "");
 
@@ -374,6 +530,16 @@ export function TalkView({
     ])
       .then(async ([page, draft]) => {
         if (cancelled || selectedTokenRef.current !== token) return;
+        const roomMeta = roomsRef.current.find((r) => r.token === token);
+        const boundary =
+          roomMeta &&
+          roomMeta.unreadMessages > 0 &&
+          roomMeta.lastReadMessage !== null &&
+          roomMeta.lastReadMessage > 0
+            ? roomMeta.lastReadMessage
+            : null;
+        setUnreadBoundaryId(boundary);
+        setConfirmDeleteMsgId(null);
         setMessages(page.messages);
         setMessagesFromCache(page.fromCache);
         setHasOlder(page.messages.length >= 50);
@@ -395,7 +561,11 @@ export function TalkView({
             ),
           );
         }
-        if (!page.fromCache && !cancelled && selectedTokenRef.current === token) {
+        if (
+          !page.fromCache &&
+          !cancelled &&
+          selectedTokenRef.current === token
+        ) {
           await startTalkPolling(token, maxId > 0 ? maxId : null).catch(
             () => {},
           );
@@ -419,8 +589,6 @@ export function TalkView({
     };
   }, [isNextcloudConnected, selectedToken, flushDraft]);
 
-  // Auto-scroll to bottom only on initial room load or when newer messages arrive,
-  // never when prepending older history via "Load older messages".
   useEffect(() => {
     if (lastScrolledTokenRef.current !== selectedToken) {
       lastScrolledTokenRef.current = selectedToken;
@@ -438,11 +606,15 @@ export function TalkView({
     }
     if (newestId > lastMessageIdRef.current) {
       lastMessageIdRef.current = newestId;
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      const reduceMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+      ).matches;
+      messagesEndRef.current?.scrollIntoView({
+        behavior: reduceMotion ? "auto" : "smooth",
+      });
     }
   }, [messages, selectedToken]);
 
-  // Per-room debounced local draft save so switching rooms never cancels or loses edits.
   function handleComposerChange(next: string) {
     setComposerText(next);
     const token = selectedToken;
@@ -499,8 +671,6 @@ export function TalkView({
     const currentEditing = editingMsg;
     const currentReplyTo = replyTo;
     if (!currentEditing) {
-      // Pause timer while sending so it cannot race with server-side draft clearing,
-      // while keeping pendingDraftsRef populated in case sending fails and the user switches rooms.
       pauseDraftTimer(token);
       pendingDraftsRef.current.set(token, trimmed);
     }
@@ -623,7 +793,6 @@ export function TalkView({
     }
   }
 
-  // Flow A2: browse Nextcloud files to reference without copying
   const loadPickerFolder = useCallback(async (path: string) => {
     setLoadingPicker(true);
     setError(null);
@@ -639,7 +808,6 @@ export function TalkView({
   }, []);
 
   async function handleOpenFilePicker() {
-    setAttachMenuOpen(false);
     setShowFilePicker(true);
     await loadPickerFolder("/");
   }
@@ -654,7 +822,7 @@ export function TalkView({
       if (selectedTokenRef.current !== token) return;
       setMessages((prev) => mergeMessages(prev, [shared]));
       setShowFilePicker(false);
-      flashNotice(`Referenced "${item.entry.name}" in chat (zero file copies).`);
+      flashNotice(`Referenced "${item.entry.name}" (zero copies).`);
     } catch (err) {
       if (selectedTokenRef.current === token) {
         setError(toUserFacingError(err));
@@ -664,7 +832,6 @@ export function TalkView({
     }
   }
 
-  // Flow B: upload a new file once to the Talk attachments folder and attach
   async function handleFileUploadSelected(
     event: React.ChangeEvent<HTMLInputElement>,
   ) {
@@ -673,14 +840,13 @@ export function TalkView({
     const room = selectedRoom;
     if (!file || !room) return;
     const token = room.token;
-    setAttachMenuOpen(false);
     if (file.size > MAX_TALK_UPLOAD_BYTES) {
       setError({
         code: "invalid_input",
         title: "File is too large for Talk chat",
-        message: `"${file.name}" is ${formatBytes(file.size)}, which exceeds the 50 MiB chat attachment limit.`,
+        message: `"${file.name}" (${formatBytes(file.size)}) exceeds the 50 MiB limit.`,
         recoveryHint:
-          "Upload larger files in Nextcloud Files first, then use 'Reference from Nextcloud Files' to link them with zero copies.",
+          "Upload larger files in Files first, then reference them here with zero copies.",
         technicalDetails: null,
       });
       return;
@@ -709,9 +875,9 @@ export function TalkView({
     }
   }
 
-  // Flow C: open clicked file reference directly in our Files preview pane
   function handleOpenFileReference(fileRef: TalkFileReference_Serialize) {
     setAccessDeniedFile(null);
+    onSetInspectorOpen(true);
     if (!fileRef.path) {
       setAccessDeniedFile(fileRef);
       return;
@@ -734,6 +900,15 @@ export function TalkView({
     });
   }
 
+  async function handleCopyMessage(msg: TalkMessage_Serialize) {
+    if (!navigator.clipboard) return;
+    await navigator.clipboard.writeText(msg.message).catch(() => {});
+    setCopiedMsgId(msg.id);
+    window.setTimeout(() => {
+      setCopiedMsgId((prev) => (prev === msg.id ? null : prev));
+    }, 1800);
+  }
+
   const filteredRooms = useMemo(() => {
     const q = roomSearch.trim().toLowerCase();
     if (!q) return rooms;
@@ -744,296 +919,554 @@ export function TalkView({
     );
   }, [rooms, roomSearch]);
 
+  const favoriteRooms = useMemo(() => {
+    filteredRoomsRef.current = filteredRooms;
+    return filteredRooms.filter((r) => r.isFavorite);
+  }, [filteredRooms]);
+  const regularRooms = useMemo(
+    () => filteredRooms.filter((r) => !r.isFavorite),
+    [filteredRooms],
+  );
+
+  const visibleMessages = useMemo(() => {
+    const q = messageFilter.trim().toLowerCase();
+    if (!q) return messages;
+    return messages.filter(
+      (m) =>
+        m.message.toLowerCase().includes(q) ||
+        m.actorDisplayName.toLowerCase().includes(q) ||
+        (m.fileReference?.name.toLowerCase().includes(q) ?? false),
+    );
+  }, [messages, messageFilter]);
+
+  const sharedFilesInRoom = useMemo(
+    () =>
+      messages
+        .map((m) => m.fileReference)
+        .filter((f): f is TalkFileReference_Serialize => Boolean(f)),
+    [messages],
+  );
+
   if (!isNextcloudConnected) {
     return (
-      <div className="mx-auto max-w-xl rounded-2xl border border-slate-200 bg-white p-10 text-center shadow-xs dark:border-slate-800 dark:bg-slate-900">
-        <MessageSquare className="mx-auto h-10 w-10 text-blue-500" />
-        <h2 className="mt-3 text-base font-semibold text-slate-900 dark:text-slate-100">
-          Sign in to Nextcloud to open Talk
-        </h2>
-        <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
-          FR Universal App connects directly to your team&apos;s Nextcloud Talk
-          conversations and lets you reference cloud files without copying them.
-        </p>
-      </div>
+      <WorkspaceLayout
+        moduleId="talk"
+        headerLeft={
+          <h1 className="text-[13px] font-medium text-[var(--text-primary)]">
+            Chat
+          </h1>
+        }
+        sidebarOpen={false}
+        onToggleSidebar={onToggleSidebar}
+        inspectorOpen={false}
+        banners={banners}
+      >
+        <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
+          <MessageSquare
+            className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+            strokeWidth={1.5}
+          />
+          <p className="text-xs font-medium text-[var(--text-primary)]">
+            Sign in to Nextcloud to open Chat
+          </p>
+          <p className="mt-1 max-w-sm text-[11px] text-[var(--text-muted)]">
+            Connect directly to Nextcloud Talk conversations with linked cloud
+            files.
+          </p>
+        </div>
+      </WorkspaceLayout>
     );
   }
 
   if (capabilities && !capabilities.enabled) {
     return (
-      <div className="mx-auto max-w-xl rounded-2xl border border-slate-200 bg-white p-10 text-center shadow-xs dark:border-slate-800 dark:bg-slate-900">
-        <MessageSquare className="mx-auto h-10 w-10 text-slate-400" />
-        <h2 className="mt-3 text-base font-semibold text-slate-900 dark:text-slate-100">
-          Nextcloud Talk isn&apos;t enabled on this server
-        </h2>
-        <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
-          Ask your Nextcloud administrator to enable the official{" "}
-          <strong>Nextcloud Talk (spreed)</strong> app, then click refresh.
-        </p>
-        <button
-          type="button"
-          onClick={() => void loadRoomsAndCaps()}
-          className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-          Check again
-        </button>
-      </div>
+      <WorkspaceLayout
+        moduleId="talk"
+        headerLeft={
+          <h1 className="text-[13px] font-medium text-[var(--text-primary)]">
+            Chat
+          </h1>
+        }
+        sidebarOpen={false}
+        onToggleSidebar={onToggleSidebar}
+        inspectorOpen={false}
+        banners={banners}
+      >
+        <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
+          <MessageSquare
+            className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+            strokeWidth={1.5}
+          />
+          <p className="text-xs font-medium text-[var(--text-primary)]">
+            Nextcloud Talk is not enabled on this server
+          </p>
+          <p className="mt-1 max-w-sm text-[11px] text-[var(--text-muted)]">
+            Enable the Nextcloud Talk (spreed) app, then refresh.
+          </p>
+          <button
+            type="button"
+            onClick={() => void loadRoomsAndCaps()}
+            className="mt-3 inline-flex h-7 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white hover:bg-[var(--accent-hover)]"
+          >
+            <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.5} />
+            Check again
+          </button>
+        </div>
+      </WorkspaceLayout>
     );
   }
 
-  return (
-    <div className="mx-auto flex h-[calc(100vh-8.5rem)] max-w-7xl flex-col gap-3">
-      {error && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
-      {notice && (
-        <div className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-medium text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300">
-          <span className="flex items-center gap-2">
-            <CheckCircle2 className="h-4 w-4 shrink-0" />
-            {notice}
-          </span>
-          <button
-            type="button"
-            onClick={() => setNotice(null)}
-            className="hover:underline"
+  const renderRoomRow = (room: TalkRoom_Serialize) => {
+    const active = room.token === selectedToken;
+    const isDm = room.roomType === "oneToOne";
+    return (
+      <div
+        key={room.token}
+        role="listitem"
+        className={`group relative flex items-center justify-between gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+          active
+            ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+            : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        }`}
+      >
+        {active && (
+          <span
+            aria-hidden="true"
+            className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+          />
+        )}
+        <button
+          type="button"
+          data-room-token={room.token}
+          aria-current={active ? "page" : undefined}
+          tabIndex={
+            active ||
+            (!selectedToken && filteredRoomsRef.current[0]?.token === room.token)
+              ? 0
+              : -1
+          }
+          onClick={() => setSelectedToken(room.token)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+              const list = filteredRoomsRef.current;
+              const idx = list.findIndex((r) => r.token === room.token);
+              if (idx === -1) return;
+              const nextIdx =
+                e.key === "ArrowDown"
+                  ? Math.min(list.length - 1, idx + 1)
+                  : Math.max(0, idx - 1);
+              if (nextIdx !== idx) {
+                e.preventDefault();
+                const nextToken = list[nextIdx].token;
+                setSelectedToken(nextToken);
+                const btn = document.querySelector<HTMLElement>(
+                  `button[data-room-token="${CSS.escape(nextToken)}"]`,
+                );
+                btn?.focus({ preventScroll: false });
+                btn?.scrollIntoView({ block: "nearest" });
+              }
+            }
+          }}
+          className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
+        >
+          {isDm ? (
+            <User
+              className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+              strokeWidth={1.5}
+            />
+          ) : (
+            <Hash
+              className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+              strokeWidth={1.5}
+            />
+          )}
+          <span className="truncate">{room.displayName}</span>
+        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {room.unreadMessages > 0 && (
+            <span className="mono-num inline-flex items-center gap-1 text-[11px] leading-none font-medium text-[var(--accent-text)]">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+              {room.unreadMessages}
+            </span>
+          )}
+          <IconButton
+            size="xs"
+            side="right"
+            tabIndex={active ? 0 : -1}
+            label={room.isFavorite ? "Unpin room" : "Pin room"}
+            onClick={() => void handleToggleFavorite(room)}
+            className={`!h-5 !w-5 transition-opacity focus-visible:opacity-100 ${
+              room.isFavorite
+                ? "text-[var(--accent-text)] opacity-85 hover:opacity-100"
+                : "text-[var(--text-muted)] opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 hover:text-[var(--text-primary)]"
+            }`}
           >
-            Dismiss
-          </button>
+            <Star
+              className={`h-3 w-3 ${room.isFavorite ? "fill-current" : ""}`}
+              strokeWidth={1.5}
+            />
+          </IconButton>
+        </div>
+      </div>
+    );
+  };
+
+  const sidebarNode = (
+    <div className="flex h-full flex-col">
+      {/* Compact Sidebar Search + New Room */}
+      <div className="flex items-center gap-1 border-b border-[var(--border-hairline)] p-2">
+        <div className="relative min-w-0 flex-1">
+          <Search
+            className="pointer-events-none absolute top-1/2 left-2 h-3 w-3 -translate-y-1/2 text-[var(--text-muted)]"
+            strokeWidth={1.5}
+          />
+          <input
+            ref={roomSearchRef}
+            type="text"
+            aria-label="Filter rooms"
+            value={roomSearch}
+            onChange={(e) => setRoomSearch(e.target.value)}
+            placeholder="Filter rooms…"
+            className="h-7 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] pr-6 pl-6 text-[11px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+          />
+          {!roomSearch && singleKeyEnabled && (
+            <Kbd className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2">
+              /
+            </Kbd>
+          )}
+        </div>
+        <IconButton
+          size="xs"
+          label="New conversation"
+          onClick={() => setShowNewRoomModal(true)}
+        >
+          <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
+        </IconButton>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-2.5">
+        {loadingRooms ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="py-8 text-center text-[11px] text-[var(--text-muted)]"
+          >
+            Loading rooms…
+          </div>
+        ) : filteredRooms.length === 0 ? (
+          <div className="py-8 text-center text-[11px] text-[var(--text-muted)]">
+            No conversations found.
+          </div>
+        ) : (
+          <>
+            {favoriteRooms.length > 0 && (
+              <div>
+                <h2 className="mb-1 px-2 text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                  Pinned
+                </h2>
+                <div role="list" aria-label="Pinned rooms" className="space-y-0.5">
+                  {favoriteRooms.map(renderRoomRow)}
+                </div>
+              </div>
+            )}
+            {regularRooms.length > 0 && (
+              <div>
+                <h2 className="mb-1 px-2 text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                  Conversations
+                </h2>
+                <div role="list" aria-label="Conversations" className="space-y-0.5">
+                  {regularRooms.map(renderRoomRow)}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {roomsFromCache && (
+        <div className="flex items-center gap-1.5 border-t border-[var(--border-hairline)] px-3 py-1.5 text-[11px] text-[var(--status-warning-text)]">
+          <WifiOff className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+          <span>Offline cached rooms</span>
         </div>
       )}
+      <div className="mono-num flex h-8 shrink-0 items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <span>{rooms.length} rooms</span>
+        <span>
+          {rooms.reduce((acc, r) => acc + r.unreadMessages, 0)} unread
+        </span>
+      </div>
+    </div>
+  );
 
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden">
-        {/* Left: Conversation List */}
-        <aside className="flex w-72 shrink-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs dark:border-slate-800 dark:bg-slate-900">
-          <div className="flex items-center justify-between border-b border-slate-200 px-3.5 py-3 dark:border-slate-800">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                Conversations
-              </span>
-              {roomsFromCache && (
-                <span
-                  title="Showing cached conversations while offline"
-                  className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-950/60 dark:text-amber-300"
-                >
-                  <WifiOff className="h-3 w-3" />
-                  Offline
+  const inspectorNode = previewItem ? (
+    <FilePreviewPane
+      item={previewItem}
+      expanded={previewExpanded}
+      onToggleExpand={() => setPreviewExpanded((prev) => !prev)}
+      onClose={() => {
+        setPreviewItem(null);
+        setPreviewFileRef(null);
+        setPreviewExpanded(false);
+      }}
+      onRefreshFolder={() => {}}
+      onPreviewError={handlePreviewError}
+    />
+  ) : (
+    <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--border-hairline)] px-3">
+        <span className="text-xs font-medium text-[var(--text-primary)]">
+          Room Details
+        </span>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3.5 text-xs">
+        {selectedRoom ? (
+          <>
+            <div>
+              <p className="font-medium text-[var(--text-primary)]">
+                {selectedRoom.displayName}
+              </p>
+              {selectedRoom.description && (
+                <p className="mt-1 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  {selectedRoom.description}
+                </p>
+              )}
+            </div>
+
+            <div className="border-t border-[var(--border-hairline)] pt-3">
+              <p className="mb-2 text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                Referenced Cloud Files
+              </p>
+              {sharedFilesInRoom.length === 0 ? (
+                <p className="text-[11px] text-[var(--text-muted)]">
+                  No files referenced in this conversation yet.
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  {sharedFilesInRoom.map((f) => (
+                    <button
+                      key={`${f.fileId}-${f.name}`}
+                      type="button"
+                      onClick={() => handleOpenFileReference(f)}
+                      className="flex w-full items-center gap-2 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 text-left transition-colors hover:bg-[var(--bg-elevated)]"
+                    >
+                      <FileIcon
+                        className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]"
+                        strokeWidth={1.5}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[11px] font-medium text-[var(--text-primary)]">
+                          {f.name}
+                        </p>
+                        <p className="mono-num truncate text-[11px] text-[var(--text-muted)]">
+                          {f.size ? formatBytes(f.size) : f.path ?? "Cloud file"}
+                        </p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          <p className="text-[11px] text-[var(--text-muted)]">
+            Select a conversation to inspect shared files.
+          </p>
+        )}
+      </div>
+
+      <div className="mono-num flex h-8 shrink-0 items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <span className="truncate">
+          {selectedRoom ? selectedRoom.displayName : "Chat"}
+        </span>
+        <span>{sharedFilesInRoom.length} files</span>
+      </div>
+    </div>
+  );
+
+  return (
+    <WorkspaceLayout
+      moduleId="talk"
+      headerLeft={
+        <div className="flex min-w-0 items-center gap-2">
+          {selectedRoom ? (
+            <>
+              <h1 className="sr-only">Chat</h1>
+              {selectedRoom.roomType === "oneToOne" ? (
+                <User
+                  className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+                  strokeWidth={1.5}
+                />
+              ) : (
+                <Hash
+                  className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+                  strokeWidth={1.5}
+                />
+              )}
+              <h2 className="truncate text-[13px] font-medium text-[var(--text-primary)]">
+                {selectedRoom.displayName}
+              </h2>
+              {selectedRoom.description && (
+                <span className="hidden truncate text-xs text-[var(--text-muted)] md:inline">
+                  · {selectedRoom.description}
                 </span>
               )}
-            </div>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => void loadRoomsAndCaps()}
-                disabled={loadingRooms}
-                title="Refresh conversations"
-                className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${loadingRooms ? "animate-spin" : ""}`}
-                />
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowNewRoomModal(true)}
-                title="New conversation"
-                className="rounded-lg bg-blue-600 p-1.5 text-white hover:bg-blue-700"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-
-          <div className="border-b border-slate-100 p-2.5 dark:border-slate-800">
-            <div className="relative">
-              <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={roomSearch}
-                onChange={(e) => setRoomSearch(e.target.value)}
-                placeholder="Filter chats..."
-                className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pr-2.5 pl-8 text-xs dark:border-slate-700 dark:bg-slate-950"
-              />
-            </div>
-          </div>
-
-          <div className="flex-1 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800/70">
-            {loadingRooms ? (
-              <div className="p-6 text-center text-xs text-slate-400">
-                Loading conversations...
-              </div>
-            ) : filteredRooms.length === 0 ? (
-              <div className="p-6 text-center text-xs text-slate-400">
-                No conversations found.
-              </div>
-            ) : (
-              filteredRooms.map((room) => {
-                const active = room.token === selectedToken;
-                return (
-                  <div
-                    key={room.token}
-                    onClick={() => setSelectedToken(room.token)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        setSelectedToken(room.token);
-                      }
-                    }}
-                    className={`flex cursor-pointer items-start gap-2.5 px-3.5 py-3 transition-colors ${
-                      active
-                        ? "bg-blue-50/90 dark:bg-blue-950/40"
-                        : "hover:bg-slate-50 dark:hover:bg-slate-800/60"
-                    }`}
-                  >
-                    <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                      {room.roomType === "group" ||
-                      room.roomType === "public" ? (
-                        <Users className="h-4 w-4" />
-                      ) : (
-                        <MessageSquare className="h-4 w-4" />
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-1.5">
-                        <p className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
-                          {room.displayName}
-                        </p>
-                        <div className="flex shrink-0 items-center gap-1">
-                          {room.unreadMessages > 0 && (
-                            <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                              {room.unreadMessages}
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void handleToggleFavorite(room);
-                            }}
-                            title={
-                              room.isFavorite
-                                ? "Remove favorite"
-                                : "Pin favorite"
-                            }
-                            className="text-slate-400 hover:text-amber-500"
-                          >
-                            <Star
-                              className={`h-3.5 w-3.5 ${
-                                room.isFavorite
-                                  ? "fill-amber-400 text-amber-400"
-                                  : ""
-                              }`}
-                            />
-                          </button>
-                        </div>
-                      </div>
-                      {room.lastMessagePreview && (
-                        <p className="mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400">
-                          {room.lastMessageActor
-                            ? `${room.lastMessageActor}: `
-                            : ""}
-                          {room.lastMessagePreview}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </aside>
-
-        {/* Center: Message Timeline & Composer */}
-        <section className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs dark:border-slate-800 dark:bg-slate-900">
-          {!selectedRoom ? (
-            <div className="flex flex-1 flex-col items-center justify-center p-8 text-center text-xs text-slate-400">
-              <MessageSquare className="h-9 w-9 text-slate-300 dark:text-slate-700" />
-              <p className="mt-2">Select a conversation to start chatting.</p>
-            </div>
+              {messagesFromCache && (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded border border-[var(--status-warning)]/35 bg-[var(--status-warning-soft)] px-1.5 py-0.5 text-[10px] text-[var(--status-warning-text)]">
+                  <WifiOff className="h-2.5 w-2.5" strokeWidth={1.5} />
+                  Cached
+                </span>
+              )}
+            </>
           ) : (
-            <>
-              {/* Room Header */}
-              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-                <div className="min-w-0">
-                  <h2 className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
-                    {selectedRoom.displayName}
-                  </h2>
-                  {selectedRoom.description && (
-                    <p className="truncate text-[11px] text-slate-500 dark:text-slate-400">
-                      {selectedRoom.description}
-                    </p>
-                  )}
-                </div>
-                {messagesFromCache && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-medium text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
-                    <WifiOff className="h-3 w-3" />
-                    Cached history
-                  </span>
-                )}
-              </div>
+            <h1 className="text-[13px] font-medium text-[var(--text-primary)]">
+              Chat
+            </h1>
+          )}
+        </div>
+      }
+      headerRight={
+        <div className="flex items-center gap-1">
+          {showMessageFilter && (
+            <input
+              type="text"
+              autoFocus
+              aria-label="Filter messages in room"
+              value={messageFilter}
+              onChange={(e) => setMessageFilter(e.target.value)}
+              placeholder="Filter messages…"
+              className="h-7 w-40 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+          )}
+          <div
+            role="toolbar"
+            aria-label="Chat actions"
+            onKeyDown={handleToolbarKeyDown}
+            className="flex items-center gap-1"
+          >
+          <IconButton
+            label="Filter messages in room"
+            active={showMessageFilter}
+            onClick={() => {
+              setShowMessageFilter((v) => {
+                if (v) setMessageFilter("");
+                return !v;
+              });
+            }}
+          >
+            <Search className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <IconButton
+            label="Refresh conversations"
+            disabled={loadingRooms}
+            onClick={() => void loadRoomsAndCaps()}
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 ${loadingRooms ? "animate-spin" : ""}`}
+              strokeWidth={1.5}
+            />
+          </IconButton>
+          </div>
+        </div>
+      }
+      sidebar={sidebarNode}
+      sidebarOpen={sidebarOpen}
+      onToggleSidebar={onToggleSidebar}
+      inspector={inspectorNode}
+      inspectorOpen={inspectorOpen}
+      onToggleInspector={onToggleInspector}
+      inspectorExpanded={Boolean(previewItem && previewExpanded)}
+      banners={banners}
+    >
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {error && (
+          <div className="border-b border-[var(--border-hairline)] p-2.5">
+            <ErrorBanner error={error} onDismiss={() => setError(null)} />
+          </div>
+        )}
 
-              {/* Access-denied notice when recipient clicks a file reference they lack permission for */}
-              {accessDeniedFile && (
-                <div className="border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-                  <div className="flex items-center justify-between gap-2">
-                    <span>
-                      <strong>{accessDeniedFile.name}</strong> couldn&apos;t be
-                      opened directly in Files — your Nextcloud account may not
-                      have access to its folder.
-                    </span>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {accessDeniedFile.link && (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            void openExternalUrl(accessDeniedFile.link!)
-                          }
-                          className="inline-flex items-center gap-1 font-semibold underline"
-                        >
-                          Open in Nextcloud
-                          <ExternalLink className="h-3 w-3" />
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => setAccessDeniedFile(null)}
-                        className="rounded p-0.5 hover:bg-amber-200/50"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  </div>
+        {notice && (
+          <NoticeBanner message={notice} onDismiss={() => setNotice(null)} />
+        )}
+
+        {accessDeniedFile && (
+          <div className="flex items-center justify-between gap-2 border-b border-[var(--status-warning)]/35 bg-[var(--status-warning-soft)] px-4 py-2 text-xs text-[var(--text-primary)]">
+            <span>
+              <strong>{accessDeniedFile.name}</strong> couldn&apos;t be opened in
+              Files — your account may lack folder permission.
+            </span>
+            <div className="flex shrink-0 items-center gap-2">
+              {accessDeniedFile.link && (
+                <button
+                  type="button"
+                  onClick={() => void openExternalUrl(accessDeniedFile.link!)}
+                  className="inline-flex items-center gap-1 font-medium text-[var(--accent-text)] hover:underline"
+                >
+                  Open in Nextcloud
+                  <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
+                </button>
+              )}
+              <IconButton
+                size="xs"
+                label="Dismiss"
+                onClick={() => setAccessDeniedFile(null)}
+              >
+                <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
+            </div>
+          </div>
+        )}
+
+        {!selectedRoom ? (
+          <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
+            <MessageSquare
+              className="mb-2 h-7 w-7 text-[var(--text-muted)] opacity-50"
+              strokeWidth={1.5}
+            />
+            <p className="text-xs text-[var(--text-muted)]">
+              Select a conversation to start messaging.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Flat Structured Linear/T3-Inspired Message Stream (ZERO chat bubbles) */}
+            <div className="min-h-0 flex-1 overflow-y-auto py-3">
+              {hasOlder && messages.length > 0 && !messagesFromCache && (
+                <div className="mb-3 text-center">
+                  <button
+                    type="button"
+                    disabled={loadingOlder}
+                    onClick={() => void handleLoadOlder()}
+                    className="rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-3 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                  >
+                    {loadingOlder ? "Loading older…" : "Load older messages"}
+                  </button>
                 </div>
               )}
 
-              {/* Message Feed */}
-              <div className="flex-1 space-y-3 overflow-y-auto p-4">
-                {hasOlder && messages.length > 0 && !messagesFromCache && (
-                  <div className="text-center">
-                    <button
-                      type="button"
-                      disabled={loadingOlder}
-                      onClick={() => void handleLoadOlder()}
-                      className="rounded-lg border border-slate-200 px-3 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-                    >
-                      {loadingOlder
-                        ? "Loading older messages..."
-                        : "Load older messages"}
-                    </button>
-                  </div>
-                )}
-
-                {loadingMessages ? (
-                  <div className="flex items-center justify-center gap-2 py-12 text-xs text-slate-400">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Loading messages...
-                  </div>
-                ) : messages.length === 0 ? (
-                  <p className="py-12 text-center text-xs text-slate-400">
-                    No messages yet. Say hello or click <strong>+</strong> to
-                    reference a Nextcloud file.
-                  </p>
-                ) : (
-                  messages.map((msg) => {
+              {loadingMessages ? (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center justify-center gap-2 py-12 text-xs text-[var(--text-muted)]"
+                >
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+                  Loading messages…
+                </div>
+              ) : visibleMessages.length === 0 ? (
+                <p className="py-12 text-center text-xs text-[var(--text-muted)]">
+                  No messages yet. Start the thread or reference a Nextcloud
+                  file below.
+                </p>
+              ) : (
+                <div
+                  role="log"
+                  aria-label="Chat messages"
+                  aria-live="polite"
+                  aria-relevant="additions"
+                  className="divide-y divide-[var(--border-subtle)]/60"
+                >
+                  {visibleMessages.map((msg, idx) => {
                     const isMine =
                       Boolean(currentActorId) &&
                       msg.actorId === currentActorId;
@@ -1042,44 +1475,130 @@ export function TalkView({
                       return (
                         <div
                           key={msg.id ?? msg.referenceId}
-                          className="text-center text-[11px] text-slate-400"
+                          className="mono-num px-5 py-1.5 text-[11px] text-[var(--text-muted)]"
                         >
-                          {msg.actorDisplayName} · {msg.message}
+                          {formatMessageTime(msg.timestamp)} ·{" "}
+                          {msg.actorDisplayName} {msg.message}
                         </div>
                       );
                     }
 
-                    return (
-                      <div
-                        key={msg.id ?? msg.referenceId}
-                        className={`group flex flex-col ${isMine ? "items-end" : "items-start"}`}
-                      >
-                        <div className="mb-0.5 flex items-center gap-2 px-1 text-[11px] text-slate-400">
-                          <span className="font-medium text-slate-600 dark:text-slate-300">
-                            {msg.actorDisplayName}
-                          </span>
-                          <span>{formatMessageTime(msg.timestamp)}</span>
-                        </div>
+                    const prev = idx > 0 ? visibleMessages[idx - 1] : null;
+                    const msgDay = msg.timestamp
+                      ? formatIsoDate(new Date(msg.timestamp * 1000))
+                      : null;
+                    const prevDay = prev?.timestamp
+                      ? formatIsoDate(new Date(prev.timestamp * 1000))
+                      : null;
+                    const showDateDivider = Boolean(msgDay && msgDay !== prevDay);
+                    const showUnreadDivider =
+                      unreadBoundaryId !== null &&
+                      msg.id !== null &&
+                      msg.id > unreadBoundaryId &&
+                      (prev === null ||
+                        prev.id === null ||
+                        prev.id <= unreadBoundaryId);
+                    const groupedWithPrev =
+                      !showDateDivider &&
+                      !showUnreadDivider &&
+                      Boolean(prev) &&
+                      prev?.messageType !== "system" &&
+                      prev?.actorId === msg.actorId &&
+                      Math.abs((msg.timestamp ?? 0) - (prev?.timestamp ?? 0)) <
+                        300;
 
-                        <div
-                          className={`max-w-[82%] rounded-2xl px-3.5 py-2.5 text-xs shadow-2xs ${
-                            isMine
-                              ? "bg-blue-600 text-white"
-                              : "border border-slate-200 bg-slate-50 text-slate-900 dark:border-slate-800 dark:bg-slate-950/70 dark:text-slate-100"
+                    return (
+                      <div key={msg.id ?? msg.referenceId}>
+                        {showDateDivider && msgDay && (
+                          <div className="flex items-center gap-2.5 px-5 py-1.5">
+                            <span
+                              aria-hidden="true"
+                              className="h-px flex-1 bg-[var(--border-hairline)]"
+                            />
+                            <span className="mono-num text-[10px] font-medium text-[var(--text-muted)]">
+                              {msgDay}
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className="h-px flex-1 bg-[var(--border-hairline)]"
+                            />
+                          </div>
+                        )}
+                        {showUnreadDivider && (
+                          <div className="flex items-center gap-2.5 px-5 py-1.5">
+                            <span
+                              aria-hidden="true"
+                              className="h-px flex-1 bg-[var(--accent-border)]"
+                            />
+                            <span className="text-[10px] font-medium tracking-wider text-[var(--accent-text)] uppercase">
+                              New messages
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className="h-px flex-1 bg-[var(--accent-border)]"
+                            />
+                          </div>
+                        )}
+                        <article
+                          tabIndex={
+                            (focusedMsgKey
+                              ? focusedMsgKey ===
+                                String(msg.id ?? msg.referenceId)
+                              : idx === visibleMessages.length - 1)
+                              ? 0
+                              : -1
+                          }
+                          onFocus={() =>
+                            setFocusedMsgKey(String(msg.id ?? msg.referenceId))
+                          }
+                          className={`group relative flex gap-3 px-5 transition-colors hover:bg-[var(--bg-hover)]/70 ${
+                            groupedWithPrev ? "py-1" : "py-2.5"
                           }`}
                         >
-                          {msg.parent && (
+                        {/* Left Column: Monochrome Monogram or Compact Timestamp */}
+                        <div className="w-6 shrink-0 pt-0.5">
+                          {groupedWithPrev ? (
+                            <span className="mono-num text-[11px] text-[var(--text-muted)] opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
+                              {formatMessageTime(msg.timestamp)}
+                            </span>
+                          ) : (
                             <div
-                              className={`mb-1.5 rounded-lg border-l-2 px-2 py-1 text-[11px] ${
+                              className={`mono-num flex h-6 w-6 items-center justify-center rounded border text-[10px] font-medium ${
                                 isMine
-                                  ? "border-blue-300 bg-blue-700/60 text-blue-100"
-                                  : "border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400"
+                                  ? "border-[var(--accent-border)] bg-[var(--accent-soft)] text-[var(--accent-text)]"
+                                  : "border-[var(--border-hairline)] bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
                               }`}
                             >
-                              <span className="font-semibold">
-                                {msg.parent.actorDisplayName}:
+                              {initialsOf(msg.actorDisplayName)}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Message Body */}
+                        <div className="min-w-0 flex-1">
+                          {!groupedWithPrev && (
+                            <div className="mb-0.5 flex items-baseline gap-2">
+                              <span className="text-xs font-medium text-[var(--text-primary)]">
+                                {msg.actorDisplayName}
+                              </span>
+                              {isMine && (
+                                <span className="text-[11px] text-[var(--text-muted)]">
+                                  you
+                                </span>
+                              )}
+                              <span className="mono-num text-[11px] text-[var(--text-muted)]">
+                                {formatMessageTime(msg.timestamp)}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Reply Quote */}
+                          {msg.parent && (
+                            <div className="mb-1.5 border-l-2 border-[var(--border-strong)] pl-2.5 text-[11px] text-[var(--text-muted)]">
+                              <span className="font-medium text-[var(--text-secondary)]">
+                                {msg.parent.actorDisplayName}
                               </span>{" "}
-                              <span className="line-clamp-2">
+                              <span className="line-clamp-1">
                                 {msg.parent.deleted
                                   ? "Message deleted"
                                   : msg.parent.message}
@@ -1088,332 +1607,335 @@ export function TalkView({
                           )}
 
                           {msg.deleted ? (
-                            <p className="italic opacity-75">Message deleted</p>
+                            <p className="text-xs italic text-[var(--text-muted)]">
+                              Message deleted
+                            </p>
                           ) : (
                             <>
+                              {(!msg.fileReference ||
+                                msg.message !== msg.fileReference.name) && (
+                                <FormattedMessageBody text={msg.message} />
+                              )}
+
+                              {/* Zero-Copy Cloud File Reference Card */}
                               {msg.fileReference && (
                                 <button
                                   type="button"
                                   onClick={() =>
                                     handleOpenFileReference(msg.fileReference!)
                                   }
-                                  className={`mb-1.5 flex w-full items-center gap-2.5 rounded-xl border p-2.5 text-left transition-colors ${
-                                    isMine
-                                      ? "border-blue-400/50 bg-blue-700/60 text-white hover:bg-blue-700"
-                                      : "border-slate-200 bg-white text-slate-900 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
-                                  }`}
+                                  className="mt-1.5 flex w-full max-w-md items-center gap-2.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-sidebar)] px-3 py-2 text-left transition-colors hover:bg-[var(--bg-elevated)]"
                                 >
-                                  <FileIcon className="h-5 w-5 shrink-0 opacity-80" />
+                                  <FileIcon
+                                    className="h-4 w-4 shrink-0 text-[var(--accent)]"
+                                    strokeWidth={1.5}
+                                  />
                                   <div className="min-w-0 flex-1">
-                                    <p className="truncate font-semibold">
+                                    <p className="truncate text-xs font-medium text-[var(--text-primary)]">
                                       {msg.fileReference.name}
                                     </p>
-                                    <p className="truncate text-[10px] opacity-80">
+                                    <p className="mono-num truncate text-[11px] text-[var(--text-muted)]">
                                       {msg.fileReference.path ??
-                                        `Cloud file #${msg.fileReference.fileId}`}
+                                        `#${msg.fileReference.fileId}`}
                                       {msg.fileReference.size
                                         ? ` · ${formatBytes(msg.fileReference.size)}`
                                         : ""}
                                     </p>
                                   </div>
-                                  <span className="shrink-0 rounded-md bg-black/10 px-2 py-0.5 text-[10px] font-semibold">
+                                  <span className="shrink-0 rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
                                     Preview
                                   </span>
                                 </button>
                               )}
 
-                              {(!msg.fileReference ||
-                                msg.message !== msg.fileReference.name) && (
-                                <p className="break-words whitespace-pre-wrap">
-                                  {msg.message}
-                                </p>
+                              {/* Existing Reactions */}
+                              {Object.keys(msg.reactions).length > 0 && (
+                                <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                                  {Object.entries(msg.reactions).map(
+                                    ([emoji, count]) => (
+                                      <button
+                                        key={emoji}
+                                        type="button"
+                                        aria-pressed={msg.reactionsSelf.includes(
+                                          emoji,
+                                        )}
+                                        disabled={
+                                          !capabilities?.reactionsSupported
+                                        }
+                                        onClick={() =>
+                                          void handleToggleReaction(msg, emoji)
+                                        }
+                                        className={`mono-num inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] transition-colors ${
+                                          msg.reactionsSelf.includes(emoji)
+                                            ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--text-primary)]"
+                                            : "border-[var(--border-strong)] bg-[var(--bg-sidebar)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                                        }`}
+                                      >
+                                        <span>{emoji}</span>
+                                        <span>{count}</span>
+                                      </button>
+                                    ),
+                                  )}
+                                </div>
                               )}
                             </>
                           )}
                         </div>
 
-                        {/* Reactions + Hover Actions */}
-                        {!msg.deleted && (
-                          <div className="mt-1 flex flex-wrap items-center gap-1 px-1">
-                            {Object.entries(msg.reactions).map(
-                              ([emoji, count]) => (
-                                <button
-                                  key={emoji}
-                                  type="button"
-                                  disabled={!capabilities?.reactionsSupported}
-                                  onClick={() =>
-                                    void handleToggleReaction(msg, emoji)
-                                  }
-                                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] ${
-                                    msg.reactionsSelf.includes(emoji)
-                                      ? "border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-950/60 dark:text-blue-300"
-                                      : "border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-                                  }`}
-                                >
-                                  <span>{emoji}</span>
-                                  <span>{count}</span>
-                                </button>
-                              ),
-                            )}
-
-                            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                              {capabilities?.reactionsSupported &&
-                                QUICK_REACTIONS.map((emoji) => (
+                        {/* Subtle Hover- & Focus-Revealed Icon Action Bar (solid hairline, no blur) */}
+                        {!msg.deleted && (() => {
+                          const msgTabStop = focusedMsgKey
+                            ? focusedMsgKey === String(msg.id ?? msg.referenceId)
+                            : idx === visibleMessages.length - 1;
+                          const actionTabIndex = msgTabStop ? 0 : -1;
+                          return (
+                          <div className="pointer-events-none absolute top-1.5 right-4 flex items-center gap-0.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] p-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+                            {capabilities?.reactionsSupported &&
+                              QUICK_REACTIONS.map((emoji) => (
+                                <Tooltip key={emoji} label={`React ${emoji}`}>
                                   <button
-                                    key={emoji}
                                     type="button"
+                                    tabIndex={actionTabIndex}
+                                    aria-label={`React ${emoji}`}
                                     onClick={() =>
                                       void handleToggleReaction(msg, emoji)
                                     }
-                                    className="rounded px-1 text-[11px] hover:bg-slate-100 dark:hover:bg-slate-800"
+                                    className="flex h-6 w-6 items-center justify-center rounded text-[11px] hover:bg-[var(--bg-hover)]"
                                   >
                                     {emoji}
                                   </button>
-                                ))}
-                              {msg.isReplyable && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setEditingMsg(null);
-                                    setReplyTo(msg);
-                                  }}
-                                  title="Reply"
-                                  className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
-                                >
-                                  <Reply className="h-3 w-3" />
-                                </button>
+                                </Tooltip>
+                              ))}
+                            <IconButton
+                              size="xs"
+                              tabIndex={actionTabIndex}
+                              label="Copy message"
+                              onClick={() => void handleCopyMessage(msg)}
+                            >
+                              {copiedMsgId === msg.id ? (
+                                <Check
+                                  className="h-3 w-3 text-[var(--status-positive-text)]"
+                                  strokeWidth={1.5}
+                                />
+                              ) : (
+                                <Copy className="h-3 w-3" strokeWidth={1.5} />
                               )}
-                              {isMine &&
-                                capabilities?.editMessagesSupported &&
-                                !msg.fileReference && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setReplyTo(null);
-                                      setEditingMsg(msg);
-                                      setComposerText(msg.message);
-                                    }}
-                                    title="Edit message"
-                                    className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800"
-                                  >
-                                    <Pencil className="h-3 w-3" />
-                                  </button>
-                                )}
-                              {isMine &&
-                                capabilities?.deleteMessagesSupported && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      void handleDeleteMessage(msg)
-                                    }
-                                    title="Delete message"
-                                    className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/40"
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </button>
-                                )}
-                            </div>
+                            </IconButton>
+                            {msg.isReplyable && (
+                              <IconButton
+                                size="xs"
+                                tabIndex={actionTabIndex}
+                                label="Reply"
+                                onClick={() => {
+                                  setEditingMsg(null);
+                                  setReplyTo(msg);
+                                  requestAnimationFrame(() =>
+                                    composerRef.current?.focus(),
+                                  );
+                                }}
+                              >
+                                <Reply className="h-3 w-3" strokeWidth={1.5} />
+                              </IconButton>
+                            )}
+                            {isMine &&
+                              capabilities?.editMessagesSupported &&
+                              !msg.fileReference && (
+                                <IconButton
+                                  size="xs"
+                                  tabIndex={actionTabIndex}
+                                  label="Edit message"
+                                  onClick={() => {
+                                    setReplyTo(null);
+                                    setEditingMsg(msg);
+                                    setComposerText(msg.message);
+                                    requestAnimationFrame(() =>
+                                      composerRef.current?.focus(),
+                                    );
+                                  }}
+                                >
+                                  <Pencil className="h-3 w-3" strokeWidth={1.5} />
+                                </IconButton>
+                              )}
+                            {isMine &&
+                              capabilities?.deleteMessagesSupported &&
+                              msg.id !== null && (
+                                <InlineDeleteConfirm
+                                  armed={confirmDeleteMsgId === msg.id}
+                                  tabIndex={actionTabIndex}
+                                  onArm={() => setConfirmDeleteMsgId(msg.id)}
+                                  onCancel={() => setConfirmDeleteMsgId(null)}
+                                  onConfirm={() => {
+                                    setConfirmDeleteMsgId(null);
+                                    void handleDeleteMessage(msg);
+                                  }}
+                                  label="Delete message"
+                                  iconClassName="h-3 w-3"
+                                />
+                              )}
                           </div>
-                        )}
+                          );
+                        })()}
+                        </article>
                       </div>
                     );
-                  })
+                  })}
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Compact Anchored Composer Bar (icon-only toggles) */}
+            {!selectedRoom.readOnly && (
+              <form
+                onSubmit={handleSendSubmit}
+                className="shrink-0 border-t border-[var(--border-hairline)] bg-[var(--bg-surface)] px-4 py-2.5"
+              >
+                {(replyTo || editingMsg) && (
+                  <div className="mb-2 flex items-center justify-between rounded-md border border-[var(--border-hairline)] bg-[var(--bg-sidebar)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)]">
+                    <span className="truncate">
+                      {editingMsg
+                        ? "Editing message"
+                        : `Replying to ${replyTo?.actorDisplayName}: "${replyTo?.message}"`}
+                    </span>
+                    <IconButton
+                      size="xs"
+                      label="Cancel reply/edit"
+                      onClick={() => {
+                        setReplyTo(null);
+                        setEditingMsg(null);
+                      }}
+                    >
+                      <X className="h-3 w-3" strokeWidth={1.5} />
+                    </IconButton>
+                  </div>
                 )}
-                <div ref={messagesEndRef} />
-              </div>
 
-              {/* Composer */}
-              {!selectedRoom.readOnly && (
-                <form
-                  onSubmit={handleSendSubmit}
-                  className="relative border-t border-slate-200 p-3 dark:border-slate-800"
-                >
-                  {(replyTo || editingMsg) && (
-                    <div className="mb-2 flex items-center justify-between rounded-lg bg-slate-100 px-3 py-1.5 text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                      <span className="truncate">
-                        {editingMsg
-                          ? "Editing your message"
-                          : `Replying to ${replyTo?.actorDisplayName}: "${replyTo?.message}"`}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setReplyTo(null);
-                          setEditingMsg(null);
-                        }}
-                        className="ml-2 text-slate-400 hover:text-slate-700"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
+                <input
+                  ref={uploadInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={(e) => void handleFileUploadSelected(e)}
+                />
+
+                <div className="flex items-end gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-elevated)] px-2 py-1.5 focus-within:border-[var(--accent)]">
+                  {capabilities?.richObjectSharing && (
+                    <IconButton
+                      size="xs"
+                      label="Reference Nextcloud file (zero copy)"
+                      onClick={() => void handleOpenFilePicker()}
+                    >
+                      <Paperclip className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    </IconButton>
                   )}
-
-                  {/* "+" Attachment Popover Menu */}
-                  {attachMenuOpen && (
-                    <div className="absolute bottom-16 left-3 z-20 w-72 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg dark:border-slate-700 dark:bg-slate-900">
-                      {capabilities?.richObjectSharing && (
-                        <button
-                          type="button"
-                          onClick={() => void handleOpenFilePicker()}
-                          className="flex w-full items-start gap-2.5 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          <FolderOpen className="mt-0.5 h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-                          <div>
-                            <p className="font-semibold text-slate-900 dark:text-slate-100">
-                              Reference from Nextcloud Files
-                            </p>
-                            <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                              Link an existing cloud file — zero copies made.
-                            </p>
-                          </div>
-                        </button>
-                      )}
-                      {capabilities?.attachmentsAllowed && (
-                        <button
-                          type="button"
-                          onClick={() => uploadInputRef.current?.click()}
-                          className="flex w-full items-start gap-2.5 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          <Upload className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                          <div>
-                            <p className="font-semibold text-slate-900 dark:text-slate-100">
-                              Upload &amp; attach new file
-                            </p>
-                            <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                              Stores once in{" "}
-                              <code>{capabilities.attachmentsFolder}</code>.
-                            </p>
-                          </div>
-                        </button>
-                      )}
-                      {!capabilities?.richObjectSharing &&
-                        !capabilities?.attachmentsAllowed && (
-                          <p className="px-3 py-2 text-[11px] text-slate-500">
-                            File attachments are disabled on this Nextcloud
-                            server.
-                          </p>
-                        )}
-                    </div>
-                  )}
-
-                  <input
-                    ref={uploadInputRef}
-                    type="file"
-                    className="hidden"
-                    onChange={(e) => void handleFileUploadSelected(e)}
-                  />
-
-                  <div className="flex items-end gap-2">
-                    <button
-                      type="button"
+                  {capabilities?.attachmentsAllowed && (
+                    <IconButton
+                      size="xs"
+                      label="Upload & attach file"
                       disabled={uploadingAttachment}
-                      onClick={() => setAttachMenuOpen((prev) => !prev)}
-                      title="Reference a Nextcloud file or upload an attachment"
-                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-800"
+                      onClick={() => uploadInputRef.current?.click()}
                     >
                       {uploadingAttachment ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <Loader2
+                          className="h-3.5 w-3.5 animate-spin"
+                          strokeWidth={1.5}
+                        />
                       ) : (
-                        <Plus className="h-4 w-4" />
+                        <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />
                       )}
-                    </button>
+                    </IconButton>
+                  )}
 
-                    <input
-                      type="text"
-                      value={composerText}
-                      onChange={(e) => handleComposerChange(e.target.value)}
-                      placeholder={`Message ${selectedRoom.displayName}...`}
-                      disabled={sending}
-                      className="flex-1 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
-                    />
+                  <textarea
+                    ref={composerRef}
+                    rows={1}
+                    aria-label={`Message ${selectedRoom.displayName}`}
+                    value={composerText}
+                    onChange={(e) => {
+                      handleComposerChange(e.target.value);
+                      e.target.style.height = "auto";
+                      e.target.style.height = `${Math.min(e.target.scrollHeight, 128)}px`;
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        if (composerText.trim() && !sending) {
+                          e.currentTarget.style.height = "auto";
+                          e.currentTarget.form?.requestSubmit();
+                        }
+                      }
+                    }}
+                    placeholder={`Message ${selectedRoom.displayName}…`}
+                    readOnly={sending}
+                    className="max-h-32 min-w-0 flex-1 resize-none bg-transparent px-1 py-0.5 text-[13px] leading-snug text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
+                  />
 
-                    <button
-                      type="submit"
-                      disabled={sending || !composerText.trim()}
-                      className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-blue-600 px-3.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {sending ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Send className="h-3.5 w-3.5" />
-                      )}
-                      {editingMsg ? "Save" : "Send"}
-                    </button>
-                  </div>
-                </form>
-              )}
-            </>
-          )}
-        </section>
-
-        {/* Right: Inline Preview Pane for Clicked File References (Flow C) */}
-        {previewItem && (
-          <div
-            className={
-              previewExpanded
-                ? "fixed inset-4 z-40 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900"
-                : "w-full shrink-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs lg:w-[440px] dark:border-slate-800 dark:bg-slate-900"
-            }
-          >
-            <FilePreviewPane
-              item={previewItem}
-              expanded={previewExpanded}
-              onToggleExpand={() => setPreviewExpanded((prev) => !prev)}
-              onClose={() => {
-                setPreviewItem(null);
-                setPreviewFileRef(null);
-                setPreviewExpanded(false);
-              }}
-              onRefreshFolder={() => {}}
-              onPreviewError={handlePreviewError}
-            />
-          </div>
+                  <IconButton
+                    type="submit"
+                    size="xs"
+                    label={
+                      editingMsg
+                        ? "Save edit (Shift+Enter for new line)"
+                        : "Send message (Shift+Enter for new line)"
+                    }
+                    shortcut="Enter"
+                    tone={composerText.trim() ? "accent" : "default"}
+                    disabled={sending || !composerText.trim()}
+                  >
+                    {sending ? (
+                      <Loader2
+                        className="h-3.5 w-3.5 animate-spin"
+                        strokeWidth={1.5}
+                      />
+                    ) : (
+                      <ArrowUp className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    )}
+                  </IconButton>
+                </div>
+              </form>
+            )}
+          </>
         )}
       </div>
 
-      {/* Modal: Reference an Existing Nextcloud File (Flow A2 — Zero Copies) */}
+      {/* Modal: Reference an Existing Nextcloud File */}
       {showFilePicker && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label="Reference a Nextcloud File"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs"
+        <Modal
+          ariaLabel="Reference a Nextcloud File"
+          onClose={() => setShowFilePicker(false)}
         >
-          <div className="flex max-h-[82vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3.5 dark:border-slate-800">
-              <div>
-                <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
-                  <Paperclip className="h-4 w-4 text-blue-600" />
-                  Reference a Nextcloud File
+          <div className="flex max-h-[80vh] w-full max-w-xl flex-col overflow-hidden rounded-md border border-[var(--border-strong)] bg-[var(--bg-sidebar)]">
+            <div className="flex h-11 items-center justify-between border-b border-[var(--border-hairline)] px-4">
+              <div className="flex items-center gap-2">
+                <FolderOpen
+                  className="h-3.5 w-3.5 text-[var(--accent)]"
+                  strokeWidth={1.5}
+                />
+                <h2 className="text-xs font-medium text-[var(--text-primary)]">
+                  Link a Nextcloud File
                 </h2>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Links directly to the original file — no copy or permission
-                  change is created.
-                </p>
               </div>
-              <button
-                type="button"
+              <IconButton
+                size="xs"
+                label="Close"
                 onClick={() => setShowFilePicker(false)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
-                <X className="h-4 w-4" />
-              </button>
+                <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
             </div>
 
             {error && (
-              <div className="border-b border-slate-100 px-4 py-2.5 dark:border-slate-800">
+              <div className="border-b border-[var(--border-hairline)] p-3">
                 <ErrorBanner error={error} onDismiss={() => setError(null)} />
               </div>
             )}
 
-            {/* Breadcrumbs */}
-            <div className="flex flex-wrap items-center gap-1 border-b border-slate-100 bg-slate-50 px-4 py-2 text-xs dark:border-slate-800 dark:bg-slate-950/60">
+            <div className="flex flex-wrap items-center gap-1 border-b border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 py-1.5 text-xs">
               <button
                 type="button"
                 onClick={() => void loadPickerFolder("/")}
-                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-800"
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
               >
-                <Home className="h-3.5 w-3.5" />
+                <Home className="h-3.5 w-3.5" strokeWidth={1.5} />
                 Root
               </button>
               {pickerPath
@@ -1423,11 +1945,14 @@ export function TalkView({
                   const target = `/${arr.slice(0, idx + 1).join("/")}`;
                   return (
                     <span key={target} className="inline-flex items-center gap-1">
-                      <ChevronRight className="h-3 w-3 text-slate-400" />
+                      <ChevronRight
+                        className="h-3 w-3 text-[var(--text-muted)]"
+                        strokeWidth={1.5}
+                      />
                       <button
                         type="button"
                         onClick={() => void loadPickerFolder(target)}
-                        className="rounded px-1.5 py-0.5 font-medium text-slate-700 hover:bg-slate-200/70 dark:text-slate-200 dark:hover:bg-slate-800"
+                        className="rounded px-1.5 py-0.5 text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
                       >
                         {seg}
                       </button>
@@ -1436,14 +1961,18 @@ export function TalkView({
                 })}
             </div>
 
-            <div className="flex-1 divide-y divide-slate-100 overflow-y-auto dark:divide-slate-800">
+            <div className="flex-1 divide-y divide-[var(--border-subtle)] overflow-y-auto">
               {loadingPicker ? (
-                <div className="flex items-center justify-center gap-2 p-8 text-xs text-slate-400">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading folder...
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center justify-center gap-2 p-8 text-xs text-[var(--text-muted)]"
+                >
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+                  Loading folder…
                 </div>
               ) : pickerItems.length === 0 ? (
-                <div className="p-8 text-center text-xs text-slate-400">
+                <div className="p-8 text-center text-xs text-[var(--text-muted)]">
                   This folder is empty.
                 </div>
               ) : (
@@ -1453,7 +1982,7 @@ export function TalkView({
                   return (
                     <div
                       key={item.entry.path}
-                      className="flex items-center justify-between gap-3 px-4 py-2.5 text-xs hover:bg-slate-50 dark:hover:bg-slate-800/50"
+                      className="flex items-center justify-between gap-3 px-4 py-2 text-xs hover:bg-[var(--bg-hover)]/60"
                     >
                       <button
                         type="button"
@@ -1463,14 +1992,20 @@ export function TalkView({
                             : void handleReferenceCloudFile(item)
                         }
                         disabled={Boolean(referencingFileId)}
-                        className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
                       >
                         {isDir ? (
-                          <Folder className="h-4 w-4 shrink-0 text-blue-500" />
+                          <Folder
+                            className="h-4 w-4 shrink-0 text-[var(--text-secondary)]"
+                            strokeWidth={1.5}
+                          />
                         ) : (
-                          <FileIcon className="h-4 w-4 shrink-0 text-slate-400" />
+                          <FileIcon
+                            className="h-4 w-4 shrink-0 text-[var(--text-muted)]"
+                            strokeWidth={1.5}
+                          />
                         )}
-                        <span className="truncate font-medium text-slate-800 dark:text-slate-200">
+                        <span className="truncate font-medium text-[var(--text-primary)]">
                           {item.entry.name}
                         </span>
                       </button>
@@ -1479,8 +2014,9 @@ export function TalkView({
                         <button
                           type="button"
                           onClick={() => void loadPickerFolder(item.entry.path)}
-                          className="rounded-lg border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300"
+                          className="inline-flex h-6 items-center gap-1 rounded border border-[var(--border-strong)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                         >
+                          <Folder className="h-3 w-3" strokeWidth={1.5} />
                           Open
                         </button>
                       ) : (
@@ -1488,10 +2024,13 @@ export function TalkView({
                           type="button"
                           disabled={Boolean(referencingFileId)}
                           onClick={() => void handleReferenceCloudFile(item)}
-                          className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                          className="inline-flex h-6 items-center gap-1 rounded bg-[var(--accent)] px-2 text-[11px] font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
                         >
                           {busy && (
-                            <Loader2 className="h-3 w-3 animate-spin" />
+                            <Loader2
+                              className="h-3 w-3 animate-spin"
+                              strokeWidth={1.5}
+                            />
                           )}
                           Reference
                         </button>
@@ -1502,102 +2041,113 @@ export function TalkView({
               )}
             </div>
           </div>
-        </div>
+        </Modal>
       )}
 
       {/* Modal: New Conversation */}
       {showNewRoomModal && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label="New Talk Conversation"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs"
+        <Modal
+          ariaLabel="New Talk Conversation"
+          onClose={() => setShowNewRoomModal(false)}
         >
           <form
             onSubmit={handleCreateRoom}
-            className="w-full max-w-md overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            className="w-full max-w-md overflow-hidden rounded-md border border-[var(--border-strong)] bg-[var(--bg-sidebar)]"
           >
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3.5 dark:border-slate-800">
-              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                New Talk Conversation
+            <div className="flex h-11 items-center justify-between border-b border-[var(--border-hairline)] px-4">
+              <h2 className="text-xs font-medium text-[var(--text-primary)]">
+                New Conversation
               </h2>
-              <button
-                type="button"
+              <IconButton
+                size="xs"
+                label="Close"
                 onClick={() => setShowNewRoomModal(false)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
               >
-                <X className="h-4 w-4" />
-              </button>
+                <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+              </IconButton>
             </div>
-            <div className="space-y-4 p-5 text-xs">
+            <div className="space-y-3.5 p-4 text-xs">
               {error && (
                 <ErrorBanner error={error} onDismiss={() => setError(null)} />
               )}
-              <div className="space-y-1.5">
-                <label className="block font-medium text-slate-700 dark:text-slate-300">
-                  Conversation Type
-                </label>
-                <select
-                  value={newRoomType}
-                  onChange={(e) =>
-                    setNewRoomType(e.target.value as TalkRoomType)
-                  }
-                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 dark:border-slate-700 dark:bg-slate-950"
+              <div className="space-y-1">
+                <label
+                  htmlFor="talk-room-type"
+                  className="block text-[11px] text-[var(--text-secondary)]"
                 >
-                  <option value="group">Group Chat</option>
-                  <option value="oneToOne">Direct Message (1:1)</option>
-                </select>
+                  Type
+                </label>
+                <Select
+                  id="talk-room-type"
+                  ariaLabel="Conversation type"
+                  value={newRoomType}
+                  onChange={(val) => setNewRoomType(val as TalkRoomType)}
+                  options={[
+                    { value: "group", label: "Group Channel" },
+                    { value: "oneToOne", label: "Direct Message (1:1)" },
+                  ]}
+                />
               </div>
               {newRoomType === "group" ? (
-                <div className="space-y-1.5">
-                  <label className="block font-medium text-slate-700 dark:text-slate-300">
-                    Group Name *
+                <div className="space-y-1">
+                  <label
+                    htmlFor="talk-room-name"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
+                    Channel Name *
                   </label>
                   <input
+                    id="talk-room-name"
                     type="text"
                     required
                     value={newRoomName}
                     onChange={(e) => setNewRoomName(e.target.value)}
-                    placeholder="Aero & Chassis Team"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    placeholder="Aero & Chassis"
+                    className="h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
               ) : (
-                <div className="space-y-1.5">
-                  <label className="block font-medium text-slate-700 dark:text-slate-300">
-                    Teammate Nextcloud Username *
+                <div className="space-y-1">
+                  <label
+                    htmlFor="talk-room-invite"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
+                    Nextcloud Username *
                   </label>
                   <input
+                    id="talk-room-invite"
                     type="text"
                     required
                     value={newRoomInvite}
                     onChange={(e) => setNewRoomInvite(e.target.value)}
                     placeholder="alice"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
               )}
             </div>
-            <div className="flex justify-end gap-2 border-t border-slate-200 px-5 py-3 dark:border-slate-800">
+            <div className="flex justify-end gap-2 border-t border-[var(--border-hairline)] px-4 py-3">
               <button
                 type="button"
                 onClick={() => setShowNewRoomModal(false)}
-                className="rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 dark:border-slate-700 dark:text-slate-300"
+                className="h-8 rounded-md border border-[var(--border-strong)] px-3 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={creatingRoom}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3.5 text-xs font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
               >
-                {creatingRoom && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {creatingRoom && (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                )}
                 Create
               </button>
             </div>
           </form>
-        </div>
+        </Modal>
       )}
-    </div>
+    </WorkspaceLayout>
   );
 }
