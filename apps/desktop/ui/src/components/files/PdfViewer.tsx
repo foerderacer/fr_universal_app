@@ -1,6 +1,14 @@
-import { ChevronLeft, ChevronRight, Search, ZoomIn, ZoomOut } from "lucide-react";
+import {
+  ChevronLeft,
+  ChevronRight,
+  MoveHorizontal,
+  Search,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
 import * as pdfjsLib from "pdfjs-dist";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { IconButton } from "../ui/Tooltip";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -14,11 +22,12 @@ interface PdfViewerProps {
 }
 
 export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
-  const [scale, setScale] = useState(1.2);
+  const [scale, setScale] = useState(1.0);
   const [loadError, setLoadError] = useState<{
     message: string;
     details: string | null;
@@ -27,6 +36,33 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
   const [matchPages, setMatchPages] = useState<number[]>([]);
   const [searching, setSearching] = useState(false);
   const searchRunRef = useRef(0);
+  const autoFitRef = useRef(true);
+  const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  pdfDocRef.current = pdfDoc;
+  const pageNumRef = useRef(pageNum);
+  pageNumRef.current = pageNum;
+
+  const fitToWidth = useCallback(
+    async (doc: pdfjsLib.PDFDocumentProxy | null, targetPage: number) => {
+      if (!doc || !containerRef.current) return;
+      const availableWidth = containerRef.current.clientWidth - 28;
+      if (availableWidth <= 100) return;
+      try {
+        const page = await doc.getPage(targetPage);
+        const baseViewport = page.getViewport({ scale: 1 });
+        if (baseViewport.width > 0) {
+          const computed = Math.max(
+            0.4,
+            Math.min(2.5, Number((availableWidth / baseViewport.width).toFixed(2))),
+          );
+          setScale(computed);
+        }
+      } catch {
+        // Ignore fit calculation failure on destroyed document.
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -39,20 +75,20 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
     setSearching(false);
 
     const task = pdfjsLib.getDocument({ url });
+    autoFitRef.current = true;
     task.promise
       .then((doc) => {
-        if (cancelled) {
-          return;
-        }
+        if (cancelled) return;
         setPdfDoc(doc);
         setNumPages(doc.numPages);
+        void fitToWidth(doc, 1);
       })
       .catch((err) => {
         if (!cancelled) {
           setLoadError({
             message:
               onFallbackNote ??
-              `We couldn't display "${fileName}" right now. Click "Open in Native App" to open it in your PDF reader.`,
+              `We couldn't display "${fileName}" right now. Open in native app to view it.`,
             details: err instanceof Error ? err.message : String(err),
           });
         }
@@ -63,7 +99,20 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
       searchRunRef.current += 1;
       void task.destroy();
     };
-  }, [url, fileName, onFallbackNote]);
+  }, [url, fileName, onFallbackNote, fitToWidth]);
+
+  // Re-fit PDF width live when the Files inspector pane is resized (until manual zoom)
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (autoFitRef.current && pdfDocRef.current) {
+        void fitToWidth(pdfDocRef.current, pageNumRef.current);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [fitToWidth]);
 
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
@@ -85,9 +134,7 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
         canvas,
         viewport,
       });
-      void renderTask.promise.catch(() => {
-        // Ignore cancelled renders when paging or zooming quickly.
-      });
+      void renderTask.promise.catch(() => {});
     });
 
     return () => {
@@ -116,30 +163,24 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
           .map((item) => ("str" in item ? item.str : ""))
           .join(" ")
           .toLowerCase();
-        if (text.includes(needle)) {
-          hits.push(p);
-        }
+        if (text.includes(needle)) hits.push(p);
       }
       if (searchRunRef.current !== runId) return;
       setMatchPages(hits);
-      if (hits.length > 0) {
-        setPageNum(hits[0]);
-      }
+      if (hits.length > 0) setPageNum(hits[0]);
     } finally {
-      if (searchRunRef.current === runId) {
-        setSearching(false);
-      }
+      if (searchRunRef.current === runId) setSearching(false);
     }
   }
 
   if (loadError) {
     return (
-      <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+      <div className="rounded-md border border-[var(--status-warning)]/35 bg-[var(--status-warning-soft)] p-3.5 text-xs text-[var(--text-primary)]">
         <p>{loadError.message}</p>
         {loadError.details && (
-          <details className="mt-2 text-xs opacity-80">
+          <details className="mt-2 text-[11px] text-[var(--text-muted)]">
             <summary className="cursor-pointer font-medium">Technical details</summary>
-            <p className="mt-1 font-mono break-all">{loadError.details}</p>
+            <p className="mono-num mt-1 break-all">{loadError.details}</p>
           </details>
         )}
       </div>
@@ -147,83 +188,108 @@ export function PdfViewer({ url, fileName, onFallbackNote }: PdfViewerProps) {
   }
 
   return (
-    <div className="flex h-full flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
+    <div className="flex h-full flex-col gap-2">
+      <div className="flex h-8 shrink-0 flex-nowrap items-center justify-between gap-1.5 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5">
+        <div className="flex shrink-0 items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Previous page"
             disabled={pageNum <= 1}
             onClick={() => setPageNum((p) => Math.max(1, p - 1))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Previous page"
           >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
-          <span className="text-xs font-medium text-slate-700 dark:text-slate-200">
-            Page {numPages ? pageNum : "—"} / {numPages || "—"}
+            <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <span className="mono-num px-1 whitespace-nowrap text-[11px] text-[var(--text-secondary)]">
+            {numPages ? pageNum : "—"} / {numPages || "—"}
           </span>
-          <button
-            type="button"
+          <IconButton
+            size="xs"
+            label="Next page"
             disabled={pageNum >= numPages}
             onClick={() => setPageNum((p) => Math.min(numPages, p + 1))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 disabled:opacity-40 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Next page"
           >
-            <ChevronRight className="h-4 w-4" />
-          </button>
+            <ChevronRight className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
 
-        <form onSubmit={(e) => void handleSearch(e)} className="flex items-center gap-1.5">
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+        <form
+          onSubmit={(e) => void handleSearch(e)}
+          className="flex min-w-0 flex-1 items-center justify-center gap-1"
+        >
+          <div className="relative min-w-0 flex-1 max-w-[132px]">
+            <Search
+              className="pointer-events-none absolute top-1/2 left-1.5 h-3 w-3 -translate-y-1/2 text-[var(--text-muted)]"
+              strokeWidth={1.5}
+            />
             <input
               type="text"
+              aria-label="Search PDF text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Find text..."
-              className="w-36 rounded-lg border border-slate-300 bg-white py-1 pr-2 pl-7 text-xs text-slate-900 focus:border-blue-500 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+              placeholder="Find…"
+              className="h-6 w-full min-w-0 rounded border border-[var(--border-strong)] bg-[var(--bg-app)] pr-1.5 pl-5 text-[11px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
             />
           </div>
           {matchPages.length > 0 && (
-            <span className="text-[11px] text-blue-600 dark:text-blue-400">
-              {matchPages.length} pg{matchPages.length === 1 ? "" : "s"}
+            <span className="mono-num shrink-0 text-[11px] text-[var(--accent-text)]">
+              {matchPages.length}p
             </span>
           )}
           {searching && (
-            <span className="text-[11px] text-slate-400">Searching...</span>
+            <span className="shrink-0 text-[11px] text-[var(--text-muted)]">…</span>
           )}
         </form>
 
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setScale((s) => Math.max(0.5, Number((s - 0.2).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom out"
+        <div className="flex shrink-0 items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Fit to width"
+            disabled={!pdfDoc}
+            onClick={() => {
+              autoFitRef.current = true;
+              void fitToWidth(pdfDoc, pageNum);
+            }}
           >
-            <ZoomOut className="h-4 w-4" />
-          </button>
-          <span className="w-11 text-center text-xs font-medium text-slate-600 dark:text-slate-300">
+            <MoveHorizontal className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <IconButton
+            size="xs"
+            label="Zoom out"
+            onClick={() => {
+              autoFitRef.current = false;
+              setScale((s) => Math.max(0.4, Number((s - 0.15).toFixed(2))));
+            }}
+          >
+            <ZoomOut className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <span className="mono-num w-9 text-center text-[11px] text-[var(--text-secondary)]">
             {Math.round(scale * 100)}%
           </span>
-          <button
-            type="button"
-            onClick={() => setScale((s) => Math.min(3, Number((s + 0.2).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom in"
+          <IconButton
+            size="xs"
+            label="Zoom in"
+            onClick={() => {
+              autoFitRef.current = false;
+              setScale((s) => Math.min(3, Number((s + 0.15).toFixed(2))));
+            }}
           >
-            <ZoomIn className="h-4 w-4" />
-          </button>
+            <ZoomIn className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
       </div>
 
-      <div className="flex flex-1 items-start justify-center overflow-auto rounded-xl border border-slate-200 bg-slate-100 p-4 dark:border-slate-800 dark:bg-slate-950">
+      <div
+        ref={containerRef}
+        className="flex flex-1 items-start justify-center overflow-auto rounded-md border border-[var(--border-hairline)] bg-[var(--bg-app)] p-3"
+      >
         {!pdfDoc ? (
-          <p className="py-12 text-xs text-slate-500">Loading document...</p>
+          <p className="py-10 text-xs text-[var(--text-muted)]">
+            Loading document…
+          </p>
         ) : (
           <canvas
             ref={canvasRef}
-            className="rounded-md bg-white shadow-md"
+            className="rounded border border-[var(--border-hairline)] bg-white"
           />
         )}
       </div>

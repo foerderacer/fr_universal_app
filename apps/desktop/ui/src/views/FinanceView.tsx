@@ -1,20 +1,24 @@
 import {
-  CheckCircle2,
+  ArrowDown,
+  ArrowUp,
+  BarChart3,
   Download,
   Eye,
   FileText,
   Folder,
+  Landmark,
+  Layers,
   Loader2,
   Pencil,
   Plus,
   Receipt,
   RefreshCw,
   Search,
-  Trash2,
+  Tag,
   Wallet,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   FileItemView_Serialize,
   FinanceCurrencySummary,
@@ -26,7 +30,25 @@ import type {
 } from "../bindings/tauri";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { FilePreviewPane } from "../components/files/FilePreviewPane";
+import { InspectorEmptyPane } from "../components/shell/InspectorEmptyPane";
+import { NoticeBanner } from "../components/shell/NoticeBanner";
+import { WorkspaceLayout } from "../components/shell/WorkspaceLayout";
+import { Combobox } from "../components/ui/Combobox";
+import { DateInput } from "../components/ui/DateInput";
+import { InlineDeleteConfirm } from "../components/ui/InlineDeleteConfirm";
+import { Modal } from "../components/ui/Modal";
+import { Select } from "../components/ui/Select";
+import { IconButton, Kbd } from "../components/ui/Tooltip";
 import { listFiles } from "../lib/filesClient";
+import { QUICK_CHAT_SHORTCUT } from "../lib/platform";
+import {
+  areSingleKeyShortcutsEnabled,
+  handleToolbarKeyDown,
+  hasActiveOverlay,
+  isBlockedArrowScope,
+  isEditableTarget,
+  useSingleKeyShortcutsEnabled,
+} from "../lib/shortcuts";
 import {
   deleteFinanceEntry,
   exportFinanceCsv,
@@ -43,6 +65,13 @@ interface FinanceViewProps {
   financeFolder: string;
   isNextcloudConnected: boolean;
   onOverviewUpdated: (overview: WorkspaceOverview_Serialize) => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+  inspectorOpen: boolean;
+  onToggleInspector: () => void;
+  onSetInspectorOpen: (open: boolean) => void;
+  quickChatInspector?: React.ReactNode;
+  banners?: React.ReactNode;
 }
 
 interface EntryDraft {
@@ -97,14 +126,14 @@ function draftFromEntry(entry: FinanceEntry_Serialize): EntryDraft {
   };
 }
 
-function statusBadgeClass(status: FinanceEntryStatus): string {
+function statusDotColor(status: FinanceEntryStatus): string {
   switch (status) {
     case "paid":
-      return "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300";
+      return "bg-[var(--status-positive)]";
     case "approved":
-      return "bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300";
+      return "bg-[var(--accent)]";
     default:
-      return "bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300";
+      return "bg-[var(--status-warning)]";
   }
 }
 
@@ -112,6 +141,13 @@ export function FinanceView({
   financeFolder,
   isNextcloudConnected,
   onOverviewUpdated,
+  sidebarOpen,
+  onToggleSidebar,
+  inspectorOpen,
+  onToggleInspector,
+  onSetInspectorOpen,
+  quickChatInspector,
+  banners,
 }: FinanceViewProps) {
   const [entries, setEntries] = useState<FinanceEntry_Serialize[]>([]);
   const [summaries, setSummaries] = useState<FinanceCurrencySummary[]>([]);
@@ -125,7 +161,14 @@ export function FinanceView({
   const [statusFilter, setStatusFilter] = useState<FinanceEntryStatus | "all">(
     "all",
   );
+  const [categoryFilter, setCategoryFilter] = useState<string | "all">("all");
+  const [sortBy, setSortBy] = useState<
+    "date" | "vendor" | "category" | "status" | "amount"
+  >("date");
+  const [sortAsc, setSortAsc] = useState(false);
+  const [showChart, setShowChart] = useState(true);
 
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [draft, setDraft] = useState<EntryDraft | null>(null);
   const [savingEntry, setSavingEntry] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -136,6 +179,34 @@ export function FinanceView({
 
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<UserFacingError | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const singleKeyEnabled = useSingleKeyShortcutsEnabled();
+  const [confirmDiscardDraft, setConfirmDiscardDraft] = useState(false);
+  const draftOpenRef = useRef(false);
+  const draftSnapshotRef = useRef<string>("");
+
+  useEffect(() => {
+    if (draft && !draftOpenRef.current) {
+      draftOpenRef.current = true;
+      draftSnapshotRef.current = JSON.stringify(draft);
+      setConfirmDiscardDraft(false);
+    } else if (!draft) {
+      draftOpenRef.current = false;
+      draftSnapshotRef.current = "";
+      setConfirmDiscardDraft(false);
+    }
+  }, [draft]);
+
+  const isDraftDirty =
+    draft !== null && JSON.stringify(draft) !== draftSnapshotRef.current;
+
+  function requestCloseDraft() {
+    if (isDraftDirty) {
+      setConfirmDiscardDraft(true);
+    } else {
+      setDraft(null);
+    }
+  }
 
   useEffect(() => {
     setFolderInput(financeFolder);
@@ -172,7 +243,6 @@ export function FinanceView({
       const items = await listFiles(financeFolder);
       setFolderFiles(items.filter((it) => it.entry.kind === "file"));
     } catch {
-      // The /Finance folder may not exist yet on Nextcloud — non-fatal.
       setFolderFiles([]);
     }
   }, [financeFolder, isNextcloudConnected]);
@@ -184,6 +254,92 @@ export function FinanceView({
   useEffect(() => {
     void loadFinanceFolderFiles();
   }, [loadFinanceFolderFiles]);
+
+  const filteredEntriesRef = useRef<FinanceEntry_Serialize[]>([]);
+
+  // '/' focuses search, Escape closes modal or deselects row, ArrowUp/Down navigates ledger rows
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (hasActiveOverlay()) {
+        return;
+      }
+      const inInput = isEditableTarget(e.target);
+      if (e.key === "Escape") {
+        if (inInput) return;
+        if (confirmDeleteId) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          setConfirmDeleteId(null);
+          return;
+        }
+        if (!previewItem && selectedEntryId) {
+          e.preventDefault();
+          setSelectedEntryId(null);
+          onSetInspectorOpen(false);
+          return;
+        }
+      }
+      if (inInput) return;
+      if (areSingleKeyShortcutsEnabled() && e.key === "/") {
+        e.preventDefault();
+        searchRef.current?.focus();
+      } else if (
+        !e.defaultPrevented &&
+        (e.key === "ArrowDown" || e.key === "ArrowUp") &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey
+      ) {
+        if (isBlockedArrowScope(document.activeElement)) {
+          return;
+        }
+        const list = filteredEntriesRef.current;
+        if (list.length === 0) return;
+        e.preventDefault();
+        const curIdx = selectedEntryId
+          ? list.findIndex((it) => it.id === selectedEntryId)
+          : -1;
+        const nextIdx =
+          e.key === "ArrowDown"
+            ? curIdx < 0
+              ? 0
+              : Math.min(list.length - 1, curIdx + 1)
+            : curIdx <= 0
+              ? 0
+              : curIdx - 1;
+        const nextId = list[nextIdx].id;
+        setPreviewItem(null);
+        setSelectedEntryId(nextId);
+        const rowEl = document.querySelector<HTMLElement>(
+          `tr[data-entry-id="${CSS.escape(nextId)}"]`,
+        );
+        rowEl?.focus({ preventScroll: false });
+        rowEl?.scrollIntoView({ block: "nearest" });
+      } else if (
+        !e.defaultPrevented &&
+        e.key === "Enter" &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        selectedEntryId &&
+        !draft &&
+        !previewItem &&
+        (document.activeElement === document.body ||
+          document.activeElement?.tagName === "TR")
+      ) {
+        const entry = filteredEntriesRef.current.find(
+          (it) => it.id === selectedEntryId,
+        );
+        if (entry) {
+          e.preventDefault();
+          setDraft(draftFromEntry(entry));
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [draft, confirmDeleteId, previewItem, selectedEntryId, onSetInspectorOpen]);
 
   function flashNotice(msg: string) {
     setNotice(msg);
@@ -239,7 +395,7 @@ export function FinanceView({
       });
       setDraft(null);
       await loadLedger();
-      flashNotice("Finance entry saved.");
+      flashNotice("Entry saved.");
     } catch (err) {
       setError(toUserFacingError(err));
     } finally {
@@ -252,6 +408,7 @@ export function FinanceView({
     try {
       await deleteFinanceEntry(entryId);
       setConfirmDeleteId(null);
+      if (selectedEntryId === entryId) setSelectedEntryId(null);
       await loadLedger();
       flashNotice("Entry deleted.");
     } catch (err) {
@@ -272,13 +429,14 @@ export function FinanceView({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      flashNotice("Exported CSV spreadsheet.");
+      flashNotice("Exported CSV ledger.");
     } catch (err) {
       setError(toUserFacingError(err));
     }
   }
 
   function handlePreviewLinkedFile(cloudPath: string) {
+    onSetInspectorOpen(true);
     const existing = folderFiles.find((f) => f.entry.path === cloudPath);
     if (existing) {
       setPreviewItem(existing);
@@ -293,7 +451,9 @@ export function FinanceView({
           ? "image"
           : ext === "md" || ext === "markdown"
             ? "markdown"
-            : "unsupported";
+            : ext === "txt"
+              ? "plainText"
+              : "unsupported";
     setPreviewItem({
       entry: {
         id: cloudPath,
@@ -310,11 +470,38 @@ export function FinanceView({
     });
   }
 
+  const primaryCurrency = summaries[0]?.currency ?? entries[0]?.currency ?? null;
+
+  const categoryTotals = useMemo(() => {
+    const map = new Map<string, { cents: number; count: number; currency: string }>();
+    for (const e of entries) {
+      if (e.kind === "budget") continue;
+      if (primaryCurrency && e.currency !== primaryCurrency) continue;
+      const cur = map.get(e.category) ?? {
+        cents: 0,
+        count: 0,
+        currency: e.currency,
+      };
+      cur.cents += e.amountCents ?? 0;
+      cur.count += 1;
+      map.set(e.category, cur);
+    }
+    return Array.from(map.entries())
+      .map(([name, v]) => ({ name, ...v }))
+      .sort((a, b) => b.cents - a.cents);
+  }, [entries, primaryCurrency]);
+
+  const totalSpendCents = useMemo(
+    () => categoryTotals.reduce((acc, c) => acc + c.cents, 0),
+    [categoryTotals],
+  );
+
   const filteredEntries = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return entries.filter((e) => {
+    const matched = entries.filter((e) => {
       if (kindFilter !== "all" && e.kind !== kindFilter) return false;
       if (statusFilter !== "all" && e.status !== statusFilter) return false;
+      if (categoryFilter !== "all" && e.category !== categoryFilter) return false;
       if (!q) return true;
       return (
         e.vendor.toLowerCase().includes(q) ||
@@ -323,462 +510,1160 @@ export function FinanceView({
         (e.cloudFilePath?.toLowerCase().includes(q) ?? false)
       );
     });
-  }, [entries, kindFilter, statusFilter, search]);
+    return [...matched].sort((a, b) => {
+      let cmp = 0;
+      switch (sortBy) {
+        case "vendor":
+          cmp = a.vendor.localeCompare(b.vendor);
+          break;
+        case "category":
+          cmp = a.category.localeCompare(b.category);
+          break;
+        case "status":
+          cmp = a.status.localeCompare(b.status);
+          break;
+        case "amount":
+          cmp = (a.amountCents ?? 0) - (b.amountCents ?? 0);
+          break;
+        default:
+          cmp = a.entryDate.localeCompare(b.entryDate);
+      }
+      return sortAsc ? cmp : -cmp;
+    });
+  }, [entries, kindFilter, statusFilter, categoryFilter, search, sortBy, sortAsc]);
+  filteredEntriesRef.current = filteredEntries;
 
-  return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-5 lg:flex-row">
-      <div className="min-w-0 flex-1 space-y-5">
-        {error && (
-          <ErrorBanner error={error} onDismiss={() => setError(null)} />
-        )}
+  function toggleSort(
+    field: "date" | "vendor" | "category" | "status" | "amount",
+  ) {
+    if (sortBy === field) {
+      setSortAsc((prev) => !prev);
+    } else {
+      setSortBy(field);
+      setSortAsc(field === "vendor" || field === "category" || field === "status");
+    }
+  }
 
-        {notice && (
-          <div className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-medium text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300">
-            <span className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              {notice}
-            </span>
-            <button
-              type="button"
-              onClick={() => setNotice(null)}
-              className="hover:underline"
-            >
-              Dismiss
-            </button>
+  const selectedEntry = useMemo(
+    () => entries.find((e) => e.id === selectedEntryId) ?? null,
+    [entries, selectedEntryId],
+  );
+
+  const primarySummary = summaries[0] ?? null;
+  const remainingCents = primarySummary
+    ? (primarySummary.totalBudgetsCents ?? 0) -
+      ((primarySummary.totalInvoicesCents ?? 0) +
+        (primarySummary.totalReceiptsCents ?? 0))
+    : 0;
+
+  const sidebarNode = (
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-2.5">
+        {/* Ledger Views */}
+        <div>
+          <h2 className="mb-1 px-2 text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+            Ledger
+          </h2>
+          <div className="space-y-0.5">
+            {(
+              [
+                { id: "all", label: "All Entries", icon: Layers, count: entries.length },
+                {
+                  id: "invoice",
+                  label: "Invoices",
+                  icon: FileText,
+                  count: entries.filter((e) => e.kind === "invoice").length,
+                },
+                {
+                  id: "receipt",
+                  label: "Receipts",
+                  icon: Receipt,
+                  count: entries.filter((e) => e.kind === "receipt").length,
+                },
+                {
+                  id: "budget",
+                  label: "Budgets",
+                  icon: Wallet,
+                  count: entries.filter((e) => e.kind === "budget").length,
+                },
+              ] as const
+            ).map(({ id, label, icon: Icon, count }) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={kindFilter === id}
+                onClick={() => setKindFilter(id)}
+                className={`relative flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+                  kindFilter === id
+                    ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                    : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                }`}
+              >
+                {kindFilter === id && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+                  />
+                )}
+                <span className="flex min-w-0 items-center gap-2">
+                  <Icon
+                    className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+                    strokeWidth={1.5}
+                  />
+                  <span className="truncate">{label}</span>
+                </span>
+                <span className="mono-num text-[10px] text-[var(--text-muted)]">
+                  {count}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Status Filter */}
+        <div>
+          <h2 className="mb-1 px-2 text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+            Status
+          </h2>
+          <div className="space-y-0.5">
+            {(["all", "pending", "approved", "paid"] as const).map((st) => {
+              const count =
+                st === "all"
+                  ? entries.length
+                  : entries.filter((e) => e.status === st).length;
+              return (
+                <button
+                  key={st}
+                  type="button"
+                  aria-pressed={statusFilter === st}
+                  onClick={() => setStatusFilter(st)}
+                  className={`relative flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs capitalize transition-colors ${
+                    statusFilter === st
+                      ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                      : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  }`}
+                >
+                  {statusFilter === st && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+                    />
+                  )}
+                  <span className="flex items-center gap-2">
+                    {st !== "all" && (
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${statusDotColor(st)}`}
+                      />
+                    )}
+                    <span>{st === "all" ? "All statuses" : st}</span>
+                  </span>
+                  <span className="mono-num text-[10px] text-[var(--text-muted)]">
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Categories */}
+        {categoryTotals.length > 0 && (
+          <div>
+            <div className="mb-1 flex items-center justify-between px-2">
+              <h2 className="text-[11px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                Categories
+              </h2>
+              {categoryFilter !== "all" && (
+                <button
+                  type="button"
+                  onClick={() => setCategoryFilter("all")}
+                  className="text-[10px] text-[var(--accent-text)] hover:underline"
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+            <div className="space-y-0.5">
+              {categoryTotals.map((cat) => (
+                <button
+                  key={cat.name}
+                  type="button"
+                  aria-pressed={categoryFilter === cat.name}
+                  onClick={() =>
+                    setCategoryFilter((prev) =>
+                      prev === cat.name ? "all" : cat.name,
+                    )
+                  }
+                  className={`relative flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+                    categoryFilter === cat.name
+                      ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                      : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  }`}
+                >
+                  {categoryFilter === cat.name && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute top-1.5 bottom-1.5 left-0 w-[2px] rounded-r bg-[var(--accent)]"
+                    />
+                  )}
+                  <span className="flex min-w-0 items-center gap-2">
+                    <Tag
+                      className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+                      strokeWidth={1.5}
+                    />
+                    <span className="truncate">{cat.name}</span>
+                  </span>
+                  <span className="mono-num shrink-0 text-[10px] text-[var(--text-muted)]">
+                    {formatCurrencyCents(cat.cents, cat.currency)}
+                  </span>
+                </button>
+              ))}
+            </div>
           </div>
         )}
+      </div>
 
-        {/* Nextcloud Finance Folder & Actions */}
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900">
-          <form
-            onSubmit={handleSaveFolder}
-            className="flex min-w-0 flex-1 items-center gap-2"
-          >
-            <Folder className="h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
-            <label htmlFor="finance-folder" className="sr-only">
-              Nextcloud Finance Folder
-            </label>
-            <input
-              id="finance-folder"
-              type="text"
-              value={folderInput}
-              onChange={(e) => setFolderInput(e.target.value)}
-              placeholder="/Finance"
-              className="min-w-0 flex-1 rounded-xl border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
-            />
+      {/* Finance Folder Control + Unified h-8 Footer */}
+      <form
+        onSubmit={handleSaveFolder}
+        className="border-t border-[var(--border-hairline)] p-2.5"
+      >
+        <label
+          htmlFor="finance-folder"
+          className="mb-1 flex items-center gap-1.5 text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase"
+        >
+          <Folder className="h-3 w-3" strokeWidth={1.5} />
+          Source Folder
+        </label>
+        <div className="flex items-center gap-1">
+          <input
+            id="finance-folder"
+            type="text"
+            value={folderInput}
+            onChange={(e) => setFolderInput(e.target.value)}
+            placeholder="/Finance"
+            className="mono-num h-7 min-w-0 flex-1 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2 text-[11px] text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+          />
+          {folderInput.trim() !== financeFolder && (
             <button
               type="submit"
-              disabled={savingFolder || folderInput.trim() === financeFolder}
-              className="rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+              disabled={savingFolder}
+              className="h-7 rounded-md bg-[var(--accent)] px-2 text-[11px] font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-40"
             >
-              {savingFolder ? "Saving..." : "Set Folder"}
+              {savingFolder ? "…" : "Set"}
             </button>
-          </form>
+          )}
+        </div>
+      </form>
+      <div className="mono-num flex h-8 shrink-0 items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <span>{filteredEntries.length} shown</span>
+        <span>{entries.length} total</span>
+      </div>
+    </div>
+  );
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                void loadLedger();
-                void loadFinanceFolderFiles();
-              }}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+  const inspectorNode = quickChatInspector ? (
+    quickChatInspector
+  ) : previewItem ? (
+    <FilePreviewPane
+      item={previewItem}
+      expanded={previewExpanded}
+      onToggleExpand={() => setPreviewExpanded((prev) => !prev)}
+      onClose={() => {
+        setPreviewItem(null);
+        setPreviewExpanded(false);
+      }}
+      onRefreshFolder={() => void loadFinanceFolderFiles()}
+    />
+  ) : selectedEntry ? (
+    <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
+      <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--border-hairline)] px-3">
+        <span className="text-xs font-medium text-[var(--text-primary)]">
+          Entry Detail
+        </span>
+        <div className="flex items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Edit entry"
+            onClick={() => setDraft(draftFromEntry(selectedEntry))}
+          >
+            <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <IconButton
+            size="xs"
+            label="Close inspector"
+            onClick={() => {
+              setSelectedEntryId(null);
+              onSetInspectorOpen(false);
+            }}
+          >
+            <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3.5">
+        <div>
+          <p className="text-[11px] text-[var(--text-muted)] capitalize">
+            {selectedEntry.kind} · {selectedEntry.category}
+          </p>
+          <p className="mt-1 text-sm font-medium text-[var(--text-primary)]">
+            {selectedEntry.vendor}
+          </p>
+          <p className="mono-num mt-2 text-base font-semibold text-[var(--text-primary)]">
+            {formatCurrencyCents(
+              selectedEntry.amountCents,
+              selectedEntry.currency,
+            )}
+          </p>
+        </div>
+
+        <dl className="divide-y divide-[var(--border-subtle)] border-y border-[var(--border-hairline)] text-xs">
+          <div className="flex items-center justify-between py-2">
+            <dt className="text-[var(--text-muted)]">Status</dt>
+            <dd className="inline-flex items-center gap-1.5 capitalize text-[var(--text-primary)]">
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${statusDotColor(selectedEntry.status)}`}
               />
-              Refresh
-            </button>
+              {selectedEntry.status}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between py-2">
+            <dt className="text-[var(--text-muted)]">Entry Date</dt>
+            <dd className="mono-num text-[var(--text-primary)]">
+              {selectedEntry.entryDate}
+            </dd>
+          </div>
+          <div className="flex items-center justify-between py-2">
+            <dt className="text-[var(--text-muted)]">Currency</dt>
+            <dd className="mono-num text-[var(--text-primary)]">
+              {selectedEntry.currency}
+            </dd>
+          </div>
+          {selectedEntry.description && (
+            <div className="py-2">
+              <dt className="text-[var(--text-muted)]">Notes</dt>
+              <dd className="mt-1 text-[var(--text-secondary)]">
+                {selectedEntry.description}
+              </dd>
+            </div>
+          )}
+        </dl>
 
-            <button
-              type="button"
-              onClick={() => void handleExportCsv()}
-              disabled={!isNextcloudConnected || entries.length === 0}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              <Download className="h-3.5 w-3.5" />
-              Export CSV
-            </button>
-
+        {selectedEntry.cloudFilePath && (
+          <div>
+            <p className="mb-1.5 text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+              Linked Document
+            </p>
             <button
               type="button"
               disabled={!isNextcloudConnected}
-              onClick={() => {
-                setError(null);
-                setDraft(emptyDraft());
-              }}
-              title={
-                isNextcloudConnected
-                  ? "Add a new invoice, receipt, or budget entry"
-                  : "Sign in to Nextcloud first so entries are linked to your account"
+              onClick={() =>
+                handlePreviewLinkedFile(selectedEntry.cloudFilePath!)
               }
-              className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-blue-700 disabled:opacity-40"
+              className="flex w-full items-center justify-between gap-2 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 text-left text-xs hover:bg-[var(--bg-elevated)]"
             >
-              <Plus className="h-3.5 w-3.5" />
-              Add Entry
+              <span className="flex min-w-0 items-center gap-2">
+                <FileText
+                  className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]"
+                  strokeWidth={1.5}
+                />
+                <span className="mono-num truncate text-[11px] text-[var(--text-primary)]">
+                  {selectedEntry.cloudFilePath}
+                </span>
+              </span>
+              <Eye
+                className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]"
+                strokeWidth={1.5}
+              />
             </button>
           </div>
-        </div>
+        )}
+      </div>
+      <div className="mono-num flex h-8 shrink-0 items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-app)] px-3 text-[11px] text-[var(--text-muted)]">
+        <span className="truncate capitalize">{selectedEntry.kind}</span>
+        <span>{selectedEntry.entryDate}</span>
+      </div>
+    </div>
+  ) : (
+    <InspectorEmptyPane
+      icon={Receipt}
+      title="Select a ledger entry"
+      description="Inspect transaction details or preview linked Nextcloud PDFs here."
+      footerLeft={financeFolder}
+      footerRight={`${filteredEntries.length} entries`}
+    />
+  );
 
-        {/* Summary KPI Cards */}
-        {summaries.length > 0 && (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {summaries.map((sum) => (
-              <div
-                key={sum.currency}
-                className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 uppercase dark:text-slate-400">
-                    <Wallet className="h-3.5 w-3.5 text-blue-500" />
-                    {sum.currency} Ledger
-                  </span>
-                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
-                    {sum.pendingCount} pending
-                  </span>
-                </div>
-                <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-                  <div>
-                    <p className="text-[11px] text-slate-400">Invoices</p>
-                    <p className="font-semibold text-slate-900 dark:text-slate-100">
-                      {formatCurrencyCents(
-                        sum.totalInvoicesCents,
-                        sum.currency,
-                      )}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-[11px] text-slate-400">Receipts</p>
-                    <p className="font-semibold text-slate-900 dark:text-slate-100">
-                      {formatCurrencyCents(
-                        sum.totalReceiptsCents,
-                        sum.currency,
-                      )}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-[11px] text-slate-400">Budgets</p>
-                    <p className="font-semibold text-slate-900 dark:text-slate-100">
-                      {formatCurrencyCents(sum.totalBudgetsCents, sum.currency)}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            ))}
+  return (
+    <WorkspaceLayout
+      moduleId="finance"
+      headerLeft={
+        <h1 className="text-[13px] font-medium text-[var(--text-primary)]">
+          Finance
+        </h1>
+      }
+      headerRight={
+        <div className="flex items-center gap-1">
+          <div className="relative mr-1">
+            <Search
+              className="pointer-events-none absolute top-1/2 left-2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-muted)]"
+              strokeWidth={1.5}
+            />
+            <input
+              ref={searchRef}
+              type="text"
+              aria-label="Search ledger"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search ledger…"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  if (search) {
+                    e.preventDefault();
+                    setSearch("");
+                  } else {
+                    e.currentTarget.blur();
+                  }
+                }
+              }}
+              className="h-7 w-44 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] pr-6 pl-7 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+            {!search && singleKeyEnabled && (
+              <Kbd className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2">
+                /
+              </Kbd>
+            )}
+          </div>
+
+          <div
+            role="toolbar"
+            aria-label="Finance actions"
+            onKeyDown={handleToolbarKeyDown}
+            className="flex items-center gap-1"
+          >
+          <IconButton
+            label={showChart ? "Hide breakdown chart" : "Show breakdown chart"}
+            active={showChart}
+            onClick={() => setShowChart((s) => !s)}
+          >
+            <BarChart3 className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+
+          <IconButton
+            label="Export CSV"
+            disabled={!isNextcloudConnected || entries.length === 0}
+            onClick={() => void handleExportCsv()}
+          >
+            <Download className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+
+          <IconButton
+            label="Refresh ledger"
+            onClick={() => {
+              void loadLedger();
+              void loadFinanceFolderFiles();
+            }}
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+              strokeWidth={1.5}
+            />
+          </IconButton>
+
+          <IconButton
+            label="Add finance entry"
+            tone="accent"
+            disabled={!isNextcloudConnected}
+            onClick={() => {
+              setError(null);
+              setDraft(emptyDraft());
+            }}
+          >
+            <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          </div>
+        </div>
+      }
+      sidebar={sidebarNode}
+      sidebarOpen={sidebarOpen}
+      onToggleSidebar={onToggleSidebar}
+      inspector={inspectorNode}
+      inspectorOpen={Boolean(quickChatInspector) || inspectorOpen}
+      onToggleInspector={onToggleInspector}
+      inspectorLabel={quickChatInspector ? "Quick chat" : "Details inspector"}
+      inspectorToggleLabel={quickChatInspector ? "Close quick chat" : undefined}
+      inspectorToggleShortcut={quickChatInspector ? QUICK_CHAT_SHORTCUT : undefined}
+      inspectorExpanded={Boolean(previewItem && previewExpanded && !quickChatInspector)}
+      banners={banners}
+    >
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {error && (
+          <div className="border-b border-[var(--border-hairline)] p-2.5">
+            <ErrorBanner error={error} onDismiss={() => setError(null)} />
           </div>
         )}
 
-        {/* Filters */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-[200px] flex-1">
-            <Search className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search vendor, category, description..."
-              className="w-full rounded-xl border border-slate-300 bg-white py-2 pr-3 pl-9 text-xs dark:border-slate-700 dark:bg-slate-900"
-            />
+        {notice && (
+          <NoticeBanner message={notice} onDismiss={() => setNotice(null)} />
+        )}
+
+        {/* Compact Horizontal Summary Metrics Strip (single tight grid band, zero ragged wrap dividers) */}
+        {primarySummary && (
+          <div className="grid shrink-0 grid-cols-2 divide-y divide-[var(--border-hairline)] border-b border-[var(--border-hairline)] bg-[var(--bg-sidebar)] sm:grid-cols-5 sm:divide-x sm:divide-y-0">
+            <div className="px-3 py-1.5">
+              <p className="text-[11px] font-medium text-[var(--text-muted)]">
+                Invoices
+              </p>
+              <p className="mono-num text-[13px] font-medium text-[var(--text-primary)]">
+                {formatCurrencyCents(
+                  primarySummary.totalInvoicesCents,
+                  primarySummary.currency,
+                )}
+              </p>
+            </div>
+            <div className="border-l border-[var(--border-hairline)] px-3 py-1.5 sm:border-l-0">
+              <p className="text-[11px] font-medium text-[var(--text-muted)]">
+                Receipts
+              </p>
+              <p className="mono-num text-[13px] font-medium text-[var(--text-primary)]">
+                {formatCurrencyCents(
+                  primarySummary.totalReceiptsCents,
+                  primarySummary.currency,
+                )}
+              </p>
+            </div>
+            <div className="px-3 py-1.5">
+              <p className="text-[11px] font-medium text-[var(--text-muted)]">
+                Budgets
+              </p>
+              <p className="mono-num text-[13px] font-medium text-[var(--text-primary)]">
+                {formatCurrencyCents(
+                  primarySummary.totalBudgetsCents,
+                  primarySummary.currency,
+                )}
+              </p>
+            </div>
+            <div className="border-l border-[var(--border-hairline)] px-3 py-1.5 sm:border-l-0">
+              <p className="text-[11px] font-medium text-[var(--text-muted)]">
+                Remaining
+              </p>
+              <p
+                className={`mono-num text-[13px] font-medium ${
+                  remainingCents < 0
+                    ? "text-[var(--status-danger-text)]"
+                    : "text-[var(--text-primary)]"
+                }`}
+              >
+                {remainingCents >= 0 ? "+" : ""}
+                {formatCurrencyCents(remainingCents, primarySummary.currency)}
+              </p>
+            </div>
+            <div className="col-span-2 px-3 py-1.5 sm:col-span-1">
+              <p className="text-[11px] font-medium text-[var(--text-muted)]">
+                Pending
+              </p>
+              <p className="mono-num flex items-center gap-1.5 text-[13px] font-medium text-[var(--text-primary)]">
+                {primarySummary.pendingCount > 0 && (
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--status-warning)]" />
+                )}
+                <span>
+                  {primarySummary.pendingCount}{" "}
+                  <span className="text-[11px] font-normal text-[var(--text-muted)]">
+                    / {primarySummary.entryCount}
+                  </span>
+                </span>
+              </p>
+            </div>
           </div>
+        )}
 
-          <select
-            value={kindFilter}
-            onChange={(e) =>
-              setKindFilter(e.target.value as FinanceEntryKind | "all")
+        {/* Flat-Styled Category Spend Chart (tokenized for dark & light themes, 1:1 bar & legend buckets) */}
+        {showChart &&
+          categoryTotals.length > 0 &&
+          totalSpendCents > 0 &&
+          (() => {
+            const chartBuckets =
+              categoryTotals.length > 5
+                ? [
+                    ...categoryTotals.slice(0, 4),
+                    {
+                      name: "Other",
+                      cents: categoryTotals
+                        .slice(4)
+                        .reduce((acc, c) => acc + c.cents, 0),
+                      currency: categoryTotals[0].currency,
+                    },
+                  ]
+                : categoryTotals;
+            const bucketSum =
+              chartBuckets.reduce((acc, c) => acc + c.cents, 0) || 1;
+            const exact = chartBuckets.map((c) => (c.cents / bucketSum) * 100);
+            const floors = exact.map((v) => Math.floor(v));
+            const rem = 100 - floors.reduce((a, b) => a + b, 0);
+            const order = exact
+              .map((v, i) => ({ i, frac: v - floors[i] }))
+              .sort((a, b) => b.frac - a.frac);
+            for (let k = 0; k < rem && k < order.length; k += 1) {
+              floors[order[k].i] += 1;
             }
-            className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-          >
-            <option value="all">All types</option>
-            <option value="invoice">Invoices</option>
-            <option value="receipt">Receipts</option>
-            <option value="budget">Budgets</option>
-          </select>
+            const chartTokens = [
+              "var(--chart-1)",
+              "var(--chart-2)",
+              "var(--chart-3)",
+              "var(--chart-4)",
+              "var(--chart-5)",
+            ];
+            return (
+              <div className="shrink-0 border-b border-[var(--border-hairline)] bg-[var(--bg-surface)] px-4 py-2">
+                <div className="mb-2 flex items-center justify-between text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                  <span>Spend by Category</span>
+                  <span className="mono-num">
+                    {formatCurrencyCents(
+                      totalSpendCents,
+                      categoryTotals[0].currency,
+                    )}
+                  </span>
+                </div>
+                {/* Flat segmented proportion bar (1:1 synced with largest-remainder legend %) */}
+                <svg
+                  role="img"
+                  aria-label="Category spend breakdown"
+                  className="h-2 w-full overflow-hidden rounded-sm bg-[var(--bg-elevated)]"
+                  viewBox="0 0 1000 8"
+                  preserveAspectRatio="none"
+                >
+                  {chartBuckets.reduce<{
+                    offset: number;
+                    nodes: React.ReactNode[];
+                  }>(
+                    (acc, cat, idx) => {
+                      const pct = floors[idx];
+                      if (pct <= 0) return acc;
+                      const isLast = idx === chartBuckets.length - 1;
+                      const width = isLast
+                        ? Math.max(0, 1000 - acc.offset)
+                        : pct * 10;
+                      const fill = chartTokens[idx % chartTokens.length];
+                      acc.nodes.push(
+                        <rect
+                          key={cat.name}
+                          x={acc.offset}
+                          y={0}
+                          width={isLast ? width : Math.max(0, width - 2)}
+                          height={8}
+                          fill={fill}
+                        />,
+                      );
+                      acc.offset += width;
+                      return acc;
+                    },
+                    { offset: 0, nodes: [] },
+                  ).nodes}
+                </svg>
+                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+                  {chartBuckets.map((cat, idx) => {
+                    const pct = floors[idx];
+                    const isOther = cat.name === "Other";
+                    const isActiveFilter = categoryFilter === cat.name;
+                    const isDimmed =
+                      categoryFilter !== "all" && !isActiveFilter;
+                    if (isOther) {
+                      return (
+                        <span
+                          key={cat.name}
+                          className="inline-flex items-center gap-1.5 px-1 py-0.5 text-[var(--text-secondary)]"
+                        >
+                          <span
+                            className="h-2 w-2 rounded-[2px]"
+                            style={{
+                              backgroundColor:
+                                chartTokens[idx % chartTokens.length],
+                            }}
+                          />
+                          <span>{cat.name}</span>
+                          <span className="mono-num text-[var(--text-muted)]">
+                            {pct}%
+                          </span>
+                        </span>
+                      );
+                    }
+                    return (
+                      <button
+                        key={cat.name}
+                        type="button"
+                        aria-pressed={isActiveFilter}
+                        onClick={() =>
+                          setCategoryFilter((prev) =>
+                            prev === cat.name ? "all" : cat.name,
+                          )
+                        }
+                        className={`inline-flex items-center gap-1.5 rounded px-1 py-0.5 transition-colors ${
+                          isActiveFilter
+                            ? "bg-[var(--bg-elevated)] font-medium text-[var(--text-primary)]"
+                            : isDimmed
+                              ? "text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                        }`}
+                      >
+                        <span
+                          className="h-2 w-2 rounded-[2px]"
+                          style={{
+                            backgroundColor:
+                              chartTokens[idx % chartTokens.length],
+                          }}
+                        />
+                        <span>{cat.name}</span>
+                        <span className="mono-num text-[var(--text-muted)]">
+                          {pct}%
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
-          <select
-            value={statusFilter}
-            onChange={(e) =>
-              setStatusFilter(e.target.value as FinanceEntryStatus | "all")
-            }
-            className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
-          >
-            <option value="all">All statuses</option>
-            <option value="pending">Pending</option>
-            <option value="approved">Approved</option>
-            <option value="paid">Paid</option>
-          </select>
-        </div>
-
-        {/* Ledger Table */}
-        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs dark:border-slate-800 dark:bg-slate-900">
+        {/* High-Clarity Ledger Table */}
+        <div className="min-h-0 flex-1 overflow-auto">
           {!isNextcloudConnected ? (
-            <div className="p-10 text-center">
-              <Wallet className="mx-auto h-9 w-9 text-slate-400" />
-              <h3 className="mt-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
-                Sign in to Nextcloud to open your Finance ledger
-              </h3>
-              <p className="mx-auto mt-1 max-w-md text-xs text-slate-500 dark:text-slate-400">
-                Your invoices, receipts, and budgets are scoped per Nextcloud
-                account so they stay organized and link cleanly to files in{" "}
-                <code>{financeFolder}</code>.
+            <div className="flex h-64 flex-col items-center justify-center p-8 text-center">
+              <Landmark
+                className="mb-2.5 h-7 w-7 text-[var(--text-muted)]"
+                strokeWidth={1.5}
+              />
+              <p className="text-xs font-medium text-[var(--text-primary)]">
+                Sign in to Nextcloud to open Finance
+              </p>
+              <p className="mt-1 max-w-sm text-[11px] text-[var(--text-muted)]">
+                Invoices, receipts, and budgets link directly to documents in{" "}
+                <span className="mono-num">{financeFolder}</span>.
               </p>
             </div>
           ) : loading ? (
-            <div className="p-8 text-center text-sm text-slate-500">
-              Loading Finance ledger...
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex h-48 items-center justify-center gap-2 text-xs text-[var(--text-muted)]"
+            >
+              <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} />
+              Loading ledger…
             </div>
           ) : filteredEntries.length === 0 ? (
-            <div className="p-10 text-center">
-              <Receipt className="mx-auto h-9 w-9 text-slate-400" />
-              <h3 className="mt-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
+            <div className="flex h-56 flex-col items-center justify-center p-8 text-center">
+              <Receipt
+                className="mb-2.5 h-7 w-7 text-[var(--text-muted)] opacity-50"
+                strokeWidth={1.5}
+              />
+              <p className="text-xs font-medium text-[var(--text-secondary)]">
                 {entries.length === 0
-                  ? "No Finance entries yet"
+                  ? "No ledger entries yet"
                   : "No entries match your filters"}
-              </h3>
-              <p className="mx-auto mt-1 max-w-md text-xs text-slate-500 dark:text-slate-400">
-                Record invoices, receipts, and budgets, link them directly to
-                Nextcloud PDFs in <code>{financeFolder}</code>, and export clean
-                CSV spreadsheets anytime.
               </p>
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="border-b border-slate-200 bg-slate-50 text-[11px] font-semibold tracking-wider text-slate-500 uppercase dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-400">
-                  <tr>
-                    <th className="px-4 py-3">Date</th>
-                    <th className="px-4 py-3">Vendor &amp; Details</th>
-                    <th className="px-4 py-3">Category</th>
-                    <th className="px-4 py-3 text-right">Amount</th>
-                    <th className="px-4 py-3">Status</th>
-                    <th className="px-4 py-3 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {filteredEntries.map((entry) => (
+            <table className="w-full border-collapse text-left text-xs">
+              <thead className="sticky top-0 z-10 border-b border-[var(--border-hairline)] bg-[var(--bg-sidebar)] text-[10px] font-medium tracking-wider text-[var(--text-muted)] uppercase">
+                <tr>
+                  <th
+                    scope="col"
+                    aria-sort={
+                      sortBy === "date"
+                        ? sortAsc
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                    className="h-8 w-24 px-3 font-medium"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort("date")}
+                      className="inline-flex items-center gap-1 uppercase hover:text-[var(--text-primary)]"
+                    >
+                      Date
+                      {sortBy === "date" &&
+                        (sortAsc ? (
+                          <ArrowUp className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ) : (
+                          <ArrowDown className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ))}
+                    </button>
+                  </th>
+                  <th
+                    scope="col"
+                    aria-sort={
+                      sortBy === "vendor"
+                        ? sortAsc
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                    className="h-8 px-3 font-medium"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort("vendor")}
+                      className="inline-flex items-center gap-1 uppercase hover:text-[var(--text-primary)]"
+                    >
+                      Vendor &amp; Details
+                      {sortBy === "vendor" &&
+                        (sortAsc ? (
+                          <ArrowUp className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ) : (
+                          <ArrowDown className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ))}
+                    </button>
+                  </th>
+                  <th
+                    scope="col"
+                    aria-sort={
+                      sortBy === "category"
+                        ? sortAsc
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                    className="hidden h-8 w-28 px-2.5 font-medium lg:table-cell"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort("category")}
+                      className="inline-flex items-center gap-1 uppercase hover:text-[var(--text-primary)]"
+                    >
+                      Category
+                      {sortBy === "category" &&
+                        (sortAsc ? (
+                          <ArrowUp className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ) : (
+                          <ArrowDown className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ))}
+                    </button>
+                  </th>
+                  <th
+                    scope="col"
+                    aria-sort={
+                      sortBy === "status"
+                        ? sortAsc
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                    className="h-8 w-20 px-2.5 font-medium"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort("status")}
+                      className="inline-flex items-center gap-1 uppercase hover:text-[var(--text-primary)]"
+                    >
+                      Status
+                      {sortBy === "status" &&
+                        (sortAsc ? (
+                          <ArrowUp className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ) : (
+                          <ArrowDown className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ))}
+                    </button>
+                  </th>
+                  <th
+                    scope="col"
+                    aria-sort={
+                      sortBy === "amount"
+                        ? sortAsc
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                    className="h-8 w-28 px-3 text-right font-medium"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSort("amount")}
+                      className="ml-auto inline-flex items-center gap-1 uppercase hover:text-[var(--text-primary)]"
+                    >
+                      Amount
+                      {sortBy === "amount" &&
+                        (sortAsc ? (
+                          <ArrowUp className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ) : (
+                          <ArrowDown className="h-2.5 w-2.5" strokeWidth={1.75} />
+                        ))}
+                    </button>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border-subtle)]">
+                {(() => {
+                  const hasSelectedInFiltered = Boolean(
+                    selectedEntryId &&
+                      filteredEntries.some((e) => e.id === selectedEntryId),
+                  );
+                  return filteredEntries.map((entry, idx) => {
+                  const isSelected = selectedEntryId === entry.id;
+                  const isBudget = entry.kind === "budget";
+                  const isTabStop =
+                    isSelected || (!hasSelectedInFiltered && idx === 0);
+                  return (
                     <tr
                       key={entry.id}
-                      className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40"
+                      data-entry-id={entry.id}
+                      tabIndex={isTabStop ? 0 : -1}
+                      onClick={() => {
+                        setPreviewItem(null);
+                        setSelectedEntryId(entry.id);
+                        onSetInspectorOpen(true);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.target !== e.currentTarget) return;
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setPreviewItem(null);
+                          setSelectedEntryId(entry.id);
+                          onSetInspectorOpen(true);
+                        }
+                      }}
+                      aria-current={isSelected ? "true" : undefined}
+                      className={`group cursor-pointer transition-colors focus-visible:bg-[var(--bg-hover)]/80 focus-visible:outline-1 focus-visible:outline-[var(--focus-ring)] ${
+                        isSelected
+                          ? "bg-[var(--accent-soft)]"
+                          : "hover:bg-[var(--bg-hover)]/60"
+                      }`}
                     >
-                      <td className="px-4 py-3 whitespace-nowrap font-mono text-[11px] text-slate-500">
+                      <td className="mono-num relative px-3 py-1.5 whitespace-nowrap text-[11px] text-[var(--text-muted)]">
+                        {isSelected && (
+                          <span
+                            aria-hidden="true"
+                            className="absolute inset-y-0 left-0 w-0.5 bg-[var(--accent)]"
+                          />
+                        )}
                         {entry.entryDate}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="relative max-w-0 px-3 py-1.5">
                         <div className="flex items-center gap-1.5">
-                          <span className="font-semibold text-slate-900 dark:text-slate-100">
+                          <span className="truncate text-[13px] font-medium text-[var(--text-primary)]">
                             {entry.vendor}
                           </span>
-                          <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 capitalize dark:bg-slate-800 dark:text-slate-400">
+                          {entry.cloudFilePath && (
+                            <IconButton
+                              size="xs"
+                              tabIndex={isTabStop ? 0 : -1}
+                              label={`Preview ${entry.cloudFilePath}`}
+                              className="!h-4 !w-4"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handlePreviewLinkedFile(entry.cloudFilePath!);
+                              }}
+                            >
+                              <FileText
+                                className="h-3 w-3 text-[var(--text-muted)] group-hover:text-[var(--text-primary)]"
+                                strokeWidth={1.5}
+                              />
+                            </IconButton>
+                          )}
+                        </div>
+                        <div className="mt-0.5 flex items-center gap-1.5">
+                          <span className="mono-num shrink-0 text-[10px] text-[var(--text-muted)] uppercase">
                             {entry.kind}
                           </span>
+                          {entry.description && (
+                            <>
+                              <span className="text-[10px] text-[var(--text-muted)]">
+                                ·
+                              </span>
+                              <p className="truncate text-[11px] text-[var(--text-muted)]">
+                                {entry.description}
+                              </p>
+                            </>
+                          )}
                         </div>
-                        {entry.description && (
-                          <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
-                            {entry.description}
-                          </p>
-                        )}
-                        {entry.cloudFilePath && (
-                          <button
-                            type="button"
-                            disabled={!isNextcloudConnected}
-                            onClick={() =>
-                              handlePreviewLinkedFile(entry.cloudFilePath!)
-                            }
-                            className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:underline disabled:opacity-50 dark:text-blue-400"
-                          >
-                            <FileText className="h-3 w-3" />
-                            {entry.cloudFilePath}
-                          </button>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
-                        {entry.category}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono font-semibold whitespace-nowrap text-slate-900 dark:text-slate-100">
-                        {formatCurrencyCents(entry.amountCents, entry.currency)}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize ${statusBadgeClass(entry.status)}`}
+                        <div
+                          onClick={(e) => e.stopPropagation()}
+                          className={`absolute inset-y-0 right-2 flex items-center gap-0.5 rounded-md bg-[var(--bg-elevated)] px-1 transition-opacity ${
+                            confirmDeleteId === entry.id
+                              ? "pointer-events-auto opacity-100"
+                              : "pointer-events-none opacity-0 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+                          }`}
                         >
+                          {confirmDeleteId !== entry.id && (
+                            <IconButton
+                              size="xs"
+                              tabIndex={isTabStop ? 0 : -1}
+                              label="Edit entry"
+                              onClick={() => setDraft(draftFromEntry(entry))}
+                            >
+                              <Pencil className="h-3.5 w-3.5" strokeWidth={1.5} />
+                            </IconButton>
+                          )}
+                          <InlineDeleteConfirm
+                            armed={confirmDeleteId === entry.id}
+                            tabIndex={isTabStop ? 0 : -1}
+                            onArm={() => setConfirmDeleteId(entry.id)}
+                            onCancel={() => setConfirmDeleteId(null)}
+                            onConfirm={() => void handleDelete(entry.id)}
+                            label="Delete entry"
+                          />
+                        </div>
+                      </td>
+                      <td className="hidden px-2.5 py-1.5 lg:table-cell">
+                        <span className="inline-flex max-w-full truncate rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[11px] text-[var(--text-secondary)]">
+                          {entry.category}
+                        </span>
+                      </td>
+                      <td className="px-2.5 py-1.5 whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] capitalize">
+                          <span
+                            className={`h-1.5 w-1.5 rounded-full ${statusDotColor(entry.status)}`}
+                          />
                           {entry.status}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-right whitespace-nowrap">
-                        <div className="inline-flex items-center gap-1">
-                          {entry.cloudFilePath && isNextcloudConnected && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handlePreviewLinkedFile(entry.cloudFilePath!)
-                              }
-                              title="Preview linked invoice"
-                              className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-blue-600 dark:hover:bg-slate-800"
-                            >
-                              <Eye className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => setDraft(draftFromEntry(entry))}
-                            title="Edit entry"
-                            className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-slate-100"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          {confirmDeleteId === entry.id ? (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => void handleDelete(entry.id)}
-                                className="rounded-lg bg-rose-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-rose-700"
-                              >
-                                Delete
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setConfirmDeleteId(null)}
-                                className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] dark:border-slate-700"
-                              >
-                                Cancel
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteId(entry.id)}
-                              title="Delete entry"
-                              className="rounded-lg p-1.5 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </div>
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        <span
+                          className={`mono-num text-[13px] font-medium ${
+                            isBudget
+                              ? "text-[var(--status-positive-text)]"
+                              : "text-[var(--text-primary)]"
+                          }`}
+                        >
+                          {isBudget ? "+" : "−"}
+                          {formatCurrencyCents(entry.amountCents, entry.currency)}
+                        </span>
                       </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  );
+                  });
+                })()}
+              </tbody>
+            </table>
           )}
         </div>
       </div>
 
-      {/* Side-by-side Linked Document Preview Pane */}
-      {previewItem && (
-        <div
-          className={
-            previewExpanded
-              ? "fixed inset-4 z-40 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900"
-              : "h-[76vh] w-full shrink-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs lg:w-[440px] dark:border-slate-800 dark:bg-slate-900"
-          }
-        >
-          <FilePreviewPane
-            item={previewItem}
-            expanded={previewExpanded}
-            onToggleExpand={() => setPreviewExpanded((prev) => !prev)}
-            onClose={() => {
-              setPreviewItem(null);
-              setPreviewExpanded(false);
-            }}
-            onRefreshFolder={() => void loadFinanceFolderFiles()}
-          />
-        </div>
-      )}
-
-      {/* Add / Edit Entry Modal */}
+      {/* Add / Edit Entry Modal (shared Modal primitive with scrim close, Escape, focus trap & restore) */}
       {draft && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-xs">
+        <Modal
+          ariaLabel={draft.id ? "Edit Finance Entry" : "Add Finance Entry"}
+          closeOnScrim={!isDraftDirty}
+          onClose={requestCloseDraft}
+        >
           <form
             onSubmit={handleSaveEntry}
-            className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            className="w-full max-w-lg overflow-hidden rounded-md border border-[var(--border-strong)] bg-[var(--bg-sidebar)]"
           >
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4 dark:border-slate-800">
-              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+            <div className="flex h-11 items-center justify-between gap-2 border-b border-[var(--border-hairline)] px-4">
+              <h2 className="text-xs font-medium text-[var(--text-primary)]">
                 {draft.id ? "Edit Finance Entry" : "Add Finance Entry"}
               </h2>
-              <button
-                type="button"
-                onClick={() => setDraft(null)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              {confirmDiscardDraft ? (
+                <InlineDeleteConfirm
+                  armed
+                  onArm={() => setConfirmDiscardDraft(true)}
+                  onCancel={() => setConfirmDiscardDraft(false)}
+                  onConfirm={() => {
+                    setConfirmDiscardDraft(false);
+                    setDraft(null);
+                  }}
+                  label="Discard unsaved finance entry changes"
+                  confirmLabel="Discard"
+                />
+              ) : (
+                <IconButton
+                  size="xs"
+                  label="Close"
+                  onClick={requestCloseDraft}
+                >
+                  <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+                </IconButton>
+              )}
             </div>
 
-            <div className="space-y-4 p-5">
+            <div className="space-y-3.5 p-4 text-xs">
               {error && (
                 <ErrorBanner error={error} onDismiss={() => setError(null)} />
               )}
               <div className="grid gap-3 sm:grid-cols-3">
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-type"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Type
                   </label>
-                  <select
+                  <Select
+                    id="finance-entry-type"
+                    ariaLabel="Entry type"
                     value={draft.kind}
-                    onChange={(e) =>
+                    onChange={(val) =>
                       setDraft((prev) =>
-                        prev
-                          ? { ...prev, kind: e.target.value as FinanceEntryKind }
-                          : prev,
+                        prev ? { ...prev, kind: val as FinanceEntryKind } : prev,
                       )
                     }
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950"
-                  >
-                    <option value="invoice">Invoice</option>
-                    <option value="receipt">Receipt</option>
-                    <option value="budget">Budget</option>
-                  </select>
+                    options={[
+                      { value: "invoice", label: "Invoice" },
+                      { value: "receipt", label: "Receipt" },
+                      { value: "budget", label: "Budget" },
+                    ]}
+                  />
                 </div>
 
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-status"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Status
                   </label>
-                  <select
+                  <Select
+                    id="finance-entry-status"
+                    ariaLabel="Entry status"
                     value={draft.status}
-                    onChange={(e) =>
+                    onChange={(val) =>
                       setDraft((prev) =>
                         prev
-                          ? {
-                              ...prev,
-                              status: e.target.value as FinanceEntryStatus,
-                            }
+                          ? { ...prev, status: val as FinanceEntryStatus }
                           : prev,
                       )
                     }
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950"
-                  >
-                    <option value="pending">Pending</option>
-                    <option value="approved">Approved</option>
-                    <option value="paid">Paid</option>
-                  </select>
+                    options={[
+                      { value: "pending", label: "Pending" },
+                      { value: "approved", label: "Approved" },
+                      { value: "paid", label: "Paid" },
+                    ]}
+                  />
                 </div>
 
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-date"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Date
                   </label>
-                  <input
-                    type="date"
+                  <DateInput
+                    id="finance-entry-date"
                     required
+                    ariaLabel="Entry date"
                     value={draft.entryDate}
-                    onChange={(e) =>
+                    onChange={(iso) =>
                       setDraft((prev) =>
-                        prev ? { ...prev, entryDate: e.target.value } : prev,
+                        prev ? { ...prev, entryDate: iso } : prev,
                       )
                     }
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950"
                   />
                 </div>
               </div>
 
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-vendor"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Vendor / Title *
                   </label>
                   <input
+                    id="finance-entry-vendor"
                     type="text"
                     required
                     value={draft.vendor}
@@ -787,35 +1672,51 @@ export function FinanceView({
                         prev ? { ...prev, vendor: e.target.value } : prev,
                       )
                     }
-                    placeholder="Acme Carbon Supplies"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    placeholder="Toray Composite Materials"
+                    className="h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
 
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-category"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Category
                   </label>
-                  <input
-                    type="text"
+                  <Combobox
+                    id="finance-entry-category"
+                    ariaLabel="Category"
                     value={draft.category}
-                    onChange={(e) =>
+                    onChange={(next) =>
                       setDraft((prev) =>
-                        prev ? { ...prev, category: e.target.value } : prev,
+                        prev ? { ...prev, category: next } : prev,
                       )
                     }
-                    placeholder="Materials, Travel, Software..."
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                    suggestions={[
+                      ...categoryTotals.map((c) => c.name),
+                      "Operations",
+                      "Composites",
+                      "Machining",
+                      "Electronics",
+                      "3D Printing",
+                      "Infrastructure",
+                    ]}
+                    placeholder="Composites, Machining, Software…"
                   />
                 </div>
               </div>
 
               <div className="grid gap-3 sm:grid-cols-3">
                 <div className="space-y-1 sm:col-span-2">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <label
+                    htmlFor="finance-entry-amount"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
                     Amount *
                   </label>
                   <input
+                    id="finance-entry-amount"
                     type="text"
                     required
                     value={draft.amountText}
@@ -825,15 +1726,19 @@ export function FinanceView({
                       )
                     }
                     placeholder="450.00"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-950"
+                    className="mono-num h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
 
                 <div className="space-y-1">
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    Currency (ISO)
+                  <label
+                    htmlFor="finance-entry-currency"
+                    className="block text-[11px] text-[var(--text-secondary)]"
+                  >
+                    Currency
                   </label>
                   <input
+                    id="finance-entry-currency"
                     type="text"
                     required
                     maxLength={3}
@@ -846,16 +1751,20 @@ export function FinanceView({
                       )
                     }
                     placeholder="EUR"
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-sm uppercase dark:border-slate-700 dark:bg-slate-950"
+                    className="mono-num h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] uppercase focus:border-[var(--accent)] focus:outline-none"
                   />
                 </div>
               </div>
 
               <div className="space-y-1">
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                <label
+                  htmlFor="finance-entry-notes"
+                  className="block text-[11px] text-[var(--text-secondary)]"
+                >
                   Description / Notes
                 </label>
                 <input
+                  id="finance-entry-notes"
                   type="text"
                   value={draft.description}
                   onChange={(e) =>
@@ -863,17 +1772,23 @@ export function FinanceView({
                       prev ? { ...prev, description: e.target.value } : prev,
                     )
                   }
-                  placeholder="Optional invoice number or project note"
-                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950"
+                  placeholder="Optional invoice number or project reference"
+                  className="h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                 />
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Linked Nextcloud Document (optional)
+                <label
+                  htmlFor="finance-entry-doc"
+                  className="block text-[11px] text-[var(--text-secondary)]"
+                >
+                  Linked Nextcloud Document
                 </label>
                 {folderFiles.length > 0 && (
-                  <select
+                  <Select
+                    id="finance-entry-doc"
+                    ariaLabel="Linked Nextcloud document"
+                    placeholder={`Choose from ${financeFolder}…`}
                     value={
                       folderFiles.some(
                         (f) => f.entry.path === draft.cloudFilePath,
@@ -881,29 +1796,27 @@ export function FinanceView({
                         ? draft.cloudFilePath
                         : ""
                     }
-                    onChange={(e) => {
-                      if (e.target.value) {
+                    onChange={(val) => {
+                      if (val) {
                         setDraft((prev) =>
-                          prev
-                            ? { ...prev, cloudFilePath: e.target.value }
-                            : prev,
+                          prev ? { ...prev, cloudFilePath: val } : prev,
                         );
                       }
                     }}
-                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-950"
-                  >
-                    <option value="">
-                      Choose a file from {financeFolder}...
-                    </option>
-                    {folderFiles.map((file) => (
-                      <option key={file.entry.path} value={file.entry.path}>
-                        {file.entry.name} ({file.entry.path})
-                      </option>
-                    ))}
-                  </select>
+                    options={folderFiles.map((file) => ({
+                      value: file.entry.path,
+                      label: file.entry.name,
+                    }))}
+                  />
                 )}
                 <input
+                  id={
+                    folderFiles.length === 0
+                      ? "finance-entry-doc"
+                      : "finance-entry-doc-path"
+                  }
                   type="text"
+                  aria-label="Linked Nextcloud document path"
                   value={draft.cloudFilePath}
                   onChange={(e) =>
                     setDraft((prev) =>
@@ -911,33 +1824,33 @@ export function FinanceView({
                     )
                   }
                   placeholder={`${financeFolder}/invoice-2026-01.pdf`}
-                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-xs dark:border-slate-700 dark:bg-slate-950"
+                  className="mono-num h-8 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
                 />
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-3.5 dark:border-slate-800">
+            <div className="flex items-center justify-end gap-2 border-t border-[var(--border-hairline)] px-4 py-3">
               <button
                 type="button"
-                onClick={() => setDraft(null)}
-                className="rounded-xl border border-slate-300 px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                onClick={requestCloseDraft}
+                className="h-8 rounded-md border border-[var(--border-strong)] px-3 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={savingEntry}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3.5 text-xs font-medium text-white hover:bg-[var(--accent-hover)] disabled:opacity-50"
               >
-                {savingEntry ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : null}
+                {savingEntry && (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                )}
                 Save Entry
               </button>
             </div>
           </form>
-        </div>
+        </Modal>
       )}
-    </div>
+    </WorkspaceLayout>
   );
 }

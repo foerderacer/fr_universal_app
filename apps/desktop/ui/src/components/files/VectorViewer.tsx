@@ -1,7 +1,8 @@
 import DOMPurify from "dompurify";
 import DxfParser from "dxf-parser";
-import { ZoomIn, ZoomOut } from "lucide-react";
+import { Grid2x2, Moon, Sun, ZoomIn, ZoomOut } from "lucide-react";
 import { useMemo, useState } from "react";
+import { IconButton } from "../ui/Tooltip";
 
 interface SvgViewerProps {
   svgText: string;
@@ -15,12 +16,10 @@ function sanitizeSvgStrict(rawSvg: string): string {
       const val = node.getAttribute(attr);
       if (val === null) continue;
       const trimmed = val.trim();
-      const allowed = trimmed.startsWith("#") || SAFE_SVG_DATA_IMAGE_RE.test(trimmed);
-      if (!allowed) {
-        node.removeAttribute(attr);
-      }
+      const allowed =
+        trimmed.startsWith("#") || SAFE_SVG_DATA_IMAGE_RE.test(trimmed);
+      if (!allowed) node.removeAttribute(attr);
     }
-    // Strip inline style attributes that could reference remote url(...) resources.
     const styleAttr = node.getAttribute("style");
     if (styleAttr && /url\s*\(/i.test(styleAttr)) {
       node.removeAttribute("style");
@@ -56,56 +55,68 @@ export function SvgViewer({ svgText }: SvgViewerProps) {
 
   const bgClass =
     bg === "dark"
-      ? "bg-slate-900"
+      ? "bg-[var(--bg-viewport)]"
       : bg === "light"
-        ? "bg-white"
+        ? "bg-[var(--bg-surface)]"
         : "fr-checkerboard";
 
   return (
-    <div className="flex h-full flex-col gap-3">
-      <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex items-center gap-1">
-          {(["checker", "light", "dark"] as const).map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              onClick={() => setBg(mode)}
-              className={`rounded-lg px-2.5 py-1 text-xs font-medium capitalize ${
-                bg === mode
-                  ? "bg-blue-600 text-white"
-                  : "text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-              }`}
-            >
-              {mode}
-            </button>
-          ))}
+    <div className="flex h-full flex-col gap-2">
+      <div className="flex items-center justify-between rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2 py-1">
+        <div className="flex items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Checkerboard backdrop"
+            active={bg === "checker"}
+            onClick={() => setBg("checker")}
+          >
+            <Grid2x2 className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <IconButton
+            size="xs"
+            label="Light backdrop"
+            active={bg === "light"}
+            onClick={() => setBg("light")}
+          >
+            <Sun className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <IconButton
+            size="xs"
+            label="Dark backdrop"
+            active={bg === "dark"}
+            onClick={() => setBg("dark")}
+          >
+            <Moon className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
 
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.max(0.25, Number((z - 0.25).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom out"
+        <div className="flex items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Zoom out"
+            onClick={() =>
+              setZoom((z) => Math.max(0.25, Number((z - 0.25).toFixed(2))))
+            }
           >
-            <ZoomOut className="h-4 w-4" />
-          </button>
-          <span className="w-12 text-center text-xs font-medium text-slate-600 dark:text-slate-300">
+            <ZoomOut className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <span className="mono-num w-10 text-center text-[11px] text-[var(--text-secondary)]">
             {Math.round(zoom * 100)}%
           </span>
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.min(5, Number((z + 0.25).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom in"
+          <IconButton
+            size="xs"
+            label="Zoom in"
+            onClick={() =>
+              setZoom((z) => Math.min(5, Number((z + 0.25).toFixed(2))))
+            }
           >
-            <ZoomIn className="h-4 w-4" />
-          </button>
+            <ZoomIn className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
       </div>
 
       <div
-        className={`flex flex-1 items-center justify-center overflow-auto rounded-xl border border-slate-200 p-6 dark:border-slate-800 ${bgClass}`}
+        className={`flex flex-1 items-center justify-center overflow-auto rounded-md border border-[var(--border-hairline)] p-5 ${bgClass}`}
       >
         <div
           style={{ transform: `scale(${zoom})`, transformOrigin: "center" }}
@@ -166,7 +177,14 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
         maxY = Math.max(maxY, -y);
       };
 
-      const elements: Array<{ key: string; kind: "path" | "circle"; d?: string; cx?: number; cy?: number; r?: number }> = [];
+      const elements: Array<{
+        key: string;
+        kind: "path" | "circle";
+        d?: string;
+        cx?: number;
+        cy?: number;
+        r?: number;
+      }> = [];
 
       entities.forEach((ent, idx) => {
         if (ent.type === "LINE" && ent.vertices && ent.vertices.length >= 2) {
@@ -232,7 +250,7 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
 
       if (!Number.isFinite(minX)) {
         return {
-          error: "We couldn't calculate the drawing bounds for this DXF file.",
+          error: "We couldn't calculate drawing bounds for this DXF file.",
           technicalDetails: null as string | null,
           elements: [],
           viewBox: "0 0 100 100",
@@ -253,7 +271,7 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
     } catch (err) {
       return {
         error:
-          'We couldn\'t preview this DXF drawing in the app. Click "Open in Native App" to view it in your CAD program.',
+          'We couldn\'t preview this DXF drawing in the app. Open in native app to view it in CAD.',
         technicalDetails: err instanceof Error ? err.message : String(err),
         elements: [],
         viewBox: "0 0 100 100",
@@ -264,12 +282,12 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
 
   if (rendered.error) {
     return (
-      <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+      <div className="rounded-md border border-[var(--status-warning)]/35 bg-[var(--status-warning-soft)] p-3.5 text-xs text-[var(--text-primary)]">
         <p>{rendered.error}</p>
         {rendered.technicalDetails && (
-          <details className="mt-2 text-xs opacity-80">
+          <details className="mt-2 text-[11px] text-[var(--text-muted)]">
             <summary className="cursor-pointer font-medium">Technical details</summary>
-            <p className="mt-1 font-mono break-all">{rendered.technicalDetails}</p>
+            <p className="mono-num mt-1 break-all">{rendered.technicalDetails}</p>
           </details>
         )}
       </div>
@@ -277,39 +295,41 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
   }
 
   return (
-    <div className="flex h-full flex-col gap-3">
-      <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
-        <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
-          2D CAD Vector ({rendered.elements.length} primitives)
+    <div className="flex h-full flex-col gap-2">
+      <div className="flex items-center justify-between rounded-md border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2.5 py-1">
+        <span className="mono-num text-[11px] text-[var(--text-secondary)]">
+          DXF · {rendered.elements.length} primitives
         </span>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom out"
+        <div className="flex items-center gap-0.5">
+          <IconButton
+            size="xs"
+            label="Zoom out"
+            onClick={() =>
+              setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))
+            }
           >
-            <ZoomOut className="h-4 w-4" />
-          </button>
-          <span className="w-12 text-center text-xs font-medium text-slate-600 dark:text-slate-300">
+            <ZoomOut className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
+          <span className="mono-num w-10 text-center text-[11px] text-[var(--text-secondary)]">
             {Math.round(zoom * 100)}%
           </span>
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.min(6, Number((z + 0.25).toFixed(2))))}
-            className="rounded-lg p-1.5 text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label="Zoom in"
+          <IconButton
+            size="xs"
+            label="Zoom in"
+            onClick={() =>
+              setZoom((z) => Math.min(6, Number((z + 0.25).toFixed(2))))
+            }
           >
-            <ZoomIn className="h-4 w-4" />
-          </button>
+            <ZoomIn className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         </div>
       </div>
 
-      <div className="flex flex-1 items-center justify-center overflow-auto rounded-xl border border-slate-200 bg-slate-950 p-4 dark:border-slate-800">
+      <div className="flex flex-1 items-center justify-center overflow-auto rounded-md border border-[var(--border-hairline)] bg-[var(--bg-viewport)] p-4">
         <svg
           viewBox={rendered.viewBox}
           style={{ transform: `scale(${zoom})`, transformOrigin: "center" }}
-          className="h-full max-h-[520px] w-full transition-transform"
+          className="h-full max-h-full w-full transition-transform"
         >
           {rendered.elements.map((el) =>
             el.kind === "circle" ? (
@@ -319,7 +339,7 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
                 cy={el.cy}
                 r={el.r}
                 fill="none"
-                stroke="#38bdf8"
+                stroke="var(--accent-vector)"
                 strokeWidth={rendered.strokeWidth}
               />
             ) : (
@@ -327,7 +347,7 @@ export function DxfViewer({ dxfText }: DxfViewerProps) {
                 key={el.key}
                 d={el.d}
                 fill="none"
-                stroke="#38bdf8"
+                stroke="var(--accent-vector)"
                 strokeWidth={rendered.strokeWidth}
                 strokeLinecap="round"
                 strokeLinejoin="round"

@@ -1,53 +1,64 @@
 import { AlertCircle, ChevronDown, ChevronUp, X } from "lucide-react";
 import { useState } from "react";
 import type { UserFacingError } from "../bindings/tauri";
+import { IconButton } from "./ui/Tooltip";
 
 interface ErrorBannerProps {
   error: UserFacingError;
   onDismiss?: () => void;
+  variant?: "card" | "strip";
 }
 
-export function ErrorBanner({ error, onDismiss }: ErrorBannerProps) {
+export function ErrorBanner({
+  error,
+  onDismiss,
+  variant = "card",
+}: ErrorBannerProps) {
   const [showDetails, setShowDetails] = useState(false);
 
   return (
     <div
       role="alert"
-      className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-100"
+      className={
+        variant === "strip"
+          ? "border-b border-[var(--status-danger)]/35 bg-[var(--status-danger-soft)] px-4 py-2 text-xs text-[var(--text-primary)]"
+          : "rounded-md border border-[var(--status-danger)]/35 bg-[var(--status-danger-soft)] px-3 py-2.5 text-xs text-[var(--text-primary)]"
+      }
     >
-      <div className="flex items-start gap-3">
-        <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600 dark:text-rose-400" />
+      <div className="flex items-start gap-2.5">
+        <AlertCircle
+          className="mt-0.5 h-4 w-4 shrink-0 text-[var(--status-danger-text)]"
+          strokeWidth={1.5}
+        />
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold">{error.title}</p>
-          <p className="mt-1 text-sm text-rose-800 dark:text-rose-200">
-            {error.message}
-          </p>
+          <p className="font-medium text-[var(--text-primary)]">{error.title}</p>
+          <p className="mt-0.5 text-[var(--text-secondary)]">{error.message}</p>
           {error.recoveryHint && (
-            <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
+            <p className="mt-0.5 text-[11px] text-[var(--text-muted)]">
               {error.recoveryHint}
             </p>
           )}
           {error.technicalDetails && (
-            <div className="mt-2">
+            <div className="mt-1.5">
               <button
                 type="button"
                 onClick={() => setShowDetails((prev) => !prev)}
-                className="inline-flex items-center gap-1 text-xs font-medium text-rose-700 underline-offset-2 hover:underline dark:text-rose-300"
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
               >
                 {showDetails ? (
                   <>
-                    <ChevronUp className="h-3.5 w-3.5" />
-                    Hide technical details
+                    <ChevronUp className="h-3 w-3" strokeWidth={1.5} />
+                    Hide details
                   </>
                 ) : (
                   <>
-                    <ChevronDown className="h-3.5 w-3.5" />
-                    Show technical details
+                    <ChevronDown className="h-3 w-3" strokeWidth={1.5} />
+                    Technical details
                   </>
                 )}
               </button>
               {showDetails && (
-                <pre className="mt-2 overflow-x-auto rounded-lg bg-rose-100/80 p-2.5 font-mono text-xs text-rose-900 dark:bg-rose-950/80 dark:text-rose-200">
+                <pre className="mono-num mt-1.5 overflow-x-auto rounded border border-[var(--border-hairline)] bg-[var(--bg-app)] p-2 text-[11px] text-[var(--text-secondary)]">
                   [{error.code}] {error.technicalDetails}
                 </pre>
               )}
@@ -55,14 +66,9 @@ export function ErrorBanner({ error, onDismiss }: ErrorBannerProps) {
           )}
         </div>
         {onDismiss && (
-          <button
-            type="button"
-            onClick={onDismiss}
-            aria-label="Dismiss message"
-            className="rounded-lg p-1 text-rose-500 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-900/50 dark:hover:text-rose-200"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <IconButton size="xs" label="Dismiss error" onClick={onDismiss}>
+            <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+          </IconButton>
         )}
       </div>
     </div>

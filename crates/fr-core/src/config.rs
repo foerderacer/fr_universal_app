@@ -77,7 +77,7 @@ fn default_finance_folder() -> String {
 }
 
 fn default_theme() -> String {
-    "system".to_owned()
+    "dark".to_owned()
 }
 
 impl Default for AppConfig {

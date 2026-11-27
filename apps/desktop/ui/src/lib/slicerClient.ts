@@ -13,6 +13,8 @@ import {
   type StartSliceJobRequest_Deserialize,
 } from "../bindings/tauri";
 
+import { PREVIEW_SLICE_JOBS } from "./previewFixtures";
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
@@ -61,9 +63,9 @@ export async function getSlicerOverview(): Promise<SlicerOverview_Serialize> {
         maxBedTempC: 120,
       },
       binary: {
-        available: false,
-        path: null,
-        version: null,
+        available: true,
+        path: "/usr/bin/prusa-slicer",
+        version: "PrusaSlicer 2.8.1",
         source: "browser_preview",
       },
       rigidityPresets: [
@@ -145,9 +147,57 @@ export async function getSlicerOverview(): Promise<SlicerOverview_Serialize> {
           extrusionMultiplier: 1,
           hint: null,
         },
+        {
+          id: "petg",
+          name: "PETG",
+          filamentType: "PETG",
+          builtIn: true,
+          nozzleTempC: 240,
+          firstLayerNozzleTempC: 230,
+          bedTempC: 85,
+          firstLayerBedTempC: 85,
+          fanMinPercent: 30,
+          fanMaxPercent: 50,
+          disableFanFirstLayers: 3,
+          maxVolumetricSpeedMm3S: 10,
+          extrusionMultiplier: 1,
+          hint: null,
+        },
+        {
+          id: "abs",
+          name: "ABS",
+          filamentType: "ABS",
+          builtIn: true,
+          nozzleTempC: 255,
+          firstLayerNozzleTempC: 255,
+          bedTempC: 100,
+          firstLayerBedTempC: 100,
+          fanMinPercent: 15,
+          fanMaxPercent: 30,
+          disableFanFirstLayers: 4,
+          maxVolumetricSpeedMm3S: 11,
+          extrusionMultiplier: 1,
+          hint: "Recommended with enclosure & ventilation on open-frame MK3S.",
+        },
+        {
+          id: "tpu",
+          name: "TPU",
+          filamentType: "FLEX",
+          builtIn: true,
+          nozzleTempC: 230,
+          firstLayerNozzleTempC: 230,
+          bedTempC: 50,
+          firstLayerBedTempC: 50,
+          fanMinPercent: 70,
+          fanMaxPercent: 100,
+          disableFanFirstLayers: 3,
+          maxVolumetricSpeedMm3S: 3.5,
+          extrusionMultiplier: 1.05,
+          hint: null,
+        },
       ],
       materialDraft: null,
-      recentJobs: [],
+      recentJobs: PREVIEW_SLICE_JOBS,
     };
   }
   return commands.getSlicerOverview();
