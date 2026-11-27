@@ -7,4 +7,6 @@ export const IS_MAC_PLATFORM =
 
 export const MOD_KEY = IS_MAC_PLATFORM ? "⌘" : "Ctrl+";
 export const ALT_KEY = IS_MAC_PLATFORM ? "⌥" : "Alt+";
-export const QUICK_CHAT_SHORTCUT = `${ALT_KEY}C`;
+// Use ⌘ on macOS so Option+5/6 ([ / ]) and Option+C (ç) never collide on German/French layouts.
+export const NAV_MOD_KEY = IS_MAC_PLATFORM ? "⌘" : "Alt+";
+export const QUICK_CHAT_SHORTCUT = IS_MAC_PLATFORM ? "⌘J" : "Alt+C";

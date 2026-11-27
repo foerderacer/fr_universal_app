@@ -8,17 +8,19 @@ import {
   User,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   TalkMessage_Serialize,
   TalkRoom_Serialize,
 } from "../../bindings/tauri";
 import { formatIsoDate, formatTime24h } from "../../lib/dateFormat";
-import { ALT_KEY, QUICK_CHAT_SHORTCUT } from "../../lib/platform";
+import { NAV_MOD_KEY, QUICK_CHAT_SHORTCUT } from "../../lib/platform";
 import { hasActiveOverlay, isEditableTarget } from "../../lib/shortcuts";
 import {
+  getTalkDraft,
   getTalkMessages,
   listTalkRooms,
+  saveTalkDraft,
   sendTalkMessage,
 } from "../../lib/talkClient";
 import { IconButton } from "../ui/Tooltip";
@@ -42,14 +44,100 @@ export function QuickChatDrawer({
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [messages, setMessages] = useState<TalkMessage_Serialize[]>([]);
+  const [messagesRoomToken, setMessagesRoomToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [messagesError, setMessagesError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
+  const [sendingRooms, setSendingRooms] = useState<Record<string, boolean>>({});
   const [sendError, setSendError] = useState<string | null>(null);
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const selectedTokenRef = useRef<string | null>(null);
+  selectedTokenRef.current = selectedToken;
+  const messagesRoomTokenRef = useRef<string | null>(null);
+  messagesRoomTokenRef.current = messagesRoomToken;
+  const messagesReqSeqRef = useRef(0);
+  const sendingRoomsRef = useRef<Set<string>>(new Set());
+  const draftByRoomRef = useRef<Map<string, string>>(new Map());
+  const dirtyDraftTokensRef = useRef<Set<string>>(new Set());
+  const draftSaveTimersRef = useRef<Map<string, number>>(new Map());
+
+  const cancelDraftTimer = useCallback((token: string) => {
+    const timer = draftSaveTimersRef.current.get(token);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      draftSaveTimersRef.current.delete(token);
+    }
+  }, []);
+
+  const flushDraftForRoom = useCallback(
+    (token: string) => {
+      cancelDraftTimer(token);
+      if (!dirtyDraftTokensRef.current.has(token)) return;
+      dirtyDraftTokensRef.current.delete(token);
+      const value = draftByRoomRef.current.get(token) ?? "";
+      void saveTalkDraft(token, value).catch(() => {});
+    },
+    [cancelDraftTimer],
+  );
+
+  const scheduleDraftSave = useCallback(
+    (token: string, value: string) => {
+      draftByRoomRef.current.set(token, value);
+      dirtyDraftTokensRef.current.add(token);
+      cancelDraftTimer(token);
+      const timer = window.setTimeout(() => {
+        draftSaveTimersRef.current.delete(token);
+        dirtyDraftTokensRef.current.delete(token);
+        void saveTalkDraft(token, draftByRoomRef.current.get(token) ?? "").catch(
+          () => {},
+        );
+      }, 300);
+      draftSaveTimersRef.current.set(token, timer);
+    },
+    [cancelDraftTimer],
+  );
+
+  const selectRoom = useCallback(
+    (nextToken: string) => {
+      const prevToken = selectedTokenRef.current;
+      if (prevToken && prevToken !== nextToken) {
+        flushDraftForRoom(prevToken);
+      }
+      setSendError(null);
+      setMessagesError(null);
+      if (prevToken !== nextToken) {
+        setMessages([]);
+        setMessagesRoomToken(null);
+        setDraft(draftByRoomRef.current.get(nextToken) ?? "");
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "auto";
+        }
+      }
+      setSelectedToken(nextToken);
+    },
+    [flushDraftForRoom],
+  );
+
+  useEffect(() => {
+    const timers = draftSaveTimersRef.current;
+    const dirtyTokens = dirtyDraftTokensRef.current;
+    const drafts = draftByRoomRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        window.clearTimeout(timer);
+      }
+      timers.clear();
+      for (const token of dirtyTokens) {
+        void saveTalkDraft(token, drafts.get(token) ?? "").catch(() => {});
+      }
+      dirtyTokens.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const drawerEl = drawerRef.current;
@@ -145,8 +233,8 @@ export function QuickChatDrawer({
       .then((page) => {
         if (cancelled) return;
         setRooms(page.rooms);
-        if (page.rooms.length > 0) {
-          setSelectedToken((prev) => prev ?? page.rooms[0].token);
+        if (page.rooms.length > 0 && !selectedTokenRef.current) {
+          selectRoom(page.rooms[0].token);
         }
       })
       .catch(() => {})
@@ -156,48 +244,145 @@ export function QuickChatDrawer({
     return () => {
       cancelled = true;
     };
-  }, [isNextcloudConnected]);
+  }, [isNextcloudConnected, selectRoom]);
 
-  useEffect(() => {
-    if (!isNextcloudConnected || !selectedToken) return;
-    let cancelled = false;
-    void getTalkMessages(selectedToken, null, 25)
-      .then((page) => {
-        if (!cancelled) {
+  const loadRoomMessages = useCallback(
+    (token: string) => {
+      let cancelled = false;
+      const seq = ++messagesReqSeqRef.current;
+      setLoadingMessages(true);
+      setMessagesError(null);
+      setMessages([]);
+      setMessagesRoomToken(null);
+      void getTalkMessages(token, null, 25)
+        .then((page) => {
+          if (
+            cancelled ||
+            selectedTokenRef.current !== token ||
+            messagesReqSeqRef.current !== seq
+          ) {
+            return;
+          }
           setMessages(page.messages);
+          setMessagesRoomToken(token);
           window.setTimeout(
             () => endRef.current?.scrollIntoView({ behavior: "auto" }),
             20,
           );
-        }
-      })
-      .catch(() => {});
+        })
+        .catch(() => {
+          if (
+            cancelled ||
+            selectedTokenRef.current !== token ||
+            messagesReqSeqRef.current !== seq
+          ) {
+            return;
+          }
+          setMessages([]);
+          setMessagesRoomToken(null);
+          setMessagesError("Could not load messages for this room.");
+        })
+        .finally(() => {
+          if (
+            !cancelled &&
+            selectedTokenRef.current === token &&
+            messagesReqSeqRef.current === seq
+          ) {
+            setLoadingMessages(false);
+          }
+        });
+      return () => {
+        cancelled = true;
+      };
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!isNextcloudConnected || !selectedToken) return;
+    const token = selectedToken;
+    const cancelMessages = loadRoomMessages(token);
+
+    let draftCancelled = false;
+    if (!dirtyDraftTokensRef.current.has(token)) {
+      void getTalkDraft(token)
+        .then((saved) => {
+          if (
+            draftCancelled ||
+            selectedTokenRef.current !== token ||
+            dirtyDraftTokensRef.current.has(token)
+          ) {
+            return;
+          }
+          const resolved = saved ?? "";
+          draftByRoomRef.current.set(token, resolved);
+          setDraft(resolved);
+        })
+        .catch(() => {});
+    }
+
     return () => {
-      cancelled = true;
+      draftCancelled = true;
+      cancelMessages();
     };
-  }, [isNextcloudConnected, selectedToken]);
+  }, [isNextcloudConnected, selectedToken, loadRoomMessages]);
 
   async function submitDraft() {
-    const trimmed = draft.trim();
-    if (!trimmed || !selectedToken || sending) return;
-    setSending(true);
+    const targetToken = selectedTokenRef.current;
+    if (!targetToken || sendingRoomsRef.current.has(targetToken)) return;
+    const submittedText = draft;
+    const trimmed = submittedText.trim();
+    if (!trimmed) return;
+    sendingRoomsRef.current.add(targetToken);
+    setSendingRooms((prev) => ({ ...prev, [targetToken]: true }));
     setSendError(null);
+    cancelDraftTimer(targetToken);
+    dirtyDraftTokensRef.current.delete(targetToken);
     try {
       const sent = await sendTalkMessage({
-        token: selectedToken,
+        token: targetToken,
         message: trimmed,
         replyTo: null,
         referenceId: null,
       });
-      setMessages((prev) => [...prev, sent]);
-      setDraft("");
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
+
+      // Preserve any new text typed for this room while the send request was in flight
+      const latestForRoom = draftByRoomRef.current.get(targetToken) ?? submittedText;
+      let remaining = "";
+      if (latestForRoom !== submittedText) {
+        remaining = latestForRoom.startsWith(submittedText)
+          ? latestForRoom.slice(submittedText.length).trimStart()
+          : latestForRoom;
+      }
+      draftByRoomRef.current.set(targetToken, remaining);
+      dirtyDraftTokensRef.current.delete(targetToken);
+      void saveTalkDraft(targetToken, remaining).catch(() => {});
+
+      if (selectedTokenRef.current === targetToken) {
+        if (messagesRoomTokenRef.current === targetToken) {
+          setMessages((prev) => [...prev, sent]);
+        }
+        setDraft(remaining);
+        if (textareaRef.current && !remaining) {
+          textareaRef.current.style.height = "auto";
+        }
       }
     } catch {
-      setSendError("Could not send message. Your draft was kept.");
+      // Persist the unsent draft so closing or switching rooms never loses it
+      const kept = draftByRoomRef.current.get(targetToken) ?? submittedText;
+      draftByRoomRef.current.set(targetToken, kept);
+      void saveTalkDraft(targetToken, kept).catch(() => {});
+      if (selectedTokenRef.current === targetToken) {
+        setSendError("Could not send message. Your draft was kept.");
+      }
     } finally {
-      setSending(false);
+      sendingRoomsRef.current.delete(targetToken);
+      setSendingRooms((prev) => {
+        if (!prev[targetToken]) return prev;
+        const next = { ...prev };
+        delete next[targetToken];
+        return next;
+      });
     }
   }
 
@@ -207,6 +392,11 @@ export function QuickChatDrawer({
   }
 
   const activeRoom = rooms.find((r) => r.token === selectedToken) ?? null;
+  const sending = Boolean(selectedToken && sendingRooms[selectedToken]);
+  const visibleMessages =
+    selectedToken && messagesRoomToken === selectedToken
+      ? messages.filter((m) => m.messageType !== "system")
+      : [];
 
   return (
     <div ref={drawerRef} className="flex h-full flex-col bg-[var(--bg-sidebar)]">
@@ -256,7 +446,7 @@ export function QuickChatDrawer({
                     type="button"
                     role="menuitem"
                     onClick={() => {
-                      setSelectedToken(r.token);
+                      selectRoom(r.token);
                       setRoomMenuOpen(false);
                     }}
                     className={`flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors ${
@@ -295,7 +485,7 @@ export function QuickChatDrawer({
         <div className="flex shrink-0 items-center gap-0.5">
           <IconButton
             label="Open full Chat"
-            shortcut={`${ALT_KEY}4`}
+            shortcut={`${NAV_MOD_KEY}4`}
             size="xs"
             onClick={onOpenFullChat}
           >
@@ -324,61 +514,75 @@ export function QuickChatDrawer({
           <p className="px-4 py-10 text-center text-xs text-[var(--text-muted)]">
             Connect Nextcloud to access team chat.
           </p>
-        ) : loading ? (
+        ) : loading || loadingMessages ? (
           <div className="flex items-center justify-center gap-2 py-10 text-xs text-[var(--text-muted)]">
             <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
-            Loading rooms…
+            {loading ? "Loading rooms…" : "Loading messages…"}
           </div>
-        ) : messages.length === 0 ? (
+        ) : messagesError ? (
+          <div
+            role="alert"
+            className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-[var(--status-danger-text)]"
+          >
+            <p>{messagesError}</p>
+            {selectedToken && (
+              <button
+                type="button"
+                onClick={() => void loadRoomMessages(selectedToken)}
+                className="rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+              >
+                Retry
+              </button>
+            )}
+          </div>
+        ) : visibleMessages.length === 0 ? (
           <p className="px-4 py-10 text-center text-xs text-[var(--text-muted)]">
             No recent messages in this room.
           </p>
         ) : (
           <div className="divide-y divide-[var(--border-subtle)]/60">
-            {messages
-              .filter((m) => m.messageType !== "system")
-              .map((msg, idx, arr) => {
-                const prev = idx > 0 ? arr[idx - 1] : null;
-                const msgDay = msg.timestamp
-                  ? formatIsoDate(new Date(msg.timestamp * 1000))
-                  : null;
-                const prevDay = prev?.timestamp
-                  ? formatIsoDate(new Date(prev.timestamp * 1000))
-                  : null;
-                const showDate = Boolean(msgDay && msgDay !== prevDay);
-                return (
-                  <div key={msg.id ?? msg.referenceId}>
-                    {showDate && msgDay && (
-                      <div className="flex items-center gap-2 px-3.5 py-1">
-                        <span
-                          aria-hidden="true"
-                          className="h-px flex-1 bg-[var(--border-hairline)]"
-                        />
-                        <span className="mono-num text-[11px] font-medium text-[var(--text-muted)]">
-                          {msgDay}
-                        </span>
-                        <span
-                          aria-hidden="true"
-                          className="h-px flex-1 bg-[var(--border-hairline)]"
-                        />
-                      </div>
-                    )}
-                    <div className="px-3.5 py-2.5 transition-colors hover:bg-[var(--bg-hover)]/70">
-                      <div className="flex items-baseline justify-between gap-2">
-                        <span className="truncate text-xs font-medium text-[var(--text-primary)]">
-                          {msg.actorDisplayName}
-                        </span>
-                        <span className="mono-num shrink-0 text-[11px] text-[var(--text-muted)]">
-                          {formatTime(msg.timestamp)}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 text-[13px] leading-relaxed whitespace-pre-wrap break-words text-[var(--text-primary)]">
-                        {msg.deleted ? "Message deleted" : msg.message}
-                      </p>
+            {visibleMessages.map((msg, idx, arr) => {
+              const prev = idx > 0 ? arr[idx - 1] : null;
+              const msgDay = msg.timestamp
+                ? formatIsoDate(new Date(msg.timestamp * 1000))
+                : null;
+              const prevDay = prev?.timestamp
+                ? formatIsoDate(new Date(prev.timestamp * 1000))
+                : null;
+              const showDate = Boolean(msgDay && msgDay !== prevDay);
+              return (
+                <div key={msg.id ?? msg.referenceId}>
+                  {showDate && msgDay && (
+                    <div className="flex items-center gap-2 px-3.5 py-1">
+                      <span
+                        aria-hidden="true"
+                        className="h-px flex-1 bg-[var(--border-hairline)]"
+                      />
+                      <span className="mono-num text-[11px] font-medium text-[var(--text-muted)]">
+                        {msgDay}
+                      </span>
+                      <span
+                        aria-hidden="true"
+                        className="h-px flex-1 bg-[var(--border-hairline)]"
+                      />
                     </div>
+                  )}
+                  <div className="px-3.5 py-2.5 transition-colors hover:bg-[var(--bg-hover)]/70">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="truncate text-xs font-medium text-[var(--text-primary)]">
+                        {msg.actorDisplayName}
+                      </span>
+                      <span className="mono-num shrink-0 text-[11px] text-[var(--text-muted)]">
+                        {formatTime(msg.timestamp)}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 text-[13px] leading-relaxed whitespace-pre-wrap break-words text-[var(--text-primary)]">
+                      {msg.deleted ? "Message deleted" : msg.message}
+                    </p>
                   </div>
-                );
-              })}
+                </div>
+              );
+            })}
             <div ref={endRef} />
           </div>
         )}
@@ -405,7 +609,11 @@ export function QuickChatDrawer({
               aria-label={`Message ${activeRoom.displayName}`}
               value={draft}
               onChange={(e) => {
-                setDraft(e.target.value);
+                const nextValue = e.target.value;
+                setDraft(nextValue);
+                if (selectedTokenRef.current) {
+                  scheduleDraftSave(selectedTokenRef.current, nextValue);
+                }
                 e.target.style.height = "auto";
                 e.target.style.height = `${Math.min(e.target.scrollHeight, 112)}px`;
               }}

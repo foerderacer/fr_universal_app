@@ -145,8 +145,16 @@ export async function uploadTalkAttachmentBytes(
   );
 }
 
+const PREVIEW_TALK_DRAFT_PREFIX = "fr.preview.talkDraft.v1:";
+
 export async function getTalkDraft(token: string): Promise<string | null> {
-  if (!isTauri()) return null;
+  if (!isTauri()) {
+    try {
+      return window.localStorage.getItem(`${PREVIEW_TALK_DRAFT_PREFIX}${token}`);
+    } catch {
+      return null;
+    }
+  }
   return commands.getTalkDraft(token);
 }
 
@@ -154,7 +162,19 @@ export async function saveTalkDraft(
   token: string,
   text: string,
 ): Promise<void> {
-  if (!isTauri()) return;
+  if (!isTauri()) {
+    try {
+      const key = `${PREVIEW_TALK_DRAFT_PREFIX}${token}`;
+      if (text) {
+        window.localStorage.setItem(key, text);
+      } else {
+        window.localStorage.removeItem(key);
+      }
+    } catch {
+      // Ignore storage access errors in restricted previews.
+    }
+    return;
+  }
   await commands.saveTalkDraft(token, text);
 }
 

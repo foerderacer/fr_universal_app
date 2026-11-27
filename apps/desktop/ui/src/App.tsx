@@ -26,6 +26,7 @@ import { InlineDeleteConfirm } from "./components/ui/InlineDeleteConfirm";
 import { UpdateBanner } from "./components/update/UpdateBanner";
 import { UpdateDialog } from "./components/update/UpdateDialog";
 import { listPendingMcpApprovals, resolveMcpApproval } from "./lib/mcpClient";
+import { IS_MAC_PLATFORM } from "./lib/platform";
 import {
   areSingleKeyShortcutsEnabled,
   hasActiveOverlay,
@@ -177,8 +178,8 @@ export function App() {
       }
       const inInput = isEditableTarget(e.target);
 
-      // Support [ / ] BEFORE Alt+Digit so macOS German/French Option+5 ([) and Option+6 (])
-      // toggle panes instead of switching modules.
+      // Pane collapse toggles ([ / ]). On macOS, module navigation uses ⌘ so Option+5/6 ([ / ])
+      // on German/French layouts never collide with Automations / MCP shortcuts.
       if (
         areSingleKeyShortcutsEnabled() &&
         !inInput &&
@@ -209,7 +210,11 @@ export function App() {
         return;
       }
 
-      if (e.altKey && !e.ctrlKey && !e.metaKey && !inInput) {
+      const navModPressed = IS_MAC_PLATFORM
+        ? e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+        : e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
+
+      if (navModPressed && !inInput) {
         if (e.code === "Digit1" || e.code === "Numpad1" || e.key === "1") {
           e.preventDefault();
           setActiveNav("files");
@@ -246,7 +251,10 @@ export function App() {
           setActiveNav("settings");
           return;
         }
-        if (e.code === "KeyC" || e.key.toLowerCase() === "c") {
+        const isQuickChatKey = IS_MAC_PLATFORM
+          ? e.code === "KeyJ" || e.key.toLowerCase() === "j"
+          : e.code === "KeyC" || e.key.toLowerCase() === "c";
+        if (isQuickChatKey) {
           e.preventDefault();
           if (activeNav === "talk") return;
           setQuickChatOpen((prev) => !prev);

@@ -16,7 +16,7 @@ import type {
   ModuleDescriptor,
   NextcloudConnectionStatus,
 } from "../../bindings/tauri";
-import { ALT_KEY, QUICK_CHAT_SHORTCUT } from "../../lib/platform";
+import { NAV_MOD_KEY, QUICK_CHAT_SHORTCUT } from "../../lib/platform";
 import { handleVerticalToolbarKeyDown } from "../../lib/shortcuts";
 import { Tooltip } from "../ui/Tooltip";
 
@@ -39,12 +39,12 @@ const MODULE_META: Record<
   string,
   { label: string; shortcut?: string; icon: React.ComponentType<{ className?: string; strokeWidth?: number }> }
 > = {
-  files: { label: "Files", shortcut: `${ALT_KEY}1`, icon: Folder },
-  finance: { label: "Finance", shortcut: `${ALT_KEY}2`, icon: Landmark },
-  slicer: { label: "3D Printing", shortcut: `${ALT_KEY}3`, icon: Box },
-  talk: { label: "Chat", shortcut: `${ALT_KEY}4`, icon: MessageSquare },
-  automation: { label: "Automations", shortcut: `${ALT_KEY}5`, icon: Workflow },
-  mcp: { label: "MCP / AI", shortcut: `${ALT_KEY}6`, icon: Cpu },
+  files: { label: "Files", shortcut: `${NAV_MOD_KEY}1`, icon: Folder },
+  finance: { label: "Finance", shortcut: `${NAV_MOD_KEY}2`, icon: Landmark },
+  slicer: { label: "3D Printing", shortcut: `${NAV_MOD_KEY}3`, icon: Box },
+  talk: { label: "Chat", shortcut: `${NAV_MOD_KEY}4`, icon: MessageSquare },
+  automation: { label: "Automations", shortcut: `${NAV_MOD_KEY}5`, icon: Workflow },
+  mcp: { label: "MCP / AI", shortcut: `${NAV_MOD_KEY}6`, icon: Cpu },
 };
 
 function getModuleIcon(mod: ModuleDescriptor) {
@@ -344,7 +344,7 @@ export function ModuleRail({
           )}
         </div>
 
-        <Tooltip label="Settings" shortcut={`${ALT_KEY},`} side="right">
+        <Tooltip label="Settings" shortcut={`${NAV_MOD_KEY},`} side="right">
           <button
             type="button"
             onClick={() => onSelect("settings")}
