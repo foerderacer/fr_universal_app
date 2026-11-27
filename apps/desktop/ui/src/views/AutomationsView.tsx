@@ -561,11 +561,67 @@ export function AutomationsView({
                   className="mt-0.5 h-4 w-4 shrink-0 text-[var(--status-warning-text)]"
                   strokeWidth={1.5}
                 />
-                <div className="flex-1 space-y-2">
+                <div className="min-w-0 flex-1 space-y-2">
                   <p className="font-medium">
                     Review shared workflow &ldquo;{confirmTeamAction.wf.name}&rdquo;
                   </p>
-                  <div className="flex items-center gap-2">
+                  <p className="text-[11px] text-[var(--text-secondary)]">
+                    This workflow was synced from Nextcloud and has not been
+                    approved yet. Review its trigger and steps before{" "}
+                    {confirmTeamAction.action === "enable"
+                      ? "enabling"
+                      : "running"}{" "}
+                    it:
+                  </p>
+                  <div className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-2 text-[11px]">
+                    <p className="text-[var(--text-secondary)]">
+                      <span className="font-medium text-[var(--text-primary)]">
+                        Trigger:
+                      </span>{" "}
+                      <span className="mono-num">
+                        {describeTrigger(confirmTeamAction.wf.trigger)}
+                      </span>
+                    </p>
+                    {confirmTeamAction.wf.steps.length === 0 ? (
+                      <p className="mt-1 text-[var(--text-muted)]">
+                        No steps configured.
+                      </p>
+                    ) : (
+                      <ol className="mt-1.5 list-decimal space-y-1 pl-4 text-[var(--text-secondary)]">
+                        {confirmTeamAction.wf.steps.map((step, i) => (
+                          <li key={i} className="mono-num break-all">
+                            {step.type === "createFolder" && (
+                              <span>Create folder {step.path}</span>
+                            )}
+                            {step.type === "copyFile" && (
+                              <span>
+                                Copy {step.from} → {step.to}
+                              </span>
+                            )}
+                            {step.type === "moveFile" && (
+                              <span>
+                                Move {step.from} → {step.to}
+                              </span>
+                            )}
+                            {step.type === "writeMarkdown" && (
+                              <span>
+                                Write Markdown {step.path} (
+                                {step.createOnly ? "create only" : "overwrite"})
+                              </span>
+                            )}
+                            {step.type === "callMcpTool" && (
+                              <span>
+                                Call external MCP {step.serverId}::
+                                {step.toolName} — args:{" "}
+                                {step.argumentsJson || "{}"}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
                     <button
                       type="button"
                       onClick={() =>
@@ -575,12 +631,14 @@ export function AutomationsView({
                       }
                       className="rounded bg-[var(--status-warning)] px-2.5 py-1 text-[11px] font-medium text-[var(--status-warning-fg)]"
                     >
-                      Approve &amp; {confirmTeamAction.action}
+                      {confirmTeamAction.action === "enable"
+                        ? "I reviewed these steps — Enable"
+                        : "I reviewed these steps — Run Now"}
                     </button>
                     <button
                       type="button"
                       onClick={() => setConfirmTeamAction(null)}
-                      className="rounded border border-[var(--border-strong)] px-2.5 py-1 text-[11px]"
+                      className="rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                     >
                       Cancel
                     </button>

@@ -27,6 +27,7 @@ import { UpdateBanner } from "./components/update/UpdateBanner";
 import { UpdateDialog } from "./components/update/UpdateDialog";
 import { listPendingMcpApprovals, resolveMcpApproval } from "./lib/mcpClient";
 import { IS_MAC_PLATFORM } from "./lib/platform";
+import { syncQuickChatAccount } from "./lib/quickChatStore";
 import {
   areSingleKeyShortcutsEnabled,
   hasActiveOverlay,
@@ -214,6 +215,19 @@ export function App() {
         ? e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
         : e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
 
+      // Allow Quick Chat toggle even while focus is inside the Quick Chat composer
+      if (navModPressed) {
+        const isQuickChatKey = IS_MAC_PLATFORM
+          ? e.code === "KeyJ" || e.key.toLowerCase() === "j"
+          : e.code === "KeyC" || e.key.toLowerCase() === "c";
+        if (isQuickChatKey) {
+          e.preventDefault();
+          if (activeNav === "talk") return;
+          setQuickChatOpen((prev) => !prev);
+          return;
+        }
+      }
+
       if (navModPressed && !inInput) {
         if (e.code === "Digit1" || e.code === "Numpad1" || e.key === "1") {
           e.preventDefault();
@@ -246,18 +260,10 @@ export function App() {
           setActiveNav("mcp");
           return;
         }
-        if (e.code === "Comma" || e.key === ",") {
+        // Match on character key "," so AZERTY physical Comma (";") does not trigger Settings
+        if (e.key === ",") {
           e.preventDefault();
           setActiveNav("settings");
-          return;
-        }
-        const isQuickChatKey = IS_MAC_PLATFORM
-          ? e.code === "KeyJ" || e.key.toLowerCase() === "j"
-          : e.code === "KeyC" || e.key.toLowerCase() === "c";
-        if (isQuickChatKey) {
-          e.preventDefault();
-          if (activeNav === "talk") return;
-          setQuickChatOpen((prev) => !prev);
           return;
         }
       }
@@ -489,10 +495,11 @@ export function App() {
     setError(null);
     try {
       const updated = await saveWorkspaceSettings(input);
-      setOverview(updated);
       if (updated.connectionStatus.state !== "connected") {
+        syncQuickChatAccount(null);
         setLoginPendingUrl(null);
       }
+      setOverview(updated);
     } catch (err) {
       setError(toUserFacingError(err));
       throw err;
@@ -503,10 +510,11 @@ export function App() {
     setError(null);
     try {
       const updated = await resetWorkspaceNextcloudUrl();
-      setOverview(updated);
       if (updated.connectionStatus.state !== "connected") {
+        syncQuickChatAccount(null);
         setLoginPendingUrl(null);
       }
+      setOverview(updated);
       return updated.config.nextcloudUrl;
     } catch (err) {
       setError(toUserFacingError(err));
@@ -538,13 +546,24 @@ export function App() {
     }
   }
 
+  const quickChatAccountKey =
+    overview?.connectionStatus.state === "connected"
+      ? `${overview.connectionStatus.serverUrl}|${overview.connectionStatus.loginName}`
+      : null;
+
+  useEffect(() => {
+    syncQuickChatAccount(quickChatAccountKey);
+  }, [quickChatAccountKey]);
+
   async function handleSignOut() {
     setError(null);
     setLoginPendingUrl(null);
+    syncQuickChatAccount(null);
     try {
       const updated = await signOutNextcloud();
       setOverview(updated);
     } catch (err) {
+      syncQuickChatAccount(quickChatAccountKey);
       setError(toUserFacingError(err));
       throw err;
     }
@@ -586,6 +605,8 @@ export function App() {
   const quickChatDrawerNode =
     quickChatOpen && activeModule?.id !== "talk" ? (
       <QuickChatDrawer
+        key={quickChatAccountKey ?? "signed-out"}
+        accountKey={quickChatAccountKey}
         isNextcloudConnected={isNextcloudConnected}
         onClose={() => setQuickChatOpen(false)}
         onOpenFullChat={() => {

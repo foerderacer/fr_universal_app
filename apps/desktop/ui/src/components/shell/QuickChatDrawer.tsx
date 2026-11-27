@@ -15,6 +15,17 @@ import type {
 } from "../../bindings/tauri";
 import { formatIsoDate, formatTime24h } from "../../lib/dateFormat";
 import { NAV_MOD_KEY, QUICK_CHAT_SHORTCUT } from "../../lib/platform";
+import {
+  draftSyncListeners,
+  getActiveQuickChatAccount,
+  getOrCreateQuickChatDraft,
+  makeQuickChatScopeKey,
+  notifyQuickChatListeners,
+  scopedDrafts,
+  scopedSendingKeys,
+  scopedSentMessages,
+  syncQuickChatAccount,
+} from "../../lib/quickChatStore";
 import { hasActiveOverlay, isEditableTarget } from "../../lib/shortcuts";
 import {
   getTalkDraft,
@@ -26,9 +37,36 @@ import {
 import { IconButton } from "../ui/Tooltip";
 
 interface QuickChatDrawerProps {
+  accountKey: string | null;
   isNextcloudConnected: boolean;
   onClose: () => void;
   onOpenFullChat: () => void;
+}
+
+function messageDedupKey(msg: TalkMessage_Serialize): string {
+  if (msg.id !== null && msg.id !== undefined) {
+    return `id:${msg.id}`;
+  }
+  return `ref:${msg.referenceId || `${msg.timestamp ?? 0}:${msg.actorId}:${msg.message}`}`;
+}
+
+function mergeQuickChatMessages(
+  existing: TalkMessage_Serialize[],
+  incoming: TalkMessage_Serialize[],
+): TalkMessage_Serialize[] {
+  const map = new Map<string, TalkMessage_Serialize>();
+  for (const m of existing) {
+    map.set(messageDedupKey(m), m);
+  }
+  for (const m of incoming) {
+    map.set(messageDedupKey(m), m);
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    const ta = a.timestamp ?? 0;
+    const tb = b.timestamp ?? 0;
+    if (ta !== tb) return ta - tb;
+    return (a.id ?? 0) - (b.id ?? 0);
+  });
 }
 
 function formatTime(ts: number | null): string {
@@ -36,11 +74,16 @@ function formatTime(ts: number | null): string {
 }
 
 export function QuickChatDrawer({
+  accountKey,
   isNextcloudConnected,
   onClose,
   onOpenFullChat,
 }: QuickChatDrawerProps) {
+  syncQuickChatAccount(isNextcloudConnected ? accountKey : null);
+
+  const effectiveAccountKey = isNextcloudConnected ? accountKey : null;
   const [rooms, setRooms] = useState<TalkRoom_Serialize[]>([]);
+  const [roomsError, setRoomsError] = useState<string | null>(null);
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [messages, setMessages] = useState<TalkMessage_Serialize[]>([]);
@@ -49,71 +92,103 @@ export function QuickChatDrawer({
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [messagesError, setMessagesError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [sendingRooms, setSendingRooms] = useState<Record<string, boolean>>({});
+  const [, setSyncTick] = useState(0);
   const [sendError, setSendError] = useState<string | null>(null);
   const drawerRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
+  const accountKeyRef = useRef<string | null>(effectiveAccountKey);
+  accountKeyRef.current = effectiveAccountKey;
   const selectedTokenRef = useRef<string | null>(null);
   selectedTokenRef.current = selectedToken;
   const messagesRoomTokenRef = useRef<string | null>(null);
   messagesRoomTokenRef.current = messagesRoomToken;
+  const roomsReqSeqRef = useRef(0);
   const messagesReqSeqRef = useRef(0);
-  const sendingRoomsRef = useRef<Set<string>>(new Set());
-  const draftByRoomRef = useRef<Map<string, string>>(new Map());
-  const dirtyDraftTokensRef = useRef<Set<string>>(new Set());
-  const draftSaveTimersRef = useRef<Map<string, number>>(new Map());
 
-  const cancelDraftTimer = useCallback((token: string) => {
-    const timer = draftSaveTimersRef.current.get(token);
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      draftSaveTimersRef.current.delete(token);
+  const flushDraftForRoom = useCallback((acct: string, token: string) => {
+    const key = makeQuickChatScopeKey(acct, token);
+    const entry = scopedDrafts.get(key);
+    if (!entry) return;
+    if (entry.timer !== null) {
+      window.clearTimeout(entry.timer);
+      entry.timer = null;
     }
+    if (!entry.dirty || getActiveQuickChatAccount() !== acct) return;
+    entry.dirty = false;
+    const textToSave = entry.text;
+    void saveTalkDraft(token, textToSave).catch(() => {});
   }, []);
 
-  const flushDraftForRoom = useCallback(
-    (token: string) => {
-      cancelDraftTimer(token);
-      if (!dirtyDraftTokensRef.current.has(token)) return;
-      dirtyDraftTokensRef.current.delete(token);
-      const value = draftByRoomRef.current.get(token) ?? "";
-      void saveTalkDraft(token, value).catch(() => {});
+  const scheduleDraftSave = useCallback(
+    (acct: string, token: string, value: string) => {
+      if (getActiveQuickChatAccount() !== acct) return;
+      const entry = getOrCreateQuickChatDraft(acct, token);
+      entry.revision += 1;
+      entry.text = value;
+      entry.hydrated = true;
+      entry.dirty = true;
+      const scheduledRev = entry.revision;
+      if (entry.timer !== null) {
+        window.clearTimeout(entry.timer);
+      }
+      entry.timer = window.setTimeout(() => {
+        entry.timer = null;
+        if (
+          getActiveQuickChatAccount() !== acct ||
+          entry.revision !== scheduledRev
+        ) {
+          return;
+        }
+        entry.dirty = false;
+        void saveTalkDraft(token, entry.text).catch(() => {});
+      }, 300);
     },
-    [cancelDraftTimer],
+    [],
   );
 
-  const scheduleDraftSave = useCallback(
-    (token: string, value: string) => {
-      draftByRoomRef.current.set(token, value);
-      dirtyDraftTokensRef.current.add(token);
-      cancelDraftTimer(token);
-      const timer = window.setTimeout(() => {
-        draftSaveTimersRef.current.delete(token);
-        dirtyDraftTokensRef.current.delete(token);
-        void saveTalkDraft(token, draftByRoomRef.current.get(token) ?? "").catch(
-          () => {},
-        );
-      }, 300);
-      draftSaveTimersRef.current.set(token, timer);
-    },
-    [cancelDraftTimer],
-  );
+  // Sync draft/sending state if an in-flight send finishes for the active room
+  useEffect(() => {
+    const sync = () => {
+      const acct = accountKeyRef.current;
+      const tok = selectedTokenRef.current;
+      if (acct && tok) {
+        const key = makeQuickChatScopeKey(acct, tok);
+        const entry = scopedDrafts.get(key);
+        if (entry) {
+          setDraft(entry.text);
+        }
+        const sent = scopedSentMessages.get(key);
+        if (sent && sent.length > 0 && messagesRoomTokenRef.current === tok) {
+          setMessages((prev) => mergeQuickChatMessages(prev, sent));
+        }
+      }
+      setSyncTick((n) => n + 1);
+    };
+    draftSyncListeners.add(sync);
+    return () => {
+      draftSyncListeners.delete(sync);
+    };
+  }, []);
 
   const selectRoom = useCallback(
     (nextToken: string) => {
+      const acct = accountKeyRef.current;
       const prevToken = selectedTokenRef.current;
-      if (prevToken && prevToken !== nextToken) {
-        flushDraftForRoom(prevToken);
+      if (acct && prevToken && prevToken !== nextToken) {
+        flushDraftForRoom(acct, prevToken);
       }
       setSendError(null);
       setMessagesError(null);
       if (prevToken !== nextToken) {
         setMessages([]);
         setMessagesRoomToken(null);
-        setDraft(draftByRoomRef.current.get(nextToken) ?? "");
+        const existingText = acct
+          ? (scopedDrafts.get(makeQuickChatScopeKey(acct, nextToken))?.text ?? "")
+          : "";
+        setDraft(existingText);
         if (textareaRef.current) {
           textareaRef.current.style.height = "auto";
         }
@@ -123,21 +198,34 @@ export function QuickChatDrawer({
     [flushDraftForRoom],
   );
 
+  // Reset visible drawer state when signed out or account changes
   useEffect(() => {
-    const timers = draftSaveTimersRef.current;
-    const dirtyTokens = dirtyDraftTokensRef.current;
-    const drafts = draftByRoomRef.current;
+    if (!effectiveAccountKey) {
+      setRooms([]);
+      setRoomsError(null);
+      setSelectedToken(null);
+      setMessages([]);
+      setMessagesRoomToken(null);
+      setMessagesError(null);
+      setDraft("");
+      setSendError(null);
+      setLoading(false);
+      setLoadingMessages(false);
+    }
+  }, [effectiveAccountKey]);
+
+  // Flush dirty drafts for the active account on unmount
+  useEffect(() => {
     return () => {
-      for (const timer of timers.values()) {
-        window.clearTimeout(timer);
+      const acct = accountKeyRef.current;
+      if (!acct || getActiveQuickChatAccount() !== acct) return;
+      for (const entry of scopedDrafts.values()) {
+        if (entry.accountKey === acct) {
+          flushDraftForRoom(acct, entry.roomToken);
+        }
       }
-      timers.clear();
-      for (const token of dirtyTokens) {
-        void saveTalkDraft(token, drafts.get(token) ?? "").catch(() => {});
-      }
-      dirtyTokens.clear();
     };
-  }, []);
+  }, [flushDraftForRoom]);
 
   useEffect(() => {
     const drawerEl = drawerRef.current;
@@ -225,98 +313,148 @@ export function QuickChatDrawer({
     };
   }, [roomMenuOpen]);
 
-  useEffect(() => {
-    if (!isNextcloudConnected) return;
-    let cancelled = false;
-    setLoading(true);
-    void listTalkRooms(null)
-      .then((page) => {
-        if (cancelled) return;
-        setRooms(page.rooms);
-        if (page.rooms.length > 0 && !selectedTokenRef.current) {
-          selectRoom(page.rooms[0].token);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isNextcloudConnected, selectRoom]);
-
-  const loadRoomMessages = useCallback(
-    (token: string) => {
+  const loadRooms = useCallback(
+    (acct: string) => {
       let cancelled = false;
-      const seq = ++messagesReqSeqRef.current;
-      setLoadingMessages(true);
-      setMessagesError(null);
-      setMessages([]);
-      setMessagesRoomToken(null);
-      void getTalkMessages(token, null, 25)
+      const seq = ++roomsReqSeqRef.current;
+      setLoading(true);
+      setRoomsError(null);
+      void listTalkRooms(null)
         .then((page) => {
           if (
             cancelled ||
-            selectedTokenRef.current !== token ||
-            messagesReqSeqRef.current !== seq
+            accountKeyRef.current !== acct ||
+            roomsReqSeqRef.current !== seq
           ) {
             return;
           }
-          setMessages(page.messages);
-          setMessagesRoomToken(token);
-          window.setTimeout(
-            () => endRef.current?.scrollIntoView({ behavior: "auto" }),
-            20,
-          );
+          setRooms(page.rooms);
+          if (page.rooms.length > 0 && !selectedTokenRef.current) {
+            selectRoom(page.rooms[0].token);
+          }
         })
         .catch(() => {
           if (
             cancelled ||
-            selectedTokenRef.current !== token ||
-            messagesReqSeqRef.current !== seq
+            accountKeyRef.current !== acct ||
+            roomsReqSeqRef.current !== seq
           ) {
             return;
           }
-          setMessages([]);
-          setMessagesRoomToken(null);
-          setMessagesError("Could not load messages for this room.");
+          setRooms([]);
+          setSelectedToken(null);
+          setRoomsError("Could not load chat rooms.");
         })
         .finally(() => {
           if (
             !cancelled &&
-            selectedTokenRef.current === token &&
-            messagesReqSeqRef.current === seq
+            accountKeyRef.current === acct &&
+            roomsReqSeqRef.current === seq
           ) {
-            setLoadingMessages(false);
+            setLoading(false);
           }
         });
       return () => {
         cancelled = true;
       };
     },
-    [],
+    [selectRoom],
   );
 
   useEffect(() => {
-    if (!isNextcloudConnected || !selectedToken) return;
+    if (!effectiveAccountKey) return;
+    return loadRooms(effectiveAccountKey);
+  }, [effectiveAccountKey, loadRooms]);
+
+  const loadRoomMessages = useCallback((acct: string, token: string) => {
+    let cancelled = false;
+    const seq = ++messagesReqSeqRef.current;
+    setLoadingMessages(true);
+    setMessagesError(null);
+    setMessages([]);
+    setMessagesRoomToken(null);
+    void getTalkMessages(token, null, 25)
+      .then((page) => {
+        if (
+          cancelled ||
+          accountKeyRef.current !== acct ||
+          selectedTokenRef.current !== token ||
+          messagesReqSeqRef.current !== seq
+        ) {
+          return;
+        }
+        const pendingSent =
+          scopedSentMessages.get(makeQuickChatScopeKey(acct, token)) ?? [];
+        const merged = mergeQuickChatMessages(page.messages, pendingSent);
+        setMessages(merged);
+        setMessagesRoomToken(token);
+        window.setTimeout(
+          () => endRef.current?.scrollIntoView({ behavior: "auto" }),
+          20,
+        );
+      })
+      .catch(() => {
+        if (
+          cancelled ||
+          accountKeyRef.current !== acct ||
+          selectedTokenRef.current !== token ||
+          messagesReqSeqRef.current !== seq
+        ) {
+          return;
+        }
+        setMessages([]);
+        setMessagesRoomToken(null);
+        setMessagesError("Could not load messages for this room.");
+      })
+      .finally(() => {
+        if (
+          !cancelled &&
+          accountKeyRef.current === acct &&
+          selectedTokenRef.current === token &&
+          messagesReqSeqRef.current === seq
+        ) {
+          setLoadingMessages(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!effectiveAccountKey || !selectedToken) return;
+    const acct = effectiveAccountKey;
     const token = selectedToken;
-    const cancelMessages = loadRoomMessages(token);
+    const cancelMessages = loadRoomMessages(acct, token);
 
     let draftCancelled = false;
-    if (!dirtyDraftTokensRef.current.has(token)) {
+    const scopeKey = makeQuickChatScopeKey(acct, token);
+    const entry = getOrCreateQuickChatDraft(acct, token);
+    const readRevision = entry.revision;
+    if (entry.hydrated) {
+      setDraft(entry.text);
+    }
+    if (!entry.dirty && !scopedSendingKeys.has(scopeKey)) {
       void getTalkDraft(token)
         .then((saved) => {
           if (
             draftCancelled ||
-            selectedTokenRef.current !== token ||
-            dirtyDraftTokensRef.current.has(token)
+            getActiveQuickChatAccount() !== acct ||
+            entry.revision !== readRevision ||
+            entry.dirty ||
+            scopedSendingKeys.has(scopeKey)
           ) {
             return;
           }
           const resolved = saved ?? "";
-          draftByRoomRef.current.set(token, resolved);
-          setDraft(resolved);
+          entry.text = resolved;
+          entry.hydrated = true;
+          if (
+            accountKeyRef.current === acct &&
+            selectedTokenRef.current === token
+          ) {
+            setDraft(resolved);
+          }
         })
         .catch(() => {});
     }
@@ -325,19 +463,37 @@ export function QuickChatDrawer({
       draftCancelled = true;
       cancelMessages();
     };
-  }, [isNextcloudConnected, selectedToken, loadRoomMessages]);
+  }, [effectiveAccountKey, selectedToken, loadRoomMessages]);
 
   async function submitDraft() {
+    const targetAccount = accountKeyRef.current;
     const targetToken = selectedTokenRef.current;
-    if (!targetToken || sendingRoomsRef.current.has(targetToken)) return;
+    if (!targetAccount || !targetToken) return;
+    const scopeKey = makeQuickChatScopeKey(targetAccount, targetToken);
+    if (scopedSendingKeys.has(scopeKey)) return;
+
+    const entry = getOrCreateQuickChatDraft(targetAccount, targetToken);
     const submittedText = draft;
     const trimmed = submittedText.trim();
     if (!trimmed) return;
-    sendingRoomsRef.current.add(targetToken);
-    setSendingRooms((prev) => ({ ...prev, [targetToken]: true }));
+
+    // Ensure the shared draft store reflects the exact submitted text and revision
+    if (entry.text !== submittedText) {
+      entry.revision += 1;
+      entry.text = submittedText;
+      entry.hydrated = true;
+    }
+    const sendRevision = entry.revision;
+    if (entry.timer !== null) {
+      window.clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    entry.dirty = false;
+
+    scopedSendingKeys.add(scopeKey);
+    notifyQuickChatListeners();
     setSendError(null);
-    cancelDraftTimer(targetToken);
-    dirtyDraftTokensRef.current.delete(targetToken);
+
     try {
       const sent = await sendTalkMessage({
         token: targetToken,
@@ -346,43 +502,70 @@ export function QuickChatDrawer({
         referenceId: null,
       });
 
-      // Preserve any new text typed for this room while the send request was in flight
-      const latestForRoom = draftByRoomRef.current.get(targetToken) ?? submittedText;
-      let remaining = "";
-      if (latestForRoom !== submittedText) {
-        remaining = latestForRoom.startsWith(submittedText)
-          ? latestForRoom.slice(submittedText.length).trimStart()
-          : latestForRoom;
+      // Ignore completion if user signed out or switched accounts while request was in flight
+      if (getActiveQuickChatAccount() !== targetAccount) {
+        return;
       }
-      draftByRoomRef.current.set(targetToken, remaining);
-      dirtyDraftTokensRef.current.delete(targetToken);
-      void saveTalkDraft(targetToken, remaining).catch(() => {});
 
-      if (selectedTokenRef.current === targetToken) {
-        if (messagesRoomTokenRef.current === targetToken) {
-          setMessages((prev) => [...prev, sent]);
+      const prevSent = scopedSentMessages.get(scopeKey) ?? [];
+      scopedSentMessages.set(
+        scopeKey,
+        mergeQuickChatMessages(prevSent, [sent]),
+      );
+
+      const currentEntry = getOrCreateQuickChatDraft(targetAccount, targetToken);
+      if (currentEntry.revision === sendRevision) {
+        currentEntry.revision += 1;
+        currentEntry.text = "";
+        currentEntry.hydrated = true;
+        currentEntry.dirty = false;
+        if (currentEntry.timer !== null) {
+          window.clearTimeout(currentEntry.timer);
+          currentEntry.timer = null;
         }
-        setDraft(remaining);
-        if (textareaRef.current && !remaining) {
-          textareaRef.current.style.height = "auto";
+        void saveTalkDraft(targetToken, "").catch(() => {});
+      } else if (currentEntry.text.startsWith(submittedText)) {
+        const remaining = currentEntry.text
+          .slice(submittedText.length)
+          .trimStart();
+        currentEntry.revision += 1;
+        currentEntry.text = remaining;
+        currentEntry.hydrated = true;
+        currentEntry.dirty = false;
+        if (currentEntry.timer !== null) {
+          window.clearTimeout(currentEntry.timer);
+          currentEntry.timer = null;
         }
+        void saveTalkDraft(targetToken, remaining).catch(() => {});
       }
+      // Otherwise a newer draft revision replaced the text (e.g. in a reopened drawer):
+      // leave it untouched so newer edits are never erased.
+
+      if (
+        accountKeyRef.current === targetAccount &&
+        selectedTokenRef.current === targetToken &&
+        textareaRef.current &&
+        !currentEntry.text
+      ) {
+        textareaRef.current.style.height = "auto";
+      }
+      notifyQuickChatListeners();
     } catch {
-      // Persist the unsent draft so closing or switching rooms never loses it
-      const kept = draftByRoomRef.current.get(targetToken) ?? submittedText;
-      draftByRoomRef.current.set(targetToken, kept);
-      void saveTalkDraft(targetToken, kept).catch(() => {});
-      if (selectedTokenRef.current === targetToken) {
-        setSendError("Could not send message. Your draft was kept.");
+      if (getActiveQuickChatAccount() === targetAccount) {
+        const currentEntry = getOrCreateQuickChatDraft(targetAccount, targetToken);
+        if (currentEntry.revision === sendRevision) {
+          void saveTalkDraft(targetToken, currentEntry.text).catch(() => {});
+        }
+        if (
+          accountKeyRef.current === targetAccount &&
+          selectedTokenRef.current === targetToken
+        ) {
+          setSendError("Could not send message. Your draft was kept.");
+        }
       }
     } finally {
-      sendingRoomsRef.current.delete(targetToken);
-      setSendingRooms((prev) => {
-        if (!prev[targetToken]) return prev;
-        const next = { ...prev };
-        delete next[targetToken];
-        return next;
-      });
+      scopedSendingKeys.delete(scopeKey);
+      notifyQuickChatListeners();
     }
   }
 
@@ -392,9 +575,15 @@ export function QuickChatDrawer({
   }
 
   const activeRoom = rooms.find((r) => r.token === selectedToken) ?? null;
-  const sending = Boolean(selectedToken && sendingRooms[selectedToken]);
+  const sending = Boolean(
+    effectiveAccountKey &&
+      selectedToken &&
+      scopedSendingKeys.has(
+        makeQuickChatScopeKey(effectiveAccountKey, selectedToken),
+      ),
+  );
   const visibleMessages =
-    selectedToken && messagesRoomToken === selectedToken
+    effectiveAccountKey && selectedToken && messagesRoomToken === selectedToken
       ? messages.filter((m) => m.messageType !== "system")
       : [];
 
@@ -510,7 +699,7 @@ export function QuickChatDrawer({
         aria-label="Quick chat messages"
         className="min-h-0 flex-1 overflow-y-auto py-1"
       >
-        {!isNextcloudConnected ? (
+        {!effectiveAccountKey ? (
           <p className="px-4 py-10 text-center text-xs text-[var(--text-muted)]">
             Connect Nextcloud to access team chat.
           </p>
@@ -518,6 +707,20 @@ export function QuickChatDrawer({
           <div className="flex items-center justify-center gap-2 py-10 text-xs text-[var(--text-muted)]">
             <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
             {loading ? "Loading rooms…" : "Loading messages…"}
+          </div>
+        ) : roomsError ? (
+          <div
+            role="alert"
+            className="flex flex-col items-center gap-2 px-4 py-10 text-center text-xs text-[var(--status-danger-text)]"
+          >
+            <p>{roomsError}</p>
+            <button
+              type="button"
+              onClick={() => void loadRooms(effectiveAccountKey)}
+              className="rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+            >
+              Retry
+            </button>
           </div>
         ) : messagesError ? (
           <div
@@ -528,13 +731,19 @@ export function QuickChatDrawer({
             {selectedToken && (
               <button
                 type="button"
-                onClick={() => void loadRoomMessages(selectedToken)}
+                onClick={() =>
+                  void loadRoomMessages(effectiveAccountKey, selectedToken)
+                }
                 className="rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
               >
                 Retry
               </button>
             )}
           </div>
+        ) : rooms.length === 0 ? (
+          <p className="px-4 py-10 text-center text-xs text-[var(--text-muted)]">
+            No chat rooms available.
+          </p>
         ) : visibleMessages.length === 0 ? (
           <p className="px-4 py-10 text-center text-xs text-[var(--text-muted)]">
             No recent messages in this room.
@@ -551,7 +760,7 @@ export function QuickChatDrawer({
                 : null;
               const showDate = Boolean(msgDay && msgDay !== prevDay);
               return (
-                <div key={msg.id ?? msg.referenceId}>
+                <div key={messageDedupKey(msg)}>
                   {showDate && msgDay && (
                     <div className="flex items-center gap-2 px-3.5 py-1">
                       <span
@@ -589,7 +798,7 @@ export function QuickChatDrawer({
       </div>
 
       {/* Anchored Multiline Composer */}
-      {isNextcloudConnected && activeRoom && !activeRoom.readOnly && (
+      {effectiveAccountKey && activeRoom && !activeRoom.readOnly && (
         <form
           onSubmit={handleSend}
           className="border-t border-[var(--border-hairline)] p-2.5"
@@ -611,8 +820,12 @@ export function QuickChatDrawer({
               onChange={(e) => {
                 const nextValue = e.target.value;
                 setDraft(nextValue);
-                if (selectedTokenRef.current) {
-                  scheduleDraftSave(selectedTokenRef.current, nextValue);
+                if (accountKeyRef.current && selectedTokenRef.current) {
+                  scheduleDraftSave(
+                    accountKeyRef.current,
+                    selectedTokenRef.current,
+                    nextValue,
+                  );
                 }
                 e.target.style.height = "auto";
                 e.target.style.height = `${Math.min(e.target.scrollHeight, 112)}px`;

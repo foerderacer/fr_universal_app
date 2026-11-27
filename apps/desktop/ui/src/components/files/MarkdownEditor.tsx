@@ -372,6 +372,9 @@ export function MarkdownEditor({
       } catch (err) {
         const uf = toUserFacingError(err);
         if (uf.code === "conflict") {
+          await saveMarkdownDraft(path, markdown, etag)
+            .then(() => setDraftNotice("Draft saved"))
+            .catch(() => {});
           setConflictOpen(true);
         } else {
           setError(uf);
@@ -382,6 +385,19 @@ export function MarkdownEditor({
     },
     [path, markdown, etag, onSaved],
   );
+
+  const handleReloadAfterConflict = useCallback(async () => {
+    if (dirty && doc) {
+      try {
+        await saveMarkdownDraft(path, markdown, etag);
+        setDraftNotice("Draft saved");
+      } catch (err) {
+        setError(toUserFacingError(err));
+        return;
+      }
+    }
+    await loadDocument();
+  }, [dirty, doc, path, markdown, etag, loadDocument]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -547,7 +563,7 @@ export function MarkdownEditor({
                 <button
                   type="button"
                   disabled={saving}
-                  onClick={() => void loadDocument()}
+                  onClick={() => void handleReloadAfterConflict()}
                   className="inline-flex items-center gap-1 rounded border border-[var(--border-strong)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                 >
                   <RotateCcw className="h-3 w-3" strokeWidth={1.5} />
